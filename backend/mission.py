@@ -357,14 +357,16 @@ def _restore_pending_panics() -> None:
 
 # ── вид входа ─────────────────────────────────────────────────────────────────
 def _entry_kind(do: str, entry, price, hint=None) -> str:
-    """сейчас / откат / прорыв — по геометрии (она главнее подсказки ИИ): entry нет или равен цене →
+    """сейчас / откат / прорыв — по геометрии (она главнее подсказки откат/прорыв): entry нет или равен цене →
     «сейчас»; для BUY уровень ниже цены → «откат» (засада), выше → «прорыв» (вход, когда цена его
-    пройдёт); SELL зеркально. Цена неизвестна → подсказка ИИ, иначе «откат»."""
-    if entry is None:
-        return "сейчас"
+    пройдёт); SELL зеркально. Цена неизвестна → подсказка ИИ, иначе «откат».
+    v5.4.2: подсказка «сейчас»/«now» — решение ИИ войти сразу: геометрия её не переделывает в засаду или пробой
+    (цена досье старше живой, entry у ИИ — его взгляд на текущую цену); дрейф проверяет дверь по живой цене."""
     h = str(hint or "").strip().lower()
-    h = {"now": "сейчас", "pullback": "откат", "breakout": "прорыв", "пробитие": "прорыв", "пробой": "прорыв",
-         "засада": "откат"}.get(h, h)
+    h = {"now": "сейчас", "сразу": "сейчас", "immediately": "сейчас", "market": "сейчас", "pullback": "откат",
+         "breakout": "прорыв", "пробитие": "прорыв", "пробой": "прорыв", "засада": "откат"}.get(h, h)
+    if entry is None or h == "сейчас":
+        return "сейчас"
     if not price or price <= 0:
         return h if h in ("откат", "прорыв") else "откат"
     if abs(float(entry) - float(price)) <= 1e-12:
@@ -380,36 +382,37 @@ def _validate_exec(ex: Any, play: str, price, in_pos: bool = False) -> tuple[dic
     """(приказ, None) или (None, причина). Стороны как у pipeline._sanitize_forecast
     и AIPilot._plan_valid, плюс режим игры: long→BUY, short→SELL, mixed/auto→любой.
     v5.2: при открытой позиции (in_pos) допустим CLOSE — закрыть и стоять вне рынка.
-    v5.4.1: WAIT (ЖДАТЬ / FLAT / HOLD_FLAT) без позиции — «перевеса нет / вход не сейчас»: плана нет, wait_for —
-    что должно случиться; при позиции WAIT недопустим (нужно держать / закрыть / перевернуть)."""
+    v5.4.1: WAIT (ЖДАТЬ / FLAT / HOLD_FLAT) без позиции — «вход не сейчас»: плана нет, wait_for —
+    что должно случиться; при позиции WAIT недопустим (нужно держать / закрыть / перевернуть).
+    v5.4.2: слово решения — ai_v5.decision_of по словарю приказа (КУПИТЬ/ЛОНГ/ПОКУПКА → BUY, ЖДЁМ/NO_TRADE → WAIT,
+    FLAT/EXIT в позиции → CLOSE; ключ do|action|decision); ошибка уровней BUY/SELL — «сторона принята, исправь уровни»
+    (без подсказки «или WAIT»); прорыв — стоп только по ту сторону уровня входа (классический стоп пробоя между
+    ценой и уровнем законен); заглушки нейтральны — код не дописывает за ИИ «перевеса нет»."""
     if isinstance(ex, dict) and isinstance(ex.get("exec"), dict):
         ex = ex["exec"]
     if not isinstance(ex, dict):
         return None, "ответ не JSON-объект"
-    do = str(ex.get("do") or ex.get("action") or "").upper().strip()
-    if do in ("LONG",):
-        do = "BUY"
-    if do in ("SHORT",):
-        do = "SELL"
+    raw_do = ai_v5.decision_raw(ex, keys=("do", "action", "decision"))
+    do = ai_v5.decision_of(raw_do, ai_v5.exec_table(in_pos)) or ""
     ids = ex.get("news_ids") if isinstance(ex.get("news_ids"), (list, tuple)) else []
     conf = _f(ex.get("confidence"))
-    if do in ("WAIT", "ЖДАТЬ", "FLAT", "HOLD_FLAT"):
+    if do == "WAIT":
         if in_pos:
-            return None, (f"do={do}: позиция открыта — WAIT недопустим: скажи держать (BUY/SELL той же стороны с "
+            return None, (f"do={raw_do}: позиция открыта — WAIT недопустим: скажи держать (BUY/SELL той же стороны с "
                           "уровнями), CLOSE или перевернуть")
         lv = ex.get("levels") if isinstance(ex.get("levels"), (list, tuple)) else []
         wait_for = str(ex.get("wait_for") or "").strip()[:400]
         return {"do": "WAIT", "entry": None, "entry_kind": "сейчас", "take": None, "invalidation": None,
-                "why": str(ex.get("why") or "перевеса нет")[:300],
+                "why": str(ex.get("why") or "").strip()[:300] or "(причина не указана)",
                 "plan": str(ex.get("plan") or "")[:1500],
-                "wait_for": wait_for or str(ex.get("why") or "перевеса нет — вне рынка")[:300],
+                "wait_for": wait_for or "условие входа не названо — реши по живой картине",
                 "confidence": int(max(0, min(100, conf))) if conf is not None else None,
                 "news_ids": [str(i)[:12] for i in ids if isinstance(i, (str, int))][:12],
                 "levels": [v for v in (_f(x) for x in lv) if v is not None][:10],
                 "time_note": str(ex.get("time_note") or "")[:300]}, None
-    if do in ("CLOSE", "ЗАКРЫТЬ", "EXIT"):
+    if do == "CLOSE":
         if not in_pos:
-            return None, f"do={do}: позиции нет — закрывать нечего; нужно BUY, SELL или WAIT (CLOSE — только при открытой позиции)"
+            return None, f"do={raw_do}: позиции нет — закрывать нечего; нужно BUY, SELL или WAIT (CLOSE — только при открытой позиции)"
         return {"do": "CLOSE", "entry": None, "entry_kind": "сейчас", "take": None,
                 "invalidation": _f(ex.get("invalidation")) or None,
                 "why": str(ex.get("why") or "закрыть позицию")[:300],
@@ -418,45 +421,43 @@ def _validate_exec(ex: Any, play: str, price, in_pos: bool = False) -> tuple[dic
                 "news_ids": [str(i)[:12] for i in ids if isinstance(i, (str, int))][:12],
                 "levels": [], "time_note": str(ex.get("time_note") or "")[:300]}, None
     if do not in ("BUY", "SELL"):
-        return None, (f"do={do or '—'}: нужно BUY, SELL или WAIT (CLOSE — только при открытой позиции)"
+        return None, (f"do={raw_do or '—'}: нужно BUY, SELL или WAIT (CLOSE — только при открытой позиции)"
                       + ("; позиция открыта: держать / CLOSE / перевернуть" if in_pos else ""))
     play = (play or "auto").lower()
     if play == "long" and do != "BUY":
         return None, "режим игры long — разрешён только BUY"
     if play == "short" and do != "SELL":
         return None, "режим игры short — разрешён только SELL"
+    fix = f"сторона {do} принята — исправь уровни: "   # v5.4.2: ошибка в числах, а не оценка решения
     inv = _f(ex.get("invalidation"))
     if inv is None or inv <= 0:
-        return None, "invalidation не задан или ≤0 — позиции без стопа не бывает"
+        return None, fix + "invalidation не задан или ≤0 — позиции без стопа не бывает"
     entry = _f(ex.get("entry")) if ex.get("entry") not in (None, "", "null") else None
     take = _f(ex.get("take")) if ex.get("take") not in (None, "", "null") else None
     if entry is not None and entry <= 0:
-        return None, "entry ≤ 0"
+        return None, fix + "entry ≤ 0"
     if take is not None and take <= 0:
         take = None
     kind = _entry_kind(do, entry, _f(price), ex.get("entry_kind"))
     if kind == "сейчас":
         entry = None
-    if kind == "прорыв" and _f(price):               # до пробития идея не должна быть мертва: стоп за ценой
-        px = _f(price)
-        if (do == "BUY" and inv >= px) or (do == "SELL" and inv <= px):
-            return None, (f"{do} на пробитии {entry:g}: invalidation {inv:g} не {'ниже' if do == 'BUY' else 'выше'} "
-                          f"цены {px:g} — до пробития идея была бы мертва сразу")
+    # прорыв (v5.4.2): стоп — по ту сторону УРОВНЯ входа (ref = entry ниже); стоп между ценой и уровнем — классика
+    # пробоя: до пробития позиции нет, и мёртвой такую идею код не считает
     ref = entry if entry is not None else _f(price)
     if ref:
         if do == "BUY":
             if inv >= ref:
-                return None, f"BUY: invalidation {inv:g} не ниже {'entry' if entry else 'цены'} {ref:g}"
+                return None, fix + f"invalidation {inv:g} не ниже {'entry' if entry else 'цены'} {ref:g}"
             if take is not None and take <= ref:
-                return None, f"BUY: take {take:g} не выше {'entry' if entry else 'цены'} {ref:g}"
+                return None, fix + f"take {take:g} не выше {'entry' if entry else 'цены'} {ref:g}"
         else:
             if inv <= ref:
-                return None, f"SELL: invalidation {inv:g} не выше {'entry' if entry else 'цены'} {ref:g}"
+                return None, fix + f"invalidation {inv:g} не выше {'entry' if entry else 'цены'} {ref:g}"
             if take is not None and take >= ref:
-                return None, f"SELL: take {take:g} не ниже {'entry' if entry else 'цены'} {ref:g}"
+                return None, fix + f"take {take:g} не ниже {'entry' if entry else 'цены'} {ref:g}"
     bad = ai_pilot.AIPilot._plan_valid("long" if do == "BUY" else "short", entry, take, inv)
     if bad:
-        return None, bad
+        return None, fix + bad
     lv = ex.get("levels") if isinstance(ex.get("levels"), (list, tuple)) else []
     out = {"do": do, "entry": entry, "entry_kind": kind, "take": take, "invalidation": inv,
            "why": str(ex.get("why") or "")[:300],
@@ -554,8 +555,8 @@ def _exec_text(m: Mission) -> str:
     ex = m.exec or {}
     if not ex:
         return ""
-    if str(ex.get("do") or "").upper() == "WAIT":     # v5.4.1: совет решил стоять вне рынка
-        return (f"Приказ ({ai_v5.fmt_ts(m.exec_ts)}): WAIT — вне рынка, ждём: {ex.get('wait_for') or ex.get('why') or '—'} "
+    if str(ex.get("do") or "").upper() == "WAIT":     # v5.4.1: совет решил стоять вне рынка (5.4.2: это его прошлое мнение)
+        return (f"Приказ ({ai_v5.fmt_ts(m.exec_ts)}): WAIT — совет ждал: {ex.get('wait_for') or ex.get('why') or '—'} "
                 f"(уверенность {ex.get('confidence')}) — {ex.get('why')}\n"
                 f"План: {ex.get('plan')}\nТайминг: {ex.get('time_note')}")
     return (f"Приказ ({ai_v5.fmt_ts(m.exec_ts)}): {ex.get('do')} entry={ex.get('entry')} "
@@ -1434,8 +1435,10 @@ class MissionPilot(ai_pilot.AIPilot):
             L.append("Позиции нет, засады нет — полностью вне рынка")
             m0 = self.mission
             if m0 is not None and str((m0.exec or {}).get("do") or "").upper() == "WAIT":
-                L.append(f"ПРИКАЗ СОВЕТА: WAIT — вне рынка, ждём: {m0.exec.get('wait_for') or m0.exec.get('why') or '—'} "
-                         f"(совет {int((now - _f(m0.exec_ts, now)) // 60)} мин назад; войти можешь сам, если перевес появился)")
+                # v5.4.2: WAIT совета — его прошлое мнение, а не запрет и не «вход — исключение»
+                L.append(f"ПРИКАЗ СОВЕТА ({int((now - _f(m0.exec_ts, now)) // 60)} мин назад): вне рынка; совет ждал: "
+                         f"{m0.exec.get('wait_for') or m0.exec.get('why') or '—'}. Это прошлое мнение, а не запрет: "
+                         f"реши заново — КУПИТЬ_СЕЙЧАС / ПРОДАТЬ_СЕЙЧАС с уровнями или ЖДЁМ")
         L.append(f"Депозит {self.deposit:.0f} ₽, результат сессии {sum(self.pnls):+.0f} ₽ за {len(self.pnls)} сделок")
         acc_line = self._account_line()
         if acc_line:
@@ -1476,6 +1479,11 @@ class MissionPilot(ai_pilot.AIPilot):
             _persist(m)
 
     # ── перепроверка дежурного PRO ────────────────────────────────────────────────
+    def _parse_choice(self, raw: str, in_pos: bool, side: str | None = None) -> str | None:
+        """v5.4.2: слово перепроверки по словарю ai_v5.review_table (целые слова, латиница, Ё=Е): токен или None —
+        «не разобрано» (решения нет, переспрос), а не молчаливый ЖДЁМ базового разбора подстрок."""
+        return ai_v5.decision_of(raw, ai_v5.review_table(in_pos, side))
+
     async def _review(self, price: float) -> None:
         m = self.mission
         in_pos = self.position is not None
@@ -1504,6 +1512,8 @@ class MissionPilot(ai_pilot.AIPilot):
             "news": news_txt, "watch": watch_txt, "scan": _scan_text(m) if m else "",
             "wyckoff": (m.layers.get("wyckoff") if m else "") or "", "scout": scout_txt,
             "partners": partners_txt, "memory": (m.memory if m else "") or ""})
+        # v5.4.2: снимок решения — цена, которую PRO видит в промпте (после сбора данных, а не при запуске задачи)
+        price, snap_ts = (self.prices[-1] if self.prices else price), time.time()
         situation = self._situation_for_ai(price)     # W3: блок ПРОКОЛ СКАНЕРА первым, пока PRO его не разобрал
         if self._review_reason:
             situation += f"\nПОВОД ПЕРЕПРОВЕРКИ (внеплановая): {self._review_reason}"
@@ -1534,26 +1544,36 @@ class MissionPilot(ai_pilot.AIPilot):
         if not isinstance(obj, dict):
             self._review_silent("ответ не JSON-объект")
             return
+        # v5.4.2: слово решения — по словарю перепроверки (BUY/LONG/ЛОНГ → КУПИТЬ, CLOSE/EXIT/ЗАФИКСИРОВАТЬ в позиции →
+        # ЗАКРЫТЬ, «НЕ …» и «… или …» → не разобрано) ДО сброса повода: не разобрано → решения не было, ранний повтор
+        # с сохранённым поводом и без записи «ЖДЁМ» за ИИ
+        pos_side = (self.position or {}).get("side")
+        raw_choice = ai_v5.decision_raw(obj)
+        choice = self._parse_choice(raw_choice, in_pos, pos_side)
+        if choice is None:
+            self._review_silent(f"ответ не разобран: {raw_choice[:60] or 'пусто'}")
+            return
         self._last_review_ts = time.time()
         if self._review_pulled:
             self._last_event_review_ts = self._last_review_ts   # пейсинг событий — от ответа PRO
         self._review_reason, self._review_kind, self._review_pulled = None, None, False
+        self._review_deferred = None                 # отложенное решение (если было) PRO только что видел в поводе
         self._council_blocked = ""
         if m is not None:
             m.sizes["review"] = _sizes_rec(len(u), sb, _json_len(obj))
-        pos_side = (self.position or {}).get("side")
-        choice = self._parse_choice(str(obj.get("choice") or ""), in_pos, pos_side)
         why = str(obj.get("why") or "")[:300]
         note = str(obj.get("note") or "")[:400]
-        # режим игры: сторона против режима → ЖДЁМ с пометкой
+        # режим игры (воля владельца): вход против режима — не «ЖДЁМ» за ИИ, а своя запись ВНЕ_РЕЖИМА и переспрос;
+        # ПЕРЕВЕРНУТЬ против режима — выходная половина разрешена: ЗАКРЫТЬ
         play = self._play()
+        ai_choice = choice
         if (choice == "КУПИТЬ_СЕЙЧАС" and play == "short") or (choice == "ПРОДАТЬ_СЕЙЧАС" and play == "long"):
-            why = f"[{choice} против режима {play} — ЖДЁМ] " + why
-            choice = "ЖДЁМ"
+            why = f"[{choice} против режима {play} — не исполнено, переспрошу] " + why
+            choice = "ВНЕ_РЕЖИМА"
         if choice == "ПЕРЕВЕРНУТЬ" and pos_side and ((pos_side == "long" and play == "long")
                                                        or (pos_side == "short" and play == "short")):
-            why = f"[ПЕРЕВЕРНУТЬ против режима {play} — ЖДЁМ] " + why
-            choice = "ЖДЁМ"
+            why = f"[ПЕРЕВЕРНУТЬ против режима {play} — только ЗАКРЫТЬ] " + why
+            choice = "ЗАКРЫТЬ"
         self.last_review = {"choice": choice, "why": why, "ts": time.time()}
         if self.puncture and self.puncture.get("pending"):    # W3: PRO разобрал прокол — блок больше не первым
             self.puncture["pending"] = False
@@ -1561,6 +1581,8 @@ class MissionPilot(ai_pilot.AIPilot):
         rec = {"ts": time.time(), "choice": choice, "why": why, "note": note,
                "entry": _f(obj.get("entry")), "entry_kind": str(obj.get("entry_kind") or "")[:12] or None,
                "invalidation": _f(obj.get("invalidation")), "take": _f(obj.get("take")), "price": price}
+        if ai_choice != choice:
+            rec["ai_choice"] = ai_choice                 # что ответил ИИ (запись — что сделал код и почему)
         if m is not None:
             m.reviews.append(rec)
             del m.reviews[:-REVIEWS_KEEP]
@@ -1581,23 +1603,46 @@ class MissionPilot(ai_pilot.AIPilot):
         log.info("миссия %s: перепроверка → %s (%s)", self.base, choice, why)
         # ── исполнение решения ──
         cur = self.prices[-1] if self.prices else price
+        pos_side = (self.position or {}).get("side")     # v5.4.2: состояние — после ответа PRO (он думал минуты)
+        entry_like = choice in ("КУПИТЬ_СЕЙЧАС", "ПРОДАТЬ_СЕЙЧАС", "ДОБРАТЬ", "ПЕРЕВЕРНУТЬ")
         if choice == "ЗАКРЫТЬ" and self.position:
             await self._close_all(cur, "решение перепроверки: закрыть")
         elif choice == "ЖДЁМ" and self.position:
             self._retune(obj, cur)
-        elif choice in ("КУПИТЬ_СЕЙЧАС", "ПРОДАТЬ_СЕЙЧАС") and not self.position and not self._reanalyzing:
-            self._plan_from_review(choice, obj, why, price, cur)
-        elif choice == "ДОБРАТЬ" and self.position and not self._reanalyzing:
+        elif entry_like and self._reanalyzing:
+            # v5.4.2: совет начался, пока PRO думал, — решение не пропадает молча: повод дежурному PRO после совета
+            head = f"решение перепроверки {choice} отложено: идёт совет"
+            self._review_deferred = {"ts": time.time(), "text": head + (f" — {why[:160]}" if why else "")}
+            self._review_reason, self._review_kind = self._review_deferred["text"], "pilot"
+            self.last_action = head + " — вернусь к нему после совета"
+            log.info("миссия %s: %s", self.base, self.last_action)
+        elif choice in ("КУПИТЬ_СЕЙЧАС", "ПРОДАТЬ_СЕЙЧАС") and not self.position:
+            self._plan_from_review(choice, obj, why, price, cur, snap_ts=snap_ts)
+        elif choice == "ДОБРАТЬ" and self.position:
             # докупить до максимума, что даёт биржа: план той же стороны «сейчас» — тик доберёт
             self._plan_from_review("КУПИТЬ_СЕЙЧАС" if pos_side == "long" else "ПРОДАТЬ_СЕЙЧАС",
-                                   obj, why, price, cur, topup=True)
-        elif choice == "ПЕРЕВЕРНУТЬ" and self.position and not self._reanalyzing:
+                                   obj, why, price, cur, topup=True, snap_ts=snap_ts)
+        elif choice == "ПЕРЕВЕРНУТЬ" and self.position:
             # закрыть и войти в другую сторону на максимум: план другой стороны → тик закроет (флип) и войдёт
             self._plan_from_review("ПРОДАТЬ_СЕЙЧАС" if pos_side == "long" else "КУПИТЬ_СЕЙЧАС",
-                                   obj, why, price, cur, flip=True)
+                                   obj, why, price, cur, flip=True, snap_ts=snap_ts)
+        elif choice == "ВНЕ_РЕЖИМА":
+            # вход против режима игры владельца: не исполняем и не пишем «ЖДЁМ» за ИИ — переспрос с пометкой
+            self._review_reason = f"прошлый ответ {ai_choice} запрещён режимом {play}"
+            self._review_kind = "pilot"
+            self.review_ts = min(self.review_ts, time.time() + REVIEW_RETRY_SEC)
+            wait = max(0, int(self.review_ts - time.time()))
+            self.last_action = (f"перепроверка: {ai_choice} против режима {play} — не исполнено, "
+                                f"переспрошу через {wait // 60} мин {wait % 60} с")
+            log.info("миссия %s: %s", self.base, self.last_action)
         elif choice == "НОВЫЙ_АНАЛИЗ":
             self._fire_reanalyze("перепроверка потребовала свежий разбор: " + (why or "картина сломалась"))
-        # ЖДЁМ без позиции — осознанное решение: держим как есть
+        elif choice != "ЖДЁМ":
+            # позиция открылась/закрылась, пока PRO думал: решение к нынешнему состоянию не относится — видно в панели
+            self.last_action = (f"решение перепроверки {choice} не исполнено: "
+                                f"{'позиция уже открыта' if self.position else 'позиции уже нет'} — решу на следующей")
+            log.info("миссия %s: %s", self.base, self.last_action)
+        # ЖДЁМ без позиции — осознанное решение ИИ: держим как есть
 
     def _retune(self, obj: dict, cur: float) -> None:
         """ЖДЁМ в позиции с новыми invalidation/take: PRO передвигает трос и тейк (сторона проверяется;
@@ -1630,20 +1675,36 @@ class MissionPilot(ai_pilot.AIPilot):
             log.info("миссия %s: %s", self.base, self.last_action)
 
     def _plan_from_review(self, choice: str, obj: dict, why: str, price: float, cur: float,
-                          topup: bool = False, flip: bool = False) -> None:
-        """КУПИТЬ/ПРОДАТЬ от дежурного PRO → план: сейчас / откат / прорыв. Дрейф решения направленный:
-        цена лучше снимка — входим (подарок, не повод для нового разбора); цена убежала хуже снимка
-        более чем на DRIFT_FRAC — не гонимся, засада-откат по цене решения.
-        topup — добор той же стороны до максимума (в позиции); flip — переворот (тик закроет и войдёт)."""
+                          topup: bool = False, flip: bool = False, snap_ts: float | None = None) -> None:
+        """КУПИТЬ/ПРОДАТЬ от дежурного PRO → план: сейчас / откат / прорыв. price — снимок решения (цена в промпте
+        PRO), cur — цена после ответа. v5.4.2: дрейф хуже снимка больше PYTHIA_ENTRY_DRIFT_PCT — не тихая засада по
+        старой цене, а план «сейчас» со снимком и пометкой gate_note: решит дверь по живой цене; цена лучше снимка —
+        входим. План несёт src (review / topup) и снимок (snap_price, snap_ts) — свежее решение PRO бьётся без второго
+        вопроса у двери (_entry_gate). План той же стороны, по которому дверь уже думает, обновляется на месте — её
+        ответ ВОЙТИ не выбрасывается. topup — добор той же стороны до максимума (в позиции); flip — переворот."""
         side = "long" if choice == "КУПИТЬ_СЕЙЧАС" else "short"
+        now = time.time()
+        snap = {"snap_price": round(price, 6) if price else cur, "snap_ts": snap_ts or now}
+
+        def _put(new: dict) -> bool:
+            """План в пилот: та же сторона и дверь думает → на месте (ts и состояние двери живы). Возврат: на месте?"""
+            old = self.plan
+            if old is not None and old.get("side") == new["side"] and old.get("gate_busy") and not flip:
+                for k in ("gate_note", "gate_wait_ts"):      # пометки прошлого решения — решение свежее
+                    old.pop(k, None)
+                old.update(new)
+                return True
+            self.plan = dict(new, ts=now)
+            return False
+
         if topup and self.position:
             pos = self.position
             inv = _f(obj.get("invalidation")) if obj.get("invalidation") not in (None, "", "null") else None
             take = _f(obj.get("take")) if obj.get("take") not in (None, "", "null") else None
-            self.plan = {"side": side, "entry": None, "kind": "сейчас",
-                         "take": take if take and take > 0 else pos.get("take"),
-                         "invalidation": inv if inv and inv > 0 else pos.get("invalidation"),
-                         "why": "перепроверка: ДОБРАТЬ — " + why, "ts": time.time()}
+            _put({"side": side, "entry": None, "kind": "сейчас",
+                  "take": take if take and take > 0 else pos.get("take"),
+                  "invalidation": inv if inv and inv > 0 else pos.get("invalidation"),
+                  "why": "перепроверка: ДОБРАТЬ — " + why, "src": "topup", **snap})
             if inv and inv > 0 and ((side == "long" and inv < cur) or (side == "short" and inv > cur)):
                 self._set_levels(pos, take, inv)
                 pos["restop"] = True
@@ -1651,46 +1712,48 @@ class MissionPilot(ai_pilot.AIPilot):
             log.info("миссия %s: %s", self.base, self.last_action)
             return
         sgn = 1.0 if side == "long" else -1.0
+        lim = float(getattr(config, "PYTHIA_ENTRY_DRIFT_PCT", 1.0)) / 100.0
         entry = _f(obj.get("entry")) if obj.get("entry") not in (None, "", "null") else None
         if entry is not None and entry <= 0:
             entry = None
         kind = _entry_kind("BUY" if side == "long" else "SELL", entry, cur, obj.get("entry_kind"))
         if kind == "сейчас":
             entry = None
-        drift_note = ""
+        drift_note, gate_note = "", ""
         if entry is None and price:
             adverse = (cur - price) / price * sgn    # > 0 — цена ушла ХУЖЕ снимка, < 0 — лучше
-            if adverse > ai_pilot.DRIFT_FRAC:
-                entry, kind = price, "откат"
-                drift_note = (f" (цена ушла на {adverse * 100:.2f}% от снимка {price:g} за время раздумий — "
-                              f"не гонюсь, засада по цене решения)")
-            elif adverse < -ai_pilot.DRIFT_FRAC:
+            if adverse > lim:
+                gate_note = f"цена ушла на {adverse * 100:.2f}% за время раздумий (было {price:g}, стало {cur:g})"
+                drift_note = f" ({gate_note} — решит дверь по живой цене)"
+            elif adverse < -lim:
                 drift_note = f" (цена лучше снимка {price:g} на {-adverse * 100:.2f}% — вхожу)"
         ref = entry if entry is not None else cur
         inv = _f(obj.get("invalidation"), 0.0) if obj.get("invalidation") not in (None, "", "null") else 0.0
+        # прорыв (v5.4.2): стоп — по ту сторону уровня входа (ref); между ценой и уровнем — законный стоп пробоя
         good = inv > 0 and ((inv < ref) if side == "long" else (inv > ref))
-        if good and kind == "прорыв":                # до пробития идея не должна быть мертва: стоп за ценой
-            good = (inv < cur) if side == "long" else (inv > cur)
         if not good:
-            base = cur if kind == "прорыв" else ref
-            inv = base * (1 - ai_pilot.EMERGENCY_STOP_FRAC if side == "long" else 1 + ai_pilot.EMERGENCY_STOP_FRAC)
+            inv = ref * (1 - ai_pilot.EMERGENCY_STOP_FRAC if side == "long" else 1 + ai_pilot.EMERGENCY_STOP_FRAC)
             log.warning("перепроверка без валидного invalidation — аварийный стоп %.6g (политика %.1f%%)",
                         inv, ai_pilot.EMERGENCY_STOP_FRAC * 100)
         take = _f(obj.get("take")) if obj.get("take") not in (None, "", "null") else None
         if take is not None and not ((side == "long" and take > ref) or (side == "short" and take < ref)):
             log.warning("тейк %s не с той стороны от %s — снят", take, ref)
             take = None
-        self.plan = {"side": side, "entry": entry, "kind": kind, "take": take, "invalidation": round(inv, 6),
-                     "why": "перепроверка: " + ("ПЕРЕВЕРНУТЬ — " if flip else "") + why + drift_note, "ts": time.time()}
+        new = {"side": side, "entry": entry, "kind": kind, "take": take, "invalidation": round(inv, 6),
+               "why": "перепроверка: " + ("ПЕРЕВЕРНУТЬ — " if flip else "") + why + drift_note, "src": "review", **snap}
+        if gate_note:
+            new["gate_note"] = gate_note
+        in_place = _put(new)
         self._break_n = 0
         if self.pending:
             self._cancel_entry = True
-        if not self.position:
+        if not self.position and not in_place:
             self.state = "ЗАСАДА" if entry is not None else "ВХОЖУ"
         how = ("вход сейчас" if entry is None else
                f"вход на пробитии @{entry:g}" if kind == "прорыв" else f"засада (откат) @{entry:g}")
         self.last_action = (f"перепроверка: {'ПЕРЕВЕРНУТЬ → ' if flip else choice + ' → '}{side}, {how}, "
-                            f"стоп {self.plan['invalidation']:g}, тейк {take}{drift_note}")
+                            f"стоп {self.plan['invalidation']:g}, тейк {take}{drift_note}"
+                            + (" — план обновлён на месте, дверь уже думает над входом" if in_place else ""))
         log.info("миссия %s: %s", self.base, self.last_action)
 
     # журнал сделок
@@ -1811,6 +1874,7 @@ class MissionPilot(ai_pilot.AIPilot):
                     _bg(bus.stage("mission", m.run_id, "pilot", "progress", ticker=self.base,
                                   detail=self.last_action))
                 return False
+        deferred = getattr(self, "_review_deferred", None)
         ok = super().adopt_forecast(forecast)
         self._council_kind = ""
         if ok and not self._last_reanalyze_ts:
@@ -1819,6 +1883,15 @@ class MissionPilot(ai_pilot.AIPilot):
             self._review_reason, self._review_kind, self._review_pulled = None, None, False
             self._council_blocked = ""               # совет только что всё рассмотрел
             self._break_n = 0
+            if deferred:
+                # v5.4.2: решение перепроверки пришло, пока шёл совет (он его не видел): совет не дал входа — решение
+                # не пропадает, дежурный PRO вернётся к нему вскоре; дал план — совет новее, решение снято (в логе)
+                self._review_deferred = None
+                if not self.plan and not self.position and not self._close_pending:
+                    self._review_reason, self._review_kind = deferred.get("text"), "pilot"
+                    self.review_ts = min(self.review_ts, time.time() + EVENT_MIN_GAP_SEC)
+                else:
+                    log.info("миссия %s: %s — снято: совет дал свой приказ", self.base, deferred.get("text"))
             if isinstance(ex, dict) and str(ex.get("do") or "").upper() == "CLOSE":
                 return ok
             if self.plan and isinstance(ex, dict):
@@ -1828,6 +1901,10 @@ class MissionPilot(ai_pilot.AIPilot):
                                        self.prices[-1] if self.prices else getattr(m, "ctx_price", None),
                                        kind)
                 self.plan["kind"] = kind
+                # v5.4.2: источник и снимок плана — приказ совета (он старше живого рынка: у двери спрашиваем всегда)
+                self.plan["src"] = "council"
+                self.plan["snap_price"] = _f(getattr(m, "ctx_price", None)) or (self.prices[-1] if self.prices else None)
+                self.plan["snap_ts"] = _f(getattr(m, "exec_ts", None)) or time.time()
                 if kind == "прорыв":
                     self.last_action = self.last_action.replace("засада @", "вход на пробитии @")
         return ok
@@ -2249,7 +2326,15 @@ class MissionPilot(ai_pilot.AIPilot):
         obj = await ai_v5.money_json(s, u, route="mission_guard")     # v5.4.1: узел у денег — PRO (PYTHIA_MONEY_MODEL)
         if m is not None:
             m.sizes["guard"] = _sizes_rec(len(u), {"situation": situation, **blocks}, _json_len(obj))
-        return obj if isinstance(obj, dict) else {}
+        obj = obj if isinstance(obj, dict) else {}
+        # v5.4.2: слово — по словарю троса (CLOSE/EXIT/ВЫЙТИ → СЛИТЬ, HOLD/ДЕРЖАТЬ → ЖДАТЬ); не разобрано — правило
+        # прежнее (у троса это слив), с честной пометкой
+        raw = ai_v5.decision_raw(obj)
+        tok = ai_v5.decision_of(raw, ai_v5.guard_table())
+        if tok is None:
+            obj = dict(obj, why=f"ответ не разобран ({raw[:40] or 'пусто'}) — по правилу СЛИТЬ"
+                       + (f"; {obj.get('why')}" if obj.get("why") else ""))
+        return dict(obj, decision=tok or "СЛИТЬ")
 
     def _guards_text(self) -> str:
         return "\n".join(f"{ai_v5.fmt_ts(g.get('ts'))} {'тейк' if g.get('side') == 'take' else 'трос'}: {g.get('decision')} "
@@ -2310,7 +2395,15 @@ class MissionPilot(ai_pilot.AIPilot):
         obj = await ai_v5.money_json(s, u, route="mission_take")      # v5.4.1: узел у денег — PRO (PYTHIA_MONEY_MODEL)
         if m is not None:
             m.sizes["take"] = _sizes_rec(len(u), {"situation": situation, **blocks}, _json_len(obj))
-        return obj if isinstance(obj, dict) else {}
+        obj = obj if isinstance(obj, dict) else {}
+        # v5.4.2: слово — по словарю тейка (CLOSE/EXIT/ЗАБРАТЬ → ЗАФИКСИРОВАТЬ, HOLD/ДЕРЖАТЬ → ПОДЕРЖАТЬ); не разобрано —
+        # правило прежнее (у тейка это фиксация), с честной пометкой
+        raw = ai_v5.decision_raw(obj)
+        tok = ai_v5.decision_of(raw, ai_v5.take_table())
+        if tok is None:
+            obj = dict(obj, why=f"ответ не разобран ({raw[:40] or 'пусто'}) — по правилу ЗАФИКСИРОВАТЬ"
+                       + (f"; {obj.get('why')}" if obj.get("why") else ""))
+        return dict(obj, decision=tok or "ЗАФИКСИРОВАТЬ")
 
     async def _apply_take(self, r: dict, price: float, pos: dict) -> None:
         await super()._apply_take(r, price, pos)
@@ -2416,7 +2509,8 @@ class MissionPilot(ai_pilot.AIPilot):
         return f"{plan.get('side')} {plan.get('kind') or 'откат'} @{_f(e, 0.0):g}"
 
     def _gate_line(self, plan: dict) -> str:
-        """Строка о проверке входа для ситуации PRO (перепроверка/триаж): думает / велел ждать / прошлые ответы."""
+        """Строка о проверке входа для ситуации PRO (перепроверка/триаж): думает / велел ждать / прошлые ответы.
+        v5.4.2: молчание у двери — «ответа не было, повтор в …», а не «велел ждать»; одобренный вход — как есть."""
         if not plan or not self._entry_check_on():
             return ""
         mm = self._money_name()
@@ -2424,21 +2518,27 @@ class MissionPilot(ai_pilot.AIPilot):
         parts = []
         if plan.get("gate_busy"):
             parts.append(f"{mm} сейчас проверяет вход у двери")
-        after = _f(plan.get("gate_after"), 0.0)
-        if after > now:
-            parts.append(f"{mm} у двери велел ждать до {ai_v5.fmt_ts(after)}" + (f" ({plan.get('gate_note')})" if plan.get("gate_note") else ""))
         mine = [g for g in self.gates if g.get("plan_ts") == plan.get("ts")]
-        if mine:
-            g = mine[-1]
-            parts.append(f"проверок входа по этому плану: {len(mine)}, последняя {ai_v5.fmt_ts(g.get('ts'))}: "
-                         f"{g.get('decision')} — {str(g.get('why') or '')[:160]}")
+        last = mine[-1] if mine else None
+        after = _f(plan.get("gate_after"), 0.0)
+        if _f(plan.get("approved_until"), 0.0) > now:
+            parts.append(f"{mm} у двери сказал ВОЙТИ; вход ждёт снятия временного запрета"
+                         + (f" ({plan.get('gate_note')})" if plan.get("gate_note") else ""))
+        elif after > now and not (last and last.get("silent")):
+            parts.append(f"{mm} у двери велел ждать до {ai_v5.fmt_ts(after)}" + (f" ({plan.get('gate_note')})" if plan.get("gate_note") else ""))
+        if last:
+            txt = str(last.get("why") or "")[:200] if last.get("silent") else \
+                f"{last.get('decision')} — {str(last.get('why') or '')[:160]}"
+            parts.append(f"проверок входа по этому плану: {len(mine)}, последняя {ai_v5.fmt_ts(last.get('ts'))}: {txt}")
         return ("ПРОВЕРКА ВХОДА: " + "; ".join(parts)) if parts else ""
 
     def _gates_text(self, plan: dict) -> str:
-        """Прошлые ответы PRO у двери по ЭТОМУ плану (для промпта проверки входа)."""
-        return "\n".join(f"{ai_v5.fmt_ts(g.get('ts'))} @{g.get('price')}: {g.get('decision')} — {g.get('why')}"
-                         + (f" (уровень {g.get('entry_kind')} @{g.get('entry')})" if g.get("entry") else "")
-                         + (f" (ждать {g.get('wait_minutes')} мин)" if g.get("wait_minutes") else "")
+        """Прошлые ответы PRO у двери по ЭТОМУ плану (для промпта проверки входа). v5.4.2: молчание и непонятный
+        ответ — «ответа не было … решения не было» (запись кода), не ответ ИИ «ЖДАТЬ»."""
+        return "\n".join((f"{ai_v5.fmt_ts(g.get('ts'))} @{g.get('price')}: {g.get('why')}" if g.get("silent") else
+                          f"{ai_v5.fmt_ts(g.get('ts'))} @{g.get('price')}: {g.get('decision')} — {g.get('why')}"
+                          + (f" (уровень {g.get('entry_kind')} @{g.get('entry')})" if g.get("entry") else "")
+                          + (f" (ждать {g.get('wait_minutes')} мин)" if g.get("wait_minutes") else ""))
                          for g in self.gates if g.get("plan_ts") == plan.get("ts"))
 
     def _plan_text(self, plan: dict, price: float) -> str:
@@ -2458,11 +2558,46 @@ class MissionPilot(ai_pilot.AIPilot):
                  + ("; это ДОБОР к открытой позиции той же стороны" if self.position and self.position.get("side") == plan.get("side") else ""))
         return "\n".join(x for x in L if x)
 
+    # v5.4.2: подготовка данных узла у денег (живой рынок, разведка, партнёры, сжатие блоков) — свой срок, не из
+    # времени ИИ; одобренный у двери вход, упёршийся во временный запрет, живёт APPROVE_SEC без нового вопроса
+    MONEY_PREP_SEC = 120.0
+    APPROVE_SEC = 300.0
+
+    @staticmethod
+    def _hhmm(ts) -> str:
+        """«14:05» — время МСК (fmt_ts без даты)."""
+        return ai_v5.fmt_ts(ts).split(" ")[-1]
+
+    @staticmethod
+    def _adverse(side: str | None, ref, cur) -> float:
+        """Насколько цена cur ушла ХУЖЕ ref для стороны (доля; < 0 — лучше). Нет цены → 0."""
+        ref, cur = _f(ref, 0.0), _f(cur, 0.0)
+        if ref <= 0 or cur <= 0:
+            return 0.0
+        return (cur - ref) / ref * (1.0 if side == "long" else -1.0)
+
+    async def _money_call(self, system: str, user: str, *, route: str, attempt_timeout: float):
+        """ai_v5.money_json со сроком каждой попытки (v5.4.2); подмена без attempt_timeout (старые фейки) — без него."""
+        fn = ai_v5.money_json
+        try:
+            ps = inspect.signature(fn).parameters
+            takes = "attempt_timeout" in ps or any(x.kind is inspect.Parameter.VAR_KEYWORD for x in ps.values())
+        except (TypeError, ValueError):
+            takes = True
+        if takes:
+            return await fn(system, user, route=route, attempt_timeout=attempt_timeout)
+        return await fn(system, user, route=route)
+
     async def _entry_gate(self, price: float, book: dict | None) -> bool:
         """Хук AIPilot.tick §3 перед каждой заявкой входа по плану. Выключено (PYTHIA_ENTRY_CHECK=0) → вход сразу.
         Включено: PRO спрашивается фоном (_gate_bg) с теми же данными, что у троса; тик не входит (False) — по
         «ВОЙТИ» задача входит сама (_enter по текущей цене/стакану); пока думает — plan["gate_busy"], состояние
-        У_ДВЕРИ; ЖДАТЬ со сроком / молчание → plan["gate_after"], до него вопросов нет."""
+        У_ДВЕРИ; ЖДАТЬ со сроком / молчание → plan["gate_after"], до него вопросов нет.
+        v5.4.2 «свободный пилот»: (1) ВОЙТИ у двери, упёршийся во временный запрет, — вход без нового вопроса, когда
+        запрет снят (approved_until, дрейф в пределах); (2) биржа не даёт этой стороны ни лота — план снят с честной
+        причиной, вопрос дежурному PRO; (3) свежее решение PRO по живому рынку (src review / topup / gate_level /
+        profit, не старше PYTHIA_ENTRY_FRESH_SEC, цена не хуже снимка больше PYTHIA_ENTRY_DRIFT_PCT) — без второго
+        вопроса у двери; приказ совета и протухшее / уехавшее решение — через дверь, как в 5.4.1."""
         plan = self.plan
         if not plan or not self._entry_check_on():
             return True
@@ -2480,12 +2615,67 @@ class MissionPilot(ai_pilot.AIPilot):
         if now < after:
             if not topup:
                 self.state = "ЗАСАДА"
-            self.last_action = (f"{pre}{mm} у двери велел ждать до {ai_v5.fmt_ts(after)}"
-                                + (f" ({plan.get('gate_note')})" if plan.get("gate_note") else "")
-                                + f" — {self._plan_how(plan)}, цена {price:g}")
+            if plan.get("gate_silent"):              # молчание — не решение ИИ: не «велел ждать»
+                self.last_action = (f"{pre}{mm} не ответил у двери — решения не было, повтор в {self._hhmm(after)}"
+                                    f" — {self._plan_how(plan)}, цена {price:g}")
+            else:
+                self.last_action = (f"{pre}{mm} у двери велел ждать до {ai_v5.fmt_ts(after)}"
+                                    + (f" ({plan.get('gate_note')})" if plan.get("gate_note") else "")
+                                    + f" — {self._plan_how(plan)}, цена {price:g}")
             return False
+        side = plan.get("side")
+        lim = float(getattr(config, "PYTHIA_ENTRY_DRIFT_PCT", 1.0)) / 100.0
+        m = self.mission
+        # (1) ВОЙТИ уже сказан у двери, а вход упёрся во временный запрет (заявка в полёте, бэкофф, рынок, планка)
+        if _f(plan.get("approved_until"), 0.0) > now:
+            blocked = self._entry_blocked(price, plan)
+            drift = self._adverse(side, plan.get("approved_px"), price)
+            if blocked is None and drift <= lim:
+                plan.pop("approved_until", None)
+                plan.pop("gate_note", None)
+                self.last_action = f"{pre}запрет снят — вход по ответу {mm} у двери ВОЙТИ без нового вопроса"
+                log.info("миссия %s: %s", self.base, self.last_action)
+                return True
+            if blocked is not None:
+                self.last_action = f"{pre}{mm} у двери сказал ВОЙТИ — жду: {blocked}"
+                return False
+            plan.pop("approved_until", None)         # цена ушла от одобренной — спросить заново с этой пометкой
+            plan["gate_note"] = (f"цена ушла на {drift * 100:.2f}% от одобренной у двери "
+                                 f"{_f(plan.get('approved_px'), 0.0):g} (стало {price:g})")
+        # (2) биржа не даёт этой стороны ни лота (шорт недоступен / нет ГО) — не зовём ИИ к двери впустую
+        if not topup:
+            await self._refresh_max(price)
+            mx = self._mx
+            if mx and now - _f(mx.get("ts"), 0.0) <= ai_pilot.MX_TTL_SEC * 3 \
+                    and int(mx.get("buy" if side == "long" else "sell") or 0) <= 0:
+                reason = f"биржа не даёт {side}: лотов 0 — " + ("шорт недоступен или нет ГО" if side == "short" else "нет ГО")
+                self.plan = None
+                self._break_n = 0
+                if not self.position:
+                    self.state = "ЖДУ_ПЛАН"
+                log.warning("миссия %s: %s — план снят", self.base, reason)
+                self._ask_review_now(reason, kind="pilot")
+                return False
+        # (3) свежее решение PRO по живому рынку — исполняется без второго вопроса у двери
+        src = str(plan.get("src") or "")
+        fresh_sec = float(getattr(config, "PYTHIA_ENTRY_FRESH_SEC", 1200))
+        snap_ts = _f(plan.get("snap_ts"), 0.0)
+        ref = plan.get("entry") if plan.get("entry") is not None else plan.get("snap_price")   # уровень — цена решения
+        if (src and src != "council" and fresh_sec > 0 and snap_ts and now - snap_ts <= fresh_sec
+                and _f(plan.get("gate_wait_ts"), 0.0) <= snap_ts and _f(ref, 0.0) > 0
+                and self._adverse(side, ref, price) <= lim):
+            self.last_action = (f"{pre}вход по свежему решению {mm} ({src}, {self._hhmm(snap_ts)}) — "
+                                f"без второго вопроса у двери")
+            log.info("миссия %s: %s (%s, цена %s)", self.base, self.last_action, self._plan_how(plan), price)
+            if m is not None:
+                _tolmach(m, "entry_check", f"Вход по свежему решению {mm}",
+                         f"{self._plan_how(plan)} при цене {price:g}: решение {src} в {self._hhmm(snap_ts)} по цене "
+                         f"{_f(ref, 0.0):g}, цена не ушла дальше {lim * 100:g} % — без второго вопроса у двери",
+                         refs={"src": src, "price": price, "snap_ts": snap_ts, "ref": ref})
+            return True
         plan["gate_busy"] = True
         plan["gate_ts"] = now
+        plan["gate_how"] = self._plan_how(plan)       # с каким планом спросили (план могут обновить на месте)
         plan.pop("gate_after", None)
         if not topup:
             self.state = "У_ДВЕРИ"
@@ -2497,7 +2687,10 @@ class MissionPilot(ai_pilot.AIPilot):
     async def _entry_check(self, price: float, plan: dict) -> dict:
         """Вопрос PRO у двери: те же данные, что у троса (ситуация, ход цены, живой рынок, разведка, партнёры,
         сканер, совет, новости, память, ответы у троса/тейка) + приказ и план + прошлые проверки по этому плану →
-        prompts_mission.entry_check → ai_v5.money_json(route="mission_entry")."""
+        prompts_mission.entry_check → ai_v5.money_json(route="mission_entry").
+        v5.4.2: подготовка данных (сжатие в общей очереди FLASH) — свой срок MONEY_PREP_SEC, после него — что есть,
+        с пометкой; у ИИ — PYTHIA_ENTRY_TIMEOUT_SEC на каждую попытку; снимок двери (plan["gate_px"]) — цена в промпте;
+        пометка к вопросу (дрейф, одобренный вход) — в ситуации."""
         m = self.mission
         rid = m.run_id if m else None
         mm = self._money_name()
@@ -2515,14 +2708,34 @@ class MissionPilot(ai_pilot.AIPilot):
             except Exception as e:                   # noqa: BLE001
                 return f"(живой рынок недоступен: {str(e)[:60]})"
 
-        light_txt, scout_txt, partners_txt = await asyncio.gather(
-            _light(), self._scout_fresh(GUARD_SCOUT_TIMEOUT), self._partners_fresh(GUARD_PARTNERS_TIMEOUT))
-        blocks, _sq = await _fit_blocks({
-            "light": light_txt, "news": self._news_quick(), "history": self._history_text(price),
-            "prev_exec": self._plan_text(plan, price), "guard": self._guards_text(), "checks": self._gates_text(plan),
-            "scan": _scan_text(m) if m else "", "scout": scout_txt, "partners": partners_txt,
-            "council": _council_text(), "memory": (m.memory if m else "") or ""})
-        situation = self._situation_for_ai(price)
+        got = {"light": "(живой рынок не успел собраться)", "scout": "", "partners": ""}
+
+        def _src() -> dict:
+            return {"light": got["light"], "news": self._news_quick(), "history": self._history_text(price),
+                    "prev_exec": self._plan_text(plan, price), "guard": self._guards_text(), "checks": self._gates_text(plan),
+                    "scan": _scan_text(m) if m else "", "scout": got["scout"], "partners": got["partners"],
+                    "council": _council_text(), "memory": (m.memory if m else "") or ""}
+
+        async def _prep():
+            got["light"], got["scout"], got["partners"] = await asyncio.gather(
+                _light(), self._scout_fresh(GUARD_SCOUT_TIMEOUT), self._partners_fresh(GUARD_PARTNERS_TIMEOUT))
+            return await _fit_blocks(_src())
+
+        prep_note = ""
+        try:
+            blocks, _sq = await asyncio.wait_for(_prep(), self.MONEY_PREP_SEC)
+        except asyncio.TimeoutError:
+            blocks = _src()
+            prep_note = (f"(подготовка данных не уложилась в {int(self.MONEY_PREP_SEC)} с — блоки даны как есть, "
+                         f"без сжатия; чего нет — того не выдумывай)")
+            log.warning("миссия %s: проверка входа — %s", self.base, prep_note)
+        snap = self.prices[-1] if self.prices else price
+        plan["gate_px"] = snap                        # цена, которую PRO видит в промпте (для дрейфа за раздумья)
+        situation = self._situation_for_ai(snap)
+        if plan.get("gate_note"):
+            situation += f"\nПОМЕТКА К ЭТОМУ ВОПРОСУ: {plan['gate_note']}"
+        if prep_note:
+            situation += "\n" + prep_note
         s, u = prompts_mission.entry_check(
             self.base, self.name, self._play(), situation=situation, plan=blocks["prev_exec"], history=blocks["history"],
             light=blocks["light"], news=blocks["news"], council_text=blocks["council"], scan=blocks["scan"],
@@ -2530,20 +2743,23 @@ class MissionPilot(ai_pilot.AIPilot):
             time_msk=ai_v5.now_msk_str(), checks=blocks["checks"])
         if m is not None:
             m.sizes["entry"] = _sizes_rec(len(u), {"situation": situation, **blocks})
-        obj = await ai_v5.money_json(s, u, route="mission_entry")
+        obj = await self._money_call(s, u, route="mission_entry",
+                                     attempt_timeout=float(getattr(config, "PYTHIA_ENTRY_TIMEOUT_SEC", 1200)))
         if m is not None:
             m.sizes["entry"] = _sizes_rec(len(u), {"situation": situation, **blocks}, _json_len(obj))
         return obj if isinstance(obj, dict) else {}
 
     async def _gate_bg(self, price: float, plan: dict) -> None:
         silent = None
+        tmo = float(getattr(config, "PYTHIA_ENTRY_TIMEOUT_SEC", 1200))
         try:
-            r = await asyncio.wait_for(self._entry_check(price, plan), ai_pilot.ENTRY_TIMEOUT)
+            # у каждой попытки ИИ свой срок (attempt_timeout); общий потолок — подготовка + две попытки + запас
+            r = await asyncio.wait_for(self._entry_check(price, plan), self.MONEY_PREP_SEC + 2 * tmo + 60)
         except asyncio.CancelledError:
             plan["gate_busy"] = False
             raise
         except Exception as e:                       # noqa: BLE001
-            silent = (f"таймаут {int(ai_pilot.ENTRY_TIMEOUT)} с" if isinstance(e, asyncio.TimeoutError)
+            silent = (f"таймаут {int(tmo)} с" if isinstance(e, asyncio.TimeoutError)
                       else (str(e)[:100] or type(e).__name__))
             r = {}
         try:
@@ -2579,71 +2795,108 @@ class MissionPilot(ai_pilot.AIPilot):
         return None
 
     async def _apply_gate(self, r: dict, price: float, plan: dict, silent: str | None = None) -> None:
-        """Ответ PRO у двери. ВОЙТИ → _enter по текущей цене/стакану (цена ушла хуже снимка > DRIFT_FRAC — не гонимся:
-        план «сейчас» → засада по цене снимка, уровень ждём заново); ЖДАТЬ → новый уровень (entry/entry_kind,
-        стороны как у приказа) и/или срок (wait_minutes → gate_after), можно поправить invalidation/take;
-        ОТМЕНИТЬ → план снят, повод дежурному PRO (council=true → полный совет без очереди, handoff `entry`);
-        молчание/сбой/непонятно → входа нет, gate_after = now + PYTHIA_ENTRY_CHECK_COOL_SEC, ошибка в панель.
-        План сменился/снят за время ответа → ответ выброшен (запись остаётся с пометкой)."""
+        """Ответ PRO у двери (слово — ai_v5.door_table по стороне плана: «BUY» у лонга — ВОЙТИ, «НЕ ВХОДИТЬ» — не
+        разобрано). ВОЙТИ → _enter по текущей цене/стакану; вход упёрся во временный запрет → одобрение живёт
+        APPROVE_SEC (войдём без нового вопроса, когда запрет снимется); цена за время раздумий ушла хуже снимка двери
+        больше PYTHIA_ENTRY_DRIFT_PCT → не засада по старой цене, а сразу новый вопрос с пометкой о дрейфе.
+        ЖДАТЬ → новый уровень (entry/entry_kind, стороны как у приказа; план становится gate_level — у уровня вход без
+        второго вопроса, пока решение свежее) и/или срок (wait_minutes → gate_after), можно поправить invalidation/take;
+        ОТМЕНИТЬ → план снят, повод дежурному PRO (council=true → полный совет без очереди, handoff `entry`).
+        v5.4.2: молчание/сбой (НЕТ_ОТВЕТА) и непонятный ответ (НЕ_РАЗОБРАН) — не решение ИИ: запись кода (source «код»,
+        silent), поля ответа не читаются, ни входа, ни отмены — повтор через PYTHIA_SILENT_RETRY_SEC, счёт молчаний
+        подряд plan["gate_silent"] (сброс на любом настоящем ответе), ошибка в панель. План сменился/снят за время
+        ответа → ответ выброшен (запись остаётся с пометкой)."""
         m = self.mission
         mm = self._money_name()
         now = time.time()
         cur = self.prices[-1] if self.prices else price
         cool = float(getattr(config, "PYTHIA_ENTRY_CHECK_COOL_SEC", 300))
-        raw = str(r.get("decision") or "").upper().replace("Ё", "Е").strip()
-        why = str(r.get("why") or "")[:300]
-        unknown = None
-        if silent:
-            decision, why = "ЖДАТЬ", f"{mm} не ответил ({silent}) — входа нет, повтор через {int(cool // 60)} мин"
-        elif "ОТМЕН" in raw or "CANCEL" in raw:
-            decision = "ОТМЕНИТЬ"
-        elif "ВОЙ" in raw or "ВХОД" in raw or "ENTER" in raw or raw in ("GO", "YES", "ДА"):
-            decision = "ВОЙТИ"
-        elif "ЖД" in raw or "WAIT" in raw or "HOLD" in raw:
-            decision = "ЖДАТЬ"
-        else:
-            unknown = raw or "пусто"
-            decision, why = "ЖДАТЬ", f"{mm} ответил непонятно ({unknown}) — входа нет, повтор через {int(cool // 60)} мин"
+        retry = float(getattr(config, "PYTHIA_SILENT_RETRY_SEC", 120))
         side = plan.get("side")
-        e_ai = _f(r.get("entry")) if r.get("entry") not in (None, "", "null") else None
-        rec = {"ts": now, "decision": decision, "why": why, "note": str(r.get("note") or "")[:300], "price": cur,
-               "entry": e_ai if e_ai and e_ai > 0 else None,
-               "entry_kind": (str(r.get("entry_kind") or "").strip().lower() or None),
-               "wait_minutes": _f(r.get("wait_minutes")) or None, "council": bool(r.get("council")),
-               "plan_ts": plan.get("ts"), "side": side, "how": self._plan_how(plan), "model": mm,
-               "silent": bool(silent or unknown), "applied": ""}
+        raw = ai_v5.decision_raw(r)
+        why = str(r.get("why") or "")[:300]
+        if silent:
+            decision = "НЕТ_ОТВЕТА"
+        else:
+            decision = ai_v5.decision_of(raw, ai_v5.door_table(side)) or "НЕ_РАЗОБРАН"
+        no_answer = decision in ("НЕТ_ОТВЕТА", "НЕ_РАЗОБРАН")
+        n_sil = int(plan.get("gate_silent") or 0) + 1 if no_answer else 0
+        if no_answer:
+            head = (f"{mm} не ответил у двери ({silent})" if silent else
+                    f"{mm} ответил у двери непонятно ({raw[:60] or 'пусто'})")
+            why = f"{head} — решения не было, повтор в {self._hhmm(now + retry)}"
+            rec = {"ts": now, "decision": decision, "why": why, "note": "", "price": cur, "entry": None,
+                   "entry_kind": None, "wait_minutes": None, "council": False, "plan_ts": plan.get("ts"), "side": side,
+                   "how": self._plan_how(plan), "model": mm, "silent": True, "source": "код",
+                   "raw": raw[:80] or None, "silent_n": n_sil, "applied": ""}
+        else:
+            e_ai = _f(r.get("entry")) if r.get("entry") not in (None, "", "null") else None
+            rec = {"ts": now, "decision": decision, "why": why, "note": str(r.get("note") or "")[:300], "price": cur,
+                   "entry": e_ai if e_ai and e_ai > 0 else None,
+                   "entry_kind": (str(r.get("entry_kind") or "").strip().lower() or None),
+                   "wait_minutes": _f(r.get("wait_minutes")) or None, "council": bool(r.get("council")),
+                   "plan_ts": plan.get("ts"), "side": side, "how": self._plan_how(plan), "model": mm,
+                   "silent": False, "source": "ИИ", "applied": ""}
         self.gates.append(rec)
         del self.gates[:-ai_pilot.GATES_KEEP]
         applied: list[str] = []
         topup = bool(self.position and self.position.get("side") == side)
+        pre = "добор: " if topup else ""
         if self.plan is not plan:
             rec["applied"] = "план сменился/снят за время ответа — не применено"
             log.info("миссия %s: ответ у двери (%s) выброшен — план сменился", self.base, decision)
+        elif no_answer:
+            # решения ИИ не было: не входим и не отменяем, не пишем «ЖДАТЬ» за него — скорый повтор того же вопроса
+            plan["gate_silent"] = n_sil
+            plan["gate_after"] = now + retry
+            smax = int(getattr(config, "PYTHIA_ENTRY_SILENT_MAX", 2) or 0)
+            applied.append(f"без ответа подряд: {n_sil}")
+            if smax > 0 and n_sil >= smax:
+                applied.append(f"дверь молчит {n_sil} раз подряд — без ответа ИИ вход не исполняю, спрашиваю снова")
+                log.warning("миссия %s: дверь молчит %d раз подряд (%s)", self.base, n_sil, self._plan_how(plan))
+            if not topup:
+                self.state = "ЗАСАДА"
+            self.last_action = pre + why + f" (без ответа подряд: {n_sil})"
+            try:
+                ai_v5.note_error(f"проверка входа {mm}: {silent or 'ответ не разобран: ' + (raw[:60] or 'пусто')}",
+                                 "mission_entry")
+            except Exception:                        # noqa: BLE001
+                pass
         elif decision == "ВОЙТИ":
+            plan.pop("gate_silent", None)
             blocked = self._entry_blocked(cur, plan)
-            sgn = 1.0 if side == "long" else -1.0
-            adverse = (cur - price) / price * sgn if price else 0.0      # > 0 — цена ушла ХУЖЕ снимка, по которому думал PRO
-            if blocked:
+            snap = _f(plan.get("gate_px"), 0.0) or price          # цена, которую PRO видел в промпте
+            adverse = self._adverse(side, snap, cur)              # > 0 — цена ушла ХУЖЕ снимка, по которому думал PRO
+            lim = float(getattr(config, "PYTHIA_ENTRY_DRIFT_PCT", 1.0)) / 100.0
+            asked = plan.get("gate_how")
+            if plan.get("entry") is not None and asked and asked != self._plan_how(plan):
+                # план обновили на месте (перепроверка назвала уровень), пока дверь думала: вход — у нового уровня
+                plan.pop("gate_after", None)
+                applied.append(f"план сменил вход за время ответа ({asked} → {self._plan_how(plan)}) — войду у нового уровня")
+                self.last_action = f"{pre}{mm} у двери: ВОЙТИ ({why or 'без объяснений'}) — но {applied[-1]}"
+            elif blocked and any(k in blocked for k in ("killswitch", "протух", "мертва")):
+                # запрет не временный (стоп-кран дня, приказ протух, идея мертва) — вход не исполняется, тик решит сам
                 plan["gate_after"] = now + 60.0
-                plan["gate_note"] = f"войти не вышло: {blocked}"
                 applied.append(f"вход не выполнен: {blocked}")
-                self.last_action = f"{mm} у двери: ВОЙТИ ({why or 'без объяснений'}) — но {blocked}"
-            elif adverse > ai_pilot.DRIFT_FRAC:
-                # PRO думал долго, а цена убежала хуже снимка более чем на DRIFT_FRAC — не гонимся (как у перепроверки):
-                # план «сейчас» → засада по цене снимка, уровень остаётся уровнем; новый вопрос — когда цена вернётся
-                if plan.get("entry") is None:
-                    plan["entry"], plan["kind"] = round(price, 6), "откат"
-                    self._break_n = 0
-                    how = f"засада по цене снимка @{price:g}"
-                else:
-                    how = f"жду уровень {plan.get('kind')} @{_f(plan.get('entry'), 0.0):g} заново"
-                plan["gate_after"] = now + 60.0
-                plan["gate_note"] = f"цена ушла на {adverse * 100:.2f}% хуже снимка {price:g} — не гонюсь"
-                applied.append(f"цена {cur:g} ушла на {adverse * 100:.2f}% хуже снимка {price:g} за время раздумий — не гонюсь, {how}")
-                rec["entry"], rec["entry_kind"] = plan.get("entry"), plan.get("kind")
+                self.last_action = f"{pre}{mm} у двери: ВОЙТИ ({why or 'без объяснений'}) — но {blocked}"
+            elif blocked:
+                # одобрение не выбрасываем: войдём без нового вопроса, когда временный запрет снимется
+                plan["approved_until"] = now + self.APPROVE_SEC
+                plan["approved_px"] = cur
+                plan["gate_note"] = f"ВОЙТИ одобрен, но {blocked}"
+                applied.append(f"вход не выполнен: {blocked} — войду без нового вопроса, когда запрет снимется "
+                               f"(до {self._hhmm(now + self.APPROVE_SEC)})")
+                self.last_action = (f"{pre}{mm} у двери: ВОЙТИ ({why or 'без объяснений'}) — но {blocked}; "
+                                    f"войду без нового вопроса, когда запрет снимется")
+            elif adverse > lim:
+                # PRO думал, а цена ушла хуже его снимка: не засада по старой цене (в тренде она не исполнится) и не
+                # погоня — сразу новый вопрос с живой ценой и пометкой о дрейфе
+                plan["gate_after"] = now
+                plan["gate_note"] = f"цена ушла на {adverse * 100:.2f}% за время раздумий (было {snap:g}, стало {cur:g})"
+                applied.append(plan["gate_note"] + " — не засада по старой цене: спрошу сразу по живой")
                 if not topup:
-                    self.state = "ЗАСАДА"
-                self.last_action = f"{mm} у двери: ВОЙТИ ({why or 'без объяснений'}) — но {applied[-1]}"
+                    self.state = "ЗАСАДА" if plan.get("entry") is not None else "ВХОЖУ"
+                self.last_action = f"{pre}{mm} у двери: ВОЙТИ ({why or 'без объяснений'}) — но {applied[-1]}"
             else:
                 plan.pop("gate_after", None)
                 plan.pop("gate_note", None)
@@ -2651,21 +2904,22 @@ class MissionPilot(ai_pilot.AIPilot):
                 applied.append(self.last_action)
                 self.last_action = f"{mm} у двери: ВОЙТИ ({why or 'без объяснений'}) → {self.last_action}"
         elif decision == "ЖДАТЬ":
+            plan.pop("gate_silent", None)
             kind = rec["entry_kind"] or ""
             e = rec["entry"]
             inv_ai = _f(r.get("invalidation")) if r.get("invalidation") not in (None, "", "null") else None
             take_ai = _f(r.get("take")) if r.get("take") not in (None, "", "null") else None
             if e is not None:
-                kind = _entry_kind("BUY" if side == "long" else "SELL", e, cur, kind)
+                # ЖДАТЬ с уровнем: подсказка «сейчас» противоречит ожиданию — вид решает геометрия уровня
+                kind = _entry_kind("BUY" if side == "long" else "SELL", e, cur, kind if kind in ("откат", "прорыв") else None)
                 if kind == "сейчас":
                     applied.append(f"уровень {e:g} равен цене — это «сейчас», не уровень ожидания; жду срок")
                     e = None
             inv_new = plan.get("invalidation")
             if inv_ai and inv_ai > 0:
                 ref = e if e is not None else cur
+                # прорыв (v5.4.2): стоп — по ту сторону уровня (ref); между ценой и уровнем — законный стоп пробоя
                 ok_inv = ((side == "long" and inv_ai < ref) or (side == "short" and inv_ai > ref))
-                if kind == "прорыв":
-                    ok_inv = ok_inv and ((side == "long" and inv_ai < cur) or (side == "short" and inv_ai > cur))
                 if ok_inv and abs(inv_ai - _f(plan.get("invalidation"), 0.0)) > 1e-9:
                     inv_new = round(inv_ai, 6)
                 elif not ok_inv:
@@ -2684,9 +2938,14 @@ class MissionPilot(ai_pilot.AIPilot):
                     e = None
             if e is not None:
                 plan["entry"], plan["kind"] = round(e, 6), kind
+                # уровень назвал сам PRO по живому рынку — у уровня вход без второго вопроса, пока решение свежее
+                plan["src"], plan["snap_ts"], plan["snap_price"] = "gate_level", now, cur
+                plan.pop("gate_wait_ts", None)
                 self._break_n = 0
                 rec["entry"], rec["entry_kind"] = plan["entry"], kind
                 applied.append(f"новый уровень: {kind} @{e:g}")
+            else:
+                plan["gate_wait_ts"] = now           # ждать без уровня — у двери спросим снова (не «свежий вход»)
             if inv_new != plan.get("invalidation"):
                 applied.append(f"стоп {plan.get('invalidation')} → {inv_new:g}")
                 plan["invalidation"] = inv_new
@@ -2704,13 +2963,8 @@ class MissionPilot(ai_pilot.AIPilot):
             plan["gate_note"] = (why or "")[:80]
             if not topup:
                 self.state = "ЗАСАДА"
-            self.last_action = (("добор: " if topup else "") + f"{mm} у двери: ЖДАТЬ ({why or 'без объяснений'}) — "
+            self.last_action = (pre + f"{mm} у двери: ЖДАТЬ ({why or 'без объяснений'}) — "
                                 + (", ".join(applied) if applied else "как есть"))
-            if silent or unknown:
-                try:
-                    ai_v5.note_error(f"проверка входа {mm}: {silent or unknown}", "mission_entry")
-                except Exception:                    # noqa: BLE001
-                    pass
         else:                                        # ОТМЕНИТЬ
             self.plan = None
             self._break_n = 0
@@ -2729,13 +2983,16 @@ class MissionPilot(ai_pilot.AIPilot):
         log.info("миссия %s: %s", self.base, self.last_action)
         if m is None:
             return
+        head = why if no_answer else f"{mm} у двери: {decision} — {why}"
         _bg(bus.stage("mission", m.run_id, "entry", "done", ticker=self.base,
-                      detail=f"{mm} у двери: {decision} — {why}" + (f" · {rec['applied']}" if rec["applied"] else ""), data=rec))
-        _tolmach(m, "entry_check", f"{mm} у двери: {decision}",
+                      detail=head + (f" · {rec['applied']}" if rec["applied"] else ""), data=rec))
+        title = (f"{mm} не ответил у двери" if decision == "НЕТ_ОТВЕТА" else
+                 f"{mm}: ответ у двери не разобран" if decision == "НЕ_РАЗОБРАН" else f"{mm} у двери: {decision}")
+        _tolmach(m, "entry_check", title,
                  f"{rec['how']} при цене {cur:g}: {why or 'без объяснений'}" + (f"; {rec['applied']}" if rec["applied"] else "")
                  + (f". {rec['note']}" if rec["note"] else ""),
                  refs={"decision": decision, "price": cur, "entry": rec["entry"], "entry_kind": rec["entry_kind"],
-                       "wait_minutes": rec["wait_minutes"], "council": rec["council"]})
+                       "wait_minutes": rec["wait_minutes"], "council": rec["council"], "source": rec["source"]})
         _persist(m)
 
     def _gate_handoff(self, reason: str) -> None:
@@ -2812,16 +3069,20 @@ class MissionPilot(ai_pilot.AIPilot):
         return True
 
     def _profits_text(self, pos: dict | None = None) -> str:
-        """Прошлые мысли о прибыли (по этой позиции, если она дана) — для промпта."""
+        """Прошлые мысли о прибыли (по этой позиции, если она дана) — для промпта. v5.4.2: молчание и непонятный
+        ответ — «ответа не было … решения не было» (запись кода), не «ДЕРЖАТЬ» от имени ИИ."""
         since = _f((pos or {}).get("opened_ts"), 0.0)
-        return "\n".join(f"{ai_v5.fmt_ts(x.get('ts'))} @{x.get('price')}: {x.get('decision')} — {x.get('why')}"
-                         + (f" (триггер → {x.get('lock_price')})" if x.get("lock_price") else "")
-                         + (f" (цель → {x.get('take')})" if x.get("take") else "")
+        return "\n".join((f"{ai_v5.fmt_ts(x.get('ts'))} @{x.get('price')}: {x.get('why')}" if x.get("silent") else
+                          f"{ai_v5.fmt_ts(x.get('ts'))} @{x.get('price')}: {x.get('decision')} — {x.get('why')}"
+                          + (f" (триггер → {x.get('lock_price')})" if x.get("lock_price") else "")
+                          + (f" (цель → {x.get('take')})" if x.get("take") else ""))
                          for x in self.profits[-5:] if _f(x.get("ts"), 0.0) >= since)
 
     async def _profit_think(self, price: float, pos: dict, reason: str) -> dict:
         """Вопрос PRO о прибыли: те же данные, что у троса/тейка, + повод + прошлые мысли →
-        prompts_mission.profit_think → ai_v5.money_json(route="mission_profit")."""
+        prompts_mission.profit_think → ai_v5.money_json(route="mission_profit").
+        v5.4.2: подготовка данных — свой срок MONEY_PREP_SEC (после него — что есть, с пометкой); у ИИ —
+        PYTHIA_PROFIT_TIMEOUT_SEC на каждую попытку."""
         m = self.mission
         rid = m.run_id if m else None
         mm = self._money_name()
@@ -2839,8 +3100,6 @@ class MissionPilot(ai_pilot.AIPilot):
             except Exception as e:                   # noqa: BLE001
                 return f"(живой рынок недоступен: {str(e)[:60]})"
 
-        light_txt, scout_txt, partners_txt = await asyncio.gather(
-            _light(), self._scout_fresh(GUARD_SCOUT_TIMEOUT), self._partners_fresh(GUARD_PARTNERS_TIMEOUT))
         plan_txt = _exec_text(m) if m else ""
         if m and m.reviews:
             plan_txt += "\nПерепроверки: " + "; ".join(
@@ -2848,12 +3107,30 @@ class MissionPilot(ai_pilot.AIPilot):
         plan_txt += (f"\nУРОВНИ ПОЗИЦИИ: вход {_f(pos.get('entry'), 0.0):g}, триггер (мягкий стоп) {pos.get('invalidation')}, "
                      f"{self._hard_name()} {pos.get('hard_stop')}, тейк {pos.get('take')}"
                      + (f"; прибыль уже заперта триггером" if pos.get("profit_lock") or pos.get("take_holds") else ""))
-        blocks, _sq = await _fit_blocks({
-            "light": light_txt, "news": self._news_quick(), "history": self._history_text(price),
-            "prev_exec": plan_txt, "guard": self._guards_text(), "thoughts": self._profits_text(pos),
-            "scan": _scan_text(m) if m else "", "scout": scout_txt, "partners": partners_txt,
-            "council": _council_text(), "memory": (m.memory if m else "") or ""})
-        situation = self._situation_for_ai(price)
+        got = {"light": "(живой рынок не успел собраться)", "scout": "", "partners": ""}
+
+        def _src() -> dict:
+            return {"light": got["light"], "news": self._news_quick(), "history": self._history_text(price),
+                    "prev_exec": plan_txt, "guard": self._guards_text(), "thoughts": self._profits_text(pos),
+                    "scan": _scan_text(m) if m else "", "scout": got["scout"], "partners": got["partners"],
+                    "council": _council_text(), "memory": (m.memory if m else "") or ""}
+
+        async def _prep():
+            got["light"], got["scout"], got["partners"] = await asyncio.gather(
+                _light(), self._scout_fresh(GUARD_SCOUT_TIMEOUT), self._partners_fresh(GUARD_PARTNERS_TIMEOUT))
+            return await _fit_blocks(_src())
+
+        prep_note = ""
+        try:
+            blocks, _sq = await asyncio.wait_for(_prep(), self.MONEY_PREP_SEC)
+        except asyncio.TimeoutError:
+            blocks = _src()
+            prep_note = (f"(подготовка данных не уложилась в {int(self.MONEY_PREP_SEC)} с — блоки даны как есть, "
+                         f"без сжатия; чего нет — того не выдумывай)")
+            log.warning("миссия %s: мысль о прибыли — %s", self.base, prep_note)
+        situation = self._situation_for_ai(self.prices[-1] if self.prices else price)
+        if prep_note:
+            situation += "\n" + prep_note
         s, u = prompts_mission.profit_think(
             self.base, self.name, self._play(), situation=situation, profit=reason, history=blocks["history"],
             light=blocks["light"], plan=blocks["prev_exec"], news=blocks["news"], council_text=blocks["council"],
@@ -2861,20 +3138,23 @@ class MissionPilot(ai_pilot.AIPilot):
             guards=blocks["guard"], time_msk=ai_v5.now_msk_str(), thoughts=blocks["thoughts"])
         if m is not None:
             m.sizes["profit"] = _sizes_rec(len(u), {"situation": situation, **blocks})
-        obj = await ai_v5.money_json(s, u, route="mission_profit")
+        obj = await self._money_call(s, u, route="mission_profit",
+                                     attempt_timeout=float(getattr(config, "PYTHIA_PROFIT_TIMEOUT_SEC", 1200)))
         if m is not None:
             m.sizes["profit"] = _sizes_rec(len(u), {"situation": situation, **blocks}, _json_len(obj))
         return obj if isinstance(obj, dict) else {}
 
     async def _profit_bg(self, price: float, pos: dict, reason: str) -> None:
         silent = None
+        tmo = float(getattr(config, "PYTHIA_PROFIT_TIMEOUT_SEC", 1200))
         try:
-            r = await asyncio.wait_for(self._profit_think(price, pos, reason), ai_pilot.PROFIT_TIMEOUT)
+            # у каждой попытки ИИ свой срок (attempt_timeout); общий потолок — подготовка + две попытки + запас
+            r = await asyncio.wait_for(self._profit_think(price, pos, reason), self.MONEY_PREP_SEC + 2 * tmo + 60)
         except asyncio.CancelledError:
             pos["profit_busy"] = False
             raise
         except Exception as e:                       # noqa: BLE001
-            silent = (f"таймаут {int(ai_pilot.PROFIT_TIMEOUT)} с" if isinstance(e, asyncio.TimeoutError)
+            silent = (f"таймаут {int(tmo)} с" if isinstance(e, asyncio.TimeoutError)
                       else (str(e)[:100] or type(e).__name__))
             r = {}
         finally:
@@ -2916,19 +3196,18 @@ class MissionPilot(ai_pilot.AIPilot):
                       inv_pos, take_pos, why: str) -> dict | None:
         """ВЫЙТИ_И_ПЕРЕЗАЙТИ: план той же стороны с entry=reentry, kind=reentry_kind (сторона уровня верна: для long
         откат ниже цены / прорыв выше, short зеркально; иначе None — как ВЫЙТИ). Стоп — из позиции, если он на верной
-        стороне от уровня (и от цены для прорыва), иначе аварийный 0.6 %; тейк — из ответа или позиции, если верен."""
+        стороне от уровня (v5.4.2: и для прорыва — от уровня, не от цены), иначе аварийный 0.6 % от уровня; тейк — из
+        ответа или позиции, если верен. План несёт src «profit» и снимок решения: у уровня — вход без второго вопроса
+        у двери, пока решение свежее (PYTHIA_ENTRY_FRESH_SEC)."""
         if reentry is None or reentry <= 0:
             return None
-        kind = _entry_kind("BUY" if side == "long" else "SELL", reentry, cur, rk)
+        kind = _entry_kind("BUY" if side == "long" else "SELL", reentry, cur, rk if rk in ("откат", "прорыв") else None)
         if kind == "сейчас" or (rk in ("откат", "прорыв") and rk != kind):
             return None
         inv = _f(inv_pos, 0.0)
         ok = inv > 0 and ((side == "long" and inv < reentry) or (side == "short" and inv > reentry))
-        if ok and kind == "прорыв":
-            ok = (side == "long" and inv < cur) or (side == "short" and inv > cur)
         if not ok:
-            base = cur if kind == "прорыв" else reentry
-            inv = base * (1 - ai_pilot.EMERGENCY_STOP_FRAC if side == "long" else 1 + ai_pilot.EMERGENCY_STOP_FRAC)
+            inv = reentry * (1 - ai_pilot.EMERGENCY_STOP_FRAC if side == "long" else 1 + ai_pilot.EMERGENCY_STOP_FRAC)
         take = None
         for cand in (take_ai, take_pos):
             c = _f(cand, 0.0)
@@ -2937,13 +3216,18 @@ class MissionPilot(ai_pilot.AIPilot):
                 break
         if ai_pilot.AIPilot._plan_valid(side, reentry, take, inv):
             return None
+        now = time.time()
         return {"side": side, "entry": round(reentry, 6), "kind": kind, "take": take, "invalidation": round(inv, 6),
-                "why": f"мысль о прибыли: перезайти — {why or 'без объяснений'}", "ts": time.time()}
+                "why": f"мысль о прибыли: перезайти — {why or 'без объяснений'}", "ts": now,
+                "src": "profit", "snap_price": cur, "snap_ts": now}
 
     async def _apply_profit(self, r: dict, price: float, pos: dict, reason: str, silent: str | None = None) -> None:
-        """Ответ PRO о прибыли. ДЕРЖАТЬ (+lock_price → триггер, take → цель); ВЫЙТИ → закрыть, обычный ход после
-        закрытия; ВЫЙТИ_И_ПЕРЕЗАЙТИ → закрыть, затем план той же стороны (вход дальше через проверку у двери);
-        СОВЕТ → триггер к lock_price и полный совет без очереди (handoff `profit`). Молчание → ДЕРЖАТЬ."""
+        """Ответ PRO о прибыли (слово — ai_v5.profit_table по стороне позиции: ЗАФИКСИРОВАТЬ / CLOSE / SELL у лонга —
+        ВЫЙТИ). ДЕРЖАТЬ (+lock_price → триггер, take → цель); ВЫЙТИ → закрыть, обычный ход после закрытия;
+        ВЫЙТИ_И_ПЕРЕЗАЙТИ → закрыть, затем план той же стороны у уровня (src «profit»: у уровня вход без второго вопроса,
+        пока решение свежее); СОВЕТ → триггер к lock_price и полный совет без очереди (handoff `profit`).
+        v5.4.2: молчание/сбой (НЕТ_ОТВЕТА) и непонятный ответ (НЕ_РАЗОБРАН) — не «ДЕРЖАТЬ» за ИИ: запись кода (source
+        «код», silent), позиция как есть, поля ответа не читаются, повтор через PYTHIA_SILENT_RETRY_SEC, ошибка в панель."""
         if self.position is not pos or not self.position:
             log.info("миссия %s: мысль о прибыли — позиция уже закрыта/сменилась, ответ выброшен", self.base)
             return
@@ -2952,42 +3236,53 @@ class MissionPilot(ai_pilot.AIPilot):
         now = time.time()
         cur = self.prices[-1] if self.prices else price
         cool = float(getattr(config, "PYTHIA_PROFIT_THINK_COOL_SEC", 900))
-        raw = str(r.get("decision") or "").upper().replace("Ё", "Е").strip()
+        retry = float(getattr(config, "PYTHIA_SILENT_RETRY_SEC", 120))
+        raw = ai_v5.decision_raw(r)
         why = str(r.get("why") or "")[:300]
         if silent:
-            decision, why = "ДЕРЖАТЬ", f"{mm} не ответил ({silent}) — держу"
-        elif "ПЕРЕЗА" in raw or "REENTER" in raw or "RE-ENTER" in raw:
-            decision = "ВЫЙТИ_И_ПЕРЕЗАЙТИ"
-        elif "ВЫЙ" in raw or "ВЫХОД" in raw or "ЗАКР" in raw or "EXIT" in raw or "СЛИ" in raw:
-            decision = "ВЫЙТИ"
-        elif "СОВЕТ" in raw or "COUNCIL" in raw:
-            decision = "СОВЕТ"
+            decision = "НЕТ_ОТВЕТА"
         else:
-            decision = "ДЕРЖАТЬ"
-        lock = _f(r.get("lock_price"), 0.0)
-        take = _f(r.get("take"), 0.0)
-        reentry = _f(r.get("reentry")) if r.get("reentry") not in (None, "", "null") else None
-        rk = str(r.get("reentry_kind") or "").strip().lower()
-        rec = {"ts": now, "decision": decision, "why": why, "note": str(r.get("note") or "")[:300], "price": cur,
-               "floating": pos.get("floating"), "lock_price": lock or None, "take": take or None,
-               "reentry": reentry if reentry and reentry > 0 else None, "reentry_kind": rk or None,
-               "reason": reason[:200], "side": pos.get("side"), "model": mm, "silent": bool(silent), "applied": ""}
+            decision = ai_v5.decision_of(raw, ai_v5.profit_table(pos.get("side"))) or "НЕ_РАЗОБРАН"
+        no_answer = decision in ("НЕТ_ОТВЕТА", "НЕ_РАЗОБРАН")
+        if no_answer:
+            head = f"{mm} не ответил ({silent})" if silent else f"{mm} ответил непонятно ({raw[:60] or 'пусто'})"
+            why = f"{head} — решения не было, позиция как есть, повтор в {self._hhmm(now + retry)}"
+            rec = {"ts": now, "decision": decision, "why": why, "note": "", "price": cur,
+                   "floating": pos.get("floating"), "lock_price": None, "take": None, "reentry": None,
+                   "reentry_kind": None, "reason": reason[:200], "side": pos.get("side"), "model": mm,
+                   "silent": True, "source": "код", "raw": raw[:80] or None, "applied": ""}
+        else:
+            lock = _f(r.get("lock_price"), 0.0)
+            take = _f(r.get("take"), 0.0)
+            reentry = _f(r.get("reentry")) if r.get("reentry") not in (None, "", "null") else None
+            rk = str(r.get("reentry_kind") or "").strip().lower()
+            rec = {"ts": now, "decision": decision, "why": why, "note": str(r.get("note") or "")[:300], "price": cur,
+                   "floating": pos.get("floating"), "lock_price": lock or None, "take": take or None,
+                   "reentry": reentry if reentry and reentry > 0 else None, "reentry_kind": rk or None,
+                   "reason": reason[:200], "side": pos.get("side"), "model": mm, "silent": False, "source": "ИИ",
+                   "applied": ""}
         self.profits.append(rec)
         del self.profits[:-ai_pilot.PROFITS_KEEP]
-        pos["profit_last"] = now
-        pos["profit_next"] = now + cool
+        if not no_answer:
+            pos["profit_last"] = now
+            pos["profit_next"] = now + cool
         applied: list[str] = []
-        if decision in ("ДЕРЖАТЬ", "СОВЕТ"):
+        if no_answer:
+            # решения ИИ не было: позицию не трогаем, скорый повтор (не полный кулдаун); трос и тейк стерегут дальше
+            pos["profit_next"] = now + retry
+            self._save_state()
+            self.last_action = f"мысль о прибыли: {why}"
+            try:
+                ai_v5.note_error(f"мысль о прибыли {mm}: {silent or 'ответ не разобран: ' + (raw[:60] or 'пусто')}",
+                                 "mission_profit")
+            except Exception:                        # noqa: BLE001
+                pass
+        elif decision in ("ДЕРЖАТЬ", "СОВЕТ"):
             self._profit_lock(pos, lock, take, cur, applied)
             self._save_state()
             self.last_action = (f"мысль о прибыли: {mm} решил {decision} ({why or 'без объяснений'}) — "
                                 + (", ".join(applied) if applied else "уровни прежние")
                                 + f"; следующая мысль не раньше чем через {int(cool // 60)} мин")
-            if silent:
-                try:
-                    ai_v5.note_error(f"мысль о прибыли {mm}: {silent}", "mission_profit")
-                except Exception:                    # noqa: BLE001
-                    pass
             if decision == "СОВЕТ":
                 applied.append("зову полный совет")
                 self._profit_handoff(why)
@@ -3015,11 +3310,14 @@ class MissionPilot(ai_pilot.AIPilot):
             return
         _bg(bus.stage("mission", m.run_id, "profit", "done", ticker=self.base,
                       detail=f"мысль о прибыли: {decision} — {why}" + (f" · {rec['applied']}" if rec["applied"] else ""), data=rec))
-        _tolmach(m, "profit", f"Мысль о прибыли: {decision}",
+        title = (f"Мысль о прибыли: {mm} не ответил" if decision == "НЕТ_ОТВЕТА" else
+                 f"Мысль о прибыли: ответ {mm} не разобран" if decision == "НЕ_РАЗОБРАН" else f"Мысль о прибыли: {decision}")
+        _tolmach(m, "profit", title,
                  f"{reason[:160]}; {mm}: {why or 'без объяснений'}" + (f"; {rec['applied']}" if rec["applied"] else "")
                  + (f". {rec['note']}" if rec["note"] else ""),
                  refs={"decision": decision, "price": cur, "floating": rec["floating"], "lock_price": rec["lock_price"],
-                       "take": rec["take"], "reentry": rec["reentry"], "reentry_kind": rec["reentry_kind"]})
+                       "take": rec["take"], "reentry": rec["reentry"], "reentry_kind": rec["reentry_kind"],
+                       "source": rec["source"]})
         _persist(m)
 
     def _profit_handoff(self, why: str) -> None:
@@ -3044,7 +3342,8 @@ class MissionPilot(ai_pilot.AIPilot):
             _persist(m)
 
     def _adopt_reentry(self, spec: dict) -> None:
-        """Позиция закрыта по ВЫЙТИ_И_ПЕРЕЗАЙТИ → план той же стороны у уровня (вход дальше через проверку у двери)."""
+        """Позиция закрыта по ВЫЙТИ_И_ПЕРЕЗАЙТИ → план той же стороны у уровня. v5.4.2: план несёт src «profit» и снимок
+        решения — у уровня вход без второго вопроса у двери, пока решение свежее; протухло / цена уехала — через дверь."""
         if self.panic_flag or self.stopping:         # V 5.4.1: после ПАНИКИ / СТОПА планов не ставим
             return
         if self.session_risk and self.session_risk.locked:
@@ -3058,7 +3357,8 @@ class MissionPilot(ai_pilot.AIPilot):
         head = str(self.last_action or "")
         self.last_action = ((head + " · ") if head.startswith("ЗАКРЫЛ ВСЁ") else "") + (
             f"план перезайти: {spec['side']} {spec['kind']} @{_f(spec.get('entry'), 0.0):g}, стоп {_f(spec.get('invalidation'), 0.0):g}, "
-            f"тейк {spec.get('take')} — вход через проверку у двери")
+            f"тейк {spec.get('take')} — у уровня вход по этому решению "
+            f"(протухнет за {int(float(getattr(config, 'PYTHIA_ENTRY_FRESH_SEC', 1200)) // 60)} мин — тогда через дверь)")
         log.info("миссия %s: %s", self.base, self.last_action)
         m = self.mission
         if m is not None:
@@ -3988,6 +4288,12 @@ if __name__ == "__main__":
                 return "ПАМЯТЬ: " + " ".join(user.split("═══ НАКОПИЛОСЬ С ТЕХ ПОР ═══", 1)[1].split())[:600]
             return "сжато"
 
+        def __getattr__(self, name):
+            """v5.4.2: разбор слова решения (decision_raw/decision_of, словари узлов) — настоящий: чистые функции без сети."""
+            if name.startswith(("decision_", "SYN_")) or name.endswith("_table") or name == "DECISION_KEYS":
+                return getattr(_real_ai_v5, name)
+            raise AttributeError(name)
+
     class FakeBroker:
         mode = "real"
         mx: dict | None = None                       # ответ «биржи» GetMaxLots (None → сайзер считает сам)
@@ -4277,20 +4583,38 @@ if __name__ == "__main__":
         exw, err = _validate_exec({"do": "WAIT", "wait_for": "закрепление выше 101", "why": "перевеса нет", "confidence": 40,
                                    "levels": [99, 101]}, "long", 100)
         assert exw["do"] == "WAIT" and exw["wait_for"] == "закрепление выше 101" and exw["confidence"] == 40 and exw["levels"] == [99.0, 101.0]
-        assert _validate_exec({"do": "ЖДАТЬ"}, "auto", 100)[0]["wait_for"] == "перевеса нет — вне рынка", "wait_for пуст → честная заглушка"
+        exw = _validate_exec({"do": "ЖДАТЬ"}, "auto", 100)[0]   # v5.4.2: заглушки нейтральны — не «перевеса нет» за ИИ
+        assert exw["wait_for"] == "условие входа не названо — реши по живой картине" and exw["why"] == "(причина не указана)", exw
+        # v5.4.2: слово решения — по словарю приказа (КУПИТЬ/ЛОНГ/ПОКУПКА → BUY, ЖДЁМ/NO_TRADE → WAIT, FLAT/EXIT в позиции → CLOSE)
+        for w, want, pos_ in (("КУПИТЬ", "BUY", False), ("лонг", "BUY", False), ("Покупка", "BUY", False),
+                              ("ПРОДАТЬ", "SELL", False), ("ЖДЁМ", "WAIT", False), ("ждем", "WAIT", False),
+                              ("NO_TRADE", "WAIT", False), ("FLAT", "WAIT", False), ("FLAT", "CLOSE", True),
+                              ("EXIT", "CLOSE", True)):
+            exs, err = _validate_exec({"action": w, "invalidation": 102 if want == "SELL" else 98, "why": "т"}, "auto", 100,
+                                      in_pos=pos_)
+            assert exs and exs["do"] == want and err is None, (w, pos_, exs, err)
+        err = _validate_exec({"do": "BUY", "invalidation": 101}, "auto", 100)[1]
+        assert err.startswith("сторона BUY принята — исправь уровни:") and "WAIT" not in err, err
+        assert _validate_exec({"do": "НЕ ПОКУПАТЬ", "invalidation": 98}, "auto", 100)[1], "отрицание — не решение"
         assert "позиция открыта" in _validate_exec({"do": "WAIT"}, "auto", 100, in_pos=True)[1], "WAIT при позиции недопустим"
         assert "позиции нет" in _validate_exec({"do": "CLOSE"}, "auto", 100)[1]
         assert _validate_exec({"exec": {"do": "SELL", "invalidation": "102,5", "entry": None}}, "auto", 100)[0]
         assert _validate_exec({"do": "BUY", "invalidation": 0}, "auto", 100)[1]
-        # виды входа: геометрия главнее подсказки; прорыв — стоп за ценой (иначе идея мертва до пробития)
+        # виды входа: геометрия главнее подсказки откат/прорыв; прорыв (v5.4.2) — стоп по ту сторону УРОВНЯ входа:
+        # классический стоп пробоя между ценой и уровнем законен (до пробития позиции нет)
         ex, err = _validate_exec({"do": "BUY", "entry": 102, "take": 106, "invalidation": 99, "entry_kind": "прорыв"}, "auto", 100)
         assert ex and ex["entry_kind"] == "прорыв" and ex["entry"] == 102.0 and err is None
-        assert "до пробития" in _validate_exec({"do": "BUY", "entry": 102, "take": 106, "invalidation": 101}, "auto", 100)[1]
+        ex, err = _validate_exec({"do": "BUY", "entry": 102, "take": 106, "invalidation": 101}, "auto", 100)
+        assert ex and ex["entry_kind"] == "прорыв" and ex["invalidation"] == 101.0 and err is None, err
+        assert "не ниже entry 102" in _validate_exec({"do": "BUY", "entry": 102, "take": 106, "invalidation": 102.5}, "auto", 100)[1]
         assert _validate_exec({"do": "BUY", "entry": 99.5, "take": 103, "invalidation": 98, "entry_kind": "прорыв"}, "long", 100)[0]["entry_kind"] == "откат"
         assert _validate_exec({"do": "SELL", "entry": 98, "take": 94, "invalidation": 101}, "auto", 100)[0]["entry_kind"] == "прорыв"
-        assert _validate_exec({"do": "SELL", "entry": 98, "take": 94, "invalidation": 99.5}, "auto", 100)[1], "SELL на пробитии: стоп ниже цены"
+        assert _validate_exec({"do": "SELL", "entry": 98, "take": 94, "invalidation": 99.5}, "auto", 100)[0]["invalidation"] == 99.5, \
+            "SELL на пробитии: стоп между ценой и уровнем законен"
         ex, _ = _validate_exec({"do": "BUY", "entry": 100, "invalidation": 98}, "auto", 100)
         assert ex["entry"] is None and ex["entry_kind"] == "сейчас", "уровень равен цене — вход сейчас"
+        ex, _ = _validate_exec({"do": "BUY", "entry": 100.3, "invalidation": 98, "entry_kind": "сейчас"}, "auto", 100)
+        assert ex["entry"] is None and ex["entry_kind"] == "сейчас", "подсказка «сейчас» главнее геометрии (v5.4.2)"
         assert _validate_exec({"do": "BUY", "entry": 99, "invalidation": 98}, "auto", None)[0]["entry_kind"] == "откат"
         assert _validate_exec({"do": "BUY", "entry": 99, "invalidation": 98, "entry_kind": "breakout"}, "auto", None)[0]["entry_kind"] == "прорыв"
         # v5.2: CLOSE — закрыть и стоять вне рынка; без позиции это не приказ
@@ -4535,36 +4859,57 @@ if __name__ == "__main__":
         assert p.position["side"] == "long" and status("TEST")["phase"] == "in_position"
         FakeTinkoff.price = px
         assert await settle(lambda: bool(p.prices) and p.prices[-1] == px)
-        # прорыв со стопом между ценой и уровнем: до пробития идея была бы мертва → аварийный стоп от цены
+        # прорыв со стопом между ценой и уровнем (v5.4.2): классический стоп пробоя — принят как есть (до пробития
+        # позиции нет; стоп по ту сторону уровня входа)
         await p._close_all(px, "тест: освободить-1", reanalyze=False)
         p.plan = None
         fake_ai.review_answers[:] = [{"choice": "КУПИТЬ_СЕЙЧАС", "why": "на пробое", "entry": brk,
                                      "invalidation": px + 0.5, "take": 106.0}]
         await p._review(px)
-        assert p.plan and p.plan["kind"] == "прорыв" and p.plan["invalidation"] < px, p.plan
+        assert p.plan and p.plan["kind"] == "прорыв" and p.plan["invalidation"] == round(px + 0.5, 6), p.plan
+        assert p.plan["src"] == "review" and p.plan["snap_price"] == p.prices[-1], p.plan
         p.plan = None
 
-        # ── ДРЕЙФ РЕШЕНИЯ направленный: цена ЛУЧШЕ снимка → входим сразу (баг «цена лучше — не заходит») ──
-        FakeTinkoff.price = better = round(px * 0.98, 2)
-        assert await settle(lambda: bool(p.prices) and p.prices[-1] == better)
+        # ── ДРЕЙФ РЕШЕНИЯ направленный (v5.4.2: снимок — цена в промпте PRO, сдвиг — пока он думал): цена ЛУЧШЕ
+        #    снимка → входим сразу (баг «цена лучше — не заходит») ──
+        _pj0 = fake_ai.pro_json
+
+        def _moving(to):
+            async def _pj(system, user, *, route="pro", max_tokens=None):   # PRO думает — рынок живёт
+                FakeTinkoff.price = to
+                await settle(lambda: bool(p.prices) and p.prices[-1] == to)
+                return await _pj0(system, user, route=route, max_tokens=max_tokens)
+            return _pj
+        assert await settle(lambda: bool(p.prices) and p.prices[-1] == px)
+        better = round(px * 0.98, 2)
         fake_ai.review_answers[:] = [{"choice": "КУПИТЬ_СЕЙЧАС", "why": "сейчас", "invalidation": 95.0, "take": 104.0}]
-        await p._review(px)                                    # снимок решения — px, цена уже на 2% ниже
+        fake_ai.pro_json = _moving(better)
+        try:
+            await p._review(px)                                # снимок решения — px, пока думал — на 2% ниже
+        finally:
+            fake_ai.pro_json = _pj0
         assert p.plan and p.plan["entry"] is None and p.state == "ВХОЖУ" and "лучше снимка" in p.plan["why"], p.plan
+        assert p.plan["snap_price"] == px and p.plan["src"] == "review", p.plan
         assert await settle(lambda: p.position is not None)
         assert p.position["entry"] <= better + 0.2, p.position
-        # цена УБЕЖАЛА хуже снимка на 2% → не гонимся: засада-откат по цене решения, вход при возврате
+        # цена УБЕЖАЛА хуже снимка на 2% → v5.4.2: не тихая засада по старой цене (в тренде она не исполнится), а план
+        # «сейчас» со снимком и пометкой о дрейфе — у двери решит PRO по живой цене; дверь выключена — решение ИИ
+        # исполняется по живой цене (страховки — трос, killswitch — на месте)
         await p._close_all(better, "тест: освободить-2", reanalyze=False)
         p.plan = None
-        FakeTinkoff.price = worse = round(px * 1.02, 2)
-        assert await settle(lambda: bool(p.prices) and p.prices[-1] == worse)
-        fake_ai.review_answers[:] = [{"choice": "КУПИТЬ_СЕЙЧАС", "why": "сейчас", "invalidation": 97.0, "take": 108.0}]
-        await p._review(px)
-        assert p.plan and p.plan["entry"] == px and p.plan["kind"] == "откат" and "не гонюсь" in p.plan["why"], p.plan
-        assert p.state == "ЗАСАДА" and not p._reanalyzing
-        await settle(lambda: False, n=20)
-        assert p.position is None, "цена выше засады — ждём"
         FakeTinkoff.price = px
-        assert await settle(lambda: p.position is not None), "цена вернулась к снимку — вход"
+        assert await settle(lambda: bool(p.prices) and p.prices[-1] == px)
+        worse = round(px * 1.02, 2)
+        fake_ai.review_answers[:] = [{"choice": "КУПИТЬ_СЕЙЧАС", "why": "сейчас", "invalidation": 97.0, "take": 108.0}]
+        fake_ai.pro_json = _moving(worse)
+        try:
+            await p._review(px)
+        finally:
+            fake_ai.pro_json = _pj0
+        assert p.plan and p.plan["entry"] is None and p.plan["snap_price"] == px and "откат" != p.plan["kind"], p.plan
+        assert p.plan["gate_note"] == f"цена ушла на 2.00% за время раздумий (было {px:g}, стало {worse:g})", p.plan
+        assert "решит дверь по живой цене" in p.plan["why"] and not p._reanalyzing, p.plan
+        assert await settle(lambda: p.position is not None), "дверь выключена — решение ИИ исполнено по живой цене"
         assert status("TEST")["phase"] == "in_position"
 
         # ── режим игры в перепроверке: ПРОДАТЬ при play=long → ЖДЁМ ──
@@ -4585,8 +4930,26 @@ if __name__ == "__main__":
         assert m.reviews_since_memory == 0
         StubNews.old_ts = None
         fake_ai.review_answers[:] = [{"choice": "ПРОДАТЬ_СЕЙЧАС", "why": "вниз", "invalidation": 101}]
+        p.review_ts = time.time() + 1800
         await p._review(px)
-        assert m.reviews[-1]["choice"] == "ЖДЁМ" and "против режима" in m.reviews[-1]["why"] and p.plan is None
+        # v5.4.2: вход против режима — своя запись ВНЕ_РЕЖИМА (слово ИИ сохранено), не «ЖДЁМ» за ИИ; переспрос с пометкой
+        assert m.reviews[-1]["choice"] == "ВНЕ_РЕЖИМА" and m.reviews[-1]["ai_choice"] == "ПРОДАТЬ_СЕЙЧАС" \
+            and "против режима" in m.reviews[-1]["why"] and p.plan is None, m.reviews[-1]
+        assert p._review_reason == "прошлый ответ ПРОДАТЬ_СЕЙЧАС запрещён режимом long", p._review_reason
+        assert p.review_ts <= time.time() + REVIEW_RETRY_SEC + 1, p.review_ts - time.time()
+        # v5.4.2: слово не разобрано («НЕ ПОКУПАТЬ» / мусор) — решения нет: ни «ЖДЁМ» в m.reviews, ни плана; повод жив
+        n_rv = len(m.reviews)
+        for junk in ("НЕ ПОКУПАТЬ", "может быть"):
+            fake_ai.review_answers[:] = [{"choice": junk, "why": "?"}]
+            p.review_ts = time.time() + 1800
+            await p._review(px)
+            assert len(m.reviews) == n_rv and p.plan is None and "ответ не разобран" in p.last_action, (junk, p.last_action)
+            assert "запрещён режимом" in (p._review_reason or "") and p.review_ts <= time.time() + REVIEW_RETRY_SEC + 1
+        # латиница и синонимы — решения: BUY → КУПИТЬ_СЕЙЧАС (план), ждём → ЖДЁМ
+        fake_ai.review_answers[:] = [{"decision": "buy", "why": "латиницей", "invalidation": 95.0}]
+        await p._review(px)
+        assert m.reviews[-1]["choice"] == "КУПИТЬ_СЕЙЧАС" and p.plan and p.plan["side"] == "long", (m.reviews[-1], p.plan)
+        p.plan = None
 
         # ── поводы пилота не дёргают PRO: «идея мертва до входа» → повод копится к плановой перепроверке ──
         p._review_reason = None
@@ -5037,11 +5400,17 @@ if __name__ == "__main__":
         FakeBroker.mx = None
         p._mx = None
 
-        # ── ПЕРЕВЕРНУТЬ (v5.2): против режима long → ЖДЁМ; в режиме auto → закрыть и войти в short ──
+        # ── ПЕРЕВЕРНУТЬ (v5.2): против режима long → v5.4.2: выходная половина разрешена — ЗАКРЫТЬ (не «держим» против
+        #    взгляда ИИ); в режиме auto → закрыть и войти в short ──
         fake_ai.review_answers[:] = [{"choice": "ПЕРЕВЕРНУТЬ", "why": "вниз", "invalidation": 103.0, "take": 95.0}]
         await p._review(px)
-        assert m.reviews[-1]["choice"] == "ЖДЁМ" and "ПЕРЕВЕРНУТЬ против режима long" in m.reviews[-1]["why"]
-        assert p.position and p.position["side"] == "long" and p.plan is None
+        assert m.reviews[-1]["choice"] == "ЗАКРЫТЬ" and m.reviews[-1]["ai_choice"] == "ПЕРЕВЕРНУТЬ" \
+            and "[ПЕРЕВЕРНУТЬ против режима long — только ЗАКРЫТЬ]" in m.reviews[-1]["why"], m.reviews[-1]
+        assert p.position is None and p.plan is None and "решение перепроверки: закрыть" in store_v5.trades("TEST")[0]["why"]
+        fresh(p)
+        fake_ai.review_answers[:] = [{"choice": "КУПИТЬ_СЕЙЧАС", "why": "снова лонг", "invalidation": 97.0, "take": 104.0}]
+        await p._review(px)
+        assert await settle(lambda: p.position is not None and p.position["side"] == "long"), (p.position, p.last_action)
         m.play = "auto"
         fake_ai.review_answers[:] = [{"choice": "ПЕРЕВЕРНУТЬ", "why": "вниз всерьёз", "invalidation": 103.0, "take": 95.0}]
         await p._review(px)
@@ -5183,29 +5552,26 @@ if __name__ == "__main__":
         assert m.error is None and m.exec["do"] == "WAIT" and m.exec["wait_for"] == "закрепление выше 101", (m.error, m.exec)
         p = m.pilot
         assert p and m.pilot_alive() and p.plan is None and status("TEST")["phase"] == "idle", (p.plan, status("TEST")["phase"])
-        assert "вне рынка — ждём: закрепление выше 101" in p.last_action and "WAIT — вне рынка" in _exec_text(m), p.last_action
+        assert "вне рынка — ждём: закрепление выше 101" in p.last_action and "WAIT — совет ждал: закрепление выше 101" in _exec_text(m), \
+            p.last_action
         assert await settle(lambda: xev(m, "council", "Совет решил ждать (WAIT)")), m.explain
-        assert "ПРИКАЗ СОВЕТА: WAIT" in p._situation_text(100.0) and status("TEST")["exec"]["do"] == "WAIT"
+        sit_w = p._situation_text(100.0)                       # v5.4.2: WAIT совета — прошлое мнение, а не запрет
+        assert "ПРИКАЗ СОВЕТА (" in sit_w and "совет ждал: закрепление выше 101" in sit_w and "прошлое мнение, а не запрет" in sit_w, sit_w
+        assert status("TEST")["exec"]["do"] == "WAIT"
         FakeTinkoff.price = 101.5
         assert await settle(lambda: bool(p.prices) and p.prices[-1] == 101.5)
         await settle(lambda: False, n=10)
         assert p.position is None and p.pending is None and fake_ai.calls.count("mission_entry") == 0, "WAIT — входа нет"
-        #    дежурный PRO: КУПИТЬ_СЕЙЧАС → план → PRO у двери ЖДАТЬ (откат 101.2) → у уровня ВОЙТИ → позиция без стопа на бирже
-        fake_ai.entry_answers[:] = [{"decision": "ЖДАТЬ", "why": "взять на откате", "entry": 101.2, "entry_kind": "откат"},
-                                    {"decision": "ВОЙТИ", "why": "выкупают"}]
+        #    дежурный PRO: КУПИТЬ_СЕЙЧАС по живому рынку → v5.4.2: свежее решение PRO — вход без второго вопроса у двери
         fake_ai.review_answers[:] = [{"choice": "КУПИТЬ_СЕЙЧАС", "why": "закрепились", "invalidation": 99.0, "take": 108.0}]
         await p._review(101.5)
-        assert p.plan and p.plan["entry"] is None
-        assert await settle(lambda: fake_ai.calls.count("mission_entry") == 1 and p.plan is not None and p.plan.get("entry") == 101.2, 600), \
-            (p.plan, p.last_action)
-        assert p.gates[-1]["decision"] == "ЖДАТЬ" and p.state == "ЗАСАДА" and status("TEST")["pilot"]["entry_gate"]["decision"] == "ЖДАТЬ"
-        FakeTinkoff.price = 101.22
+        assert p.plan and p.plan["entry"] is None and p.plan["src"] == "review" and p.plan["snap_price"] == 101.5, p.plan
         assert await settle(lambda: p.position is not None, 600), (p.last_action, fake_ai.calls.count("mission_entry"))
-        assert fake_ai.calls.count("mission_entry") == 2 and p.gates[-1]["decision"] == "ВОЙТИ" and p.position["invalidation"] == 99.0
+        assert fake_ai.calls.count("mission_entry") == 0 and p.position["invalidation"] == 99.0, fake_ai.calls.count("mission_entry")
         assert not p.broker.stops and p.position.get("stop_id") is None and status("TEST")["pilot"]["exchange_stop"] is False
         def xtitle(sub):   # узлы entry_check/profit есть в explain.KINDS (5.4.1) — здесь ищем по заголовку
             return any(sub in str(e.get("title") or "") for x in m.explain for e in x.get("events") or [])
-        assert await settle(lambda: xtitle("PRO у двери: ВОЙТИ")), m.explain
+        assert await settle(lambda: xtitle("Вход по свежему решению PRO")), m.explain
         #    мысль о прибыли: 65 % хода → PRO: ВЫЙТИ → закрыто в плюс, журнал, повод дежурному PRO
         n_tr = store_v5.trades_summary("TEST")["count"]
         n_pf = fake_ai.calls.count("mission_profit")   # мысль о прибыли могла звучать и в прежних блоках (умолчание ДЕРЖАТЬ)
@@ -5219,6 +5585,22 @@ if __name__ == "__main__":
         assert p.last_action.startswith("ЗАКРЫЛ ВСЁ (мысль о прибыли") and "после закрытия" in p.last_action, p.last_action
         assert status("TEST")["pilot"]["profits"][-1]["decision"] == "ВЫЙТИ" and status("TEST")["pilot"]["money_model"] == "pro"
         assert await settle(lambda: xtitle("Мысль о прибыли: ВЫЙТИ")), m.explain
+        #    приказ совета (он старше живого рынка) — через дверь: PRO ЖДАТЬ (откат 101.2) → уровень назвал сам PRO по
+        #    живому рынку (gate_level) → у уровня вход без второго вопроса, пока решение свежее
+        FakeTinkoff.price = 101.5
+        assert await settle(lambda: bool(p.prices) and p.prices[-1] == 101.5)
+        fake_ai.entry_answers[:] = [{"decision": "ЖДАТЬ", "why": "взять на откате", "entry": 101.2, "entry_kind": "откат"}]
+        assert p.adopt_forecast({"exec": {"do": "BUY", "entry": None, "entry_kind": "сейчас", "take": 108.0,
+                                          "invalidation": 99.0, "why": "совет: вход"}}), p.last_action
+        assert p.plan["src"] == "council", p.plan
+        assert await settle(lambda: fake_ai.calls.count("mission_entry") == 1 and p.plan is not None and p.plan.get("entry") == 101.2, 600), \
+            (p.plan, p.last_action)
+        assert p.gates[-1]["decision"] == "ЖДАТЬ" and p.plan["src"] == "gate_level" and p.state == "ЗАСАДА" \
+            and status("TEST")["pilot"]["entry_gate"]["decision"] == "ЖДАТЬ", (p.plan, p.gates[-1])
+        FakeTinkoff.price = 101.22
+        assert await settle(lambda: p.position is not None, 600), (p.last_action, fake_ai.calls.count("mission_entry"))
+        assert fake_ai.calls.count("mission_entry") == 1 and p.position["invalidation"] == 99.0, fake_ai.calls.count("mission_entry")
+        assert await settle(lambda: xtitle("PRO у двери: ЖДАТЬ")), m.explain
         await stop("TEST")
         await settle(lambda: not m.pilot_alive())
         config.PYTHIA_ENTRY_CHECK, config.PYTHIA_EXCHANGE_STOP = False, True
@@ -5326,4 +5708,6 @@ if __name__ == "__main__":
           "v5.3 толмач: приказ/вход/перепроверка/закрытие/трос/рынок/отказ биржи объяснены владельцу, память миссии по узлам "
           "(абзац, списки ужаты, старые новости в память), блок ПАМЯТЬ у перепроверки и троса, explain_list, store; "
           "v5.4.1: приказ WAIT (валидатор, пилот без плана, фаза idle), узлы у денег через money_json (PRO), проверка входа у двери "
-          "ЖДАТЬ→ВОЙТИ, мысль о прибыли ВЫЙТИ, стопы только в программе")
+          "ЖДАТЬ→ВОЙТИ, мысль о прибыли ВЫЙТИ, стопы только в программе; v5.4.2: словарь приказа и перепроверки "
+          "(BUY/ЛОНГ/NO_TRADE, мусор → переспрос без ЖДЁМ), ВНЕ_РЕЖИМА, ПЕРЕВЕРНУТЬ против режима → ЗАКРЫТЬ, пробой со стопом "
+          "у уровня, снимок решения в промпте, дрейф без засады, свежее решение PRO без второго вопроса у двери")

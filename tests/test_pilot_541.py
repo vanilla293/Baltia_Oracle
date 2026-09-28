@@ -176,7 +176,9 @@ def test_validate_exec_wait_forms_and_position_rule():
     for do in ("ЖДАТЬ", "FLAT", "HOLD_FLAT", "wait"):
         out, err = mission._validate_exec({"do": do, "invalidation": 98}, "short", 100)
         assert out and out["do"] == "WAIT" and err is None, (do, err)
-    assert mission._validate_exec({"do": "WAIT"}, "auto", 100)[0]["wait_for"] == "перевеса нет — вне рынка"
+    # v5.4.2: заглушки нейтральны — код не дописывает за ИИ «перевеса нет»
+    w0 = mission._validate_exec({"do": "WAIT"}, "auto", 100)[0]
+    assert w0["wait_for"] == "условие входа не названо — реши по живой картине" and w0["why"] == "(причина не указана)"
     _, err = mission._validate_exec({"do": "WAIT", "why": "x"}, "auto", 100, in_pos=True)
     assert err and "позиция открыта" in err and "WAIT недопустим" in err
     _, err = mission._validate_exec({"do": "HOLD"}, "auto", 100)
@@ -193,8 +195,10 @@ def test_adopt_wait_leaves_pilot_out_of_market_and_exec_text_shows_it():
     assert p.review_ts - time.time() > ai_pilot.REVIEW_SEC - 5
     m.exec, m.exec_ts = ex1, time.time()
     txt = mission._exec_text(m)
-    assert "WAIT — вне рынка, ждём: закрепление выше 101" in txt and "перевеса нет" in txt
-    assert "ПРИКАЗ СОВЕТА: WAIT" in p._situation_text(100.0)
+    assert "WAIT — совет ждал: закрепление выше 101" in txt and "перевеса нет" in txt   # «перевеса нет» — слова ИИ (why)
+    sit = p._situation_text(100.0)
+    assert "ПРИКАЗ СОВЕТА (0 мин назад): вне рынка; совет ждал: закрепление выше 101" in sit, sit
+    assert "прошлое мнение, а не запрет" in sit and "войти можешь сам, если перевес появился" not in sit
     assert mission.status("TEST")["phase"] == "idle" and mission.status("TEST")["exec"]["do"] == "WAIT"
 
     async def scenario():
@@ -290,8 +294,11 @@ def test_timeouts_are_ten_minutes_and_five_for_triage():
 
 
 # ── проверка входа у двери ──────────────────────────────────────────────────────────────────────────────────
-def test_entry_gate_wait_with_level_then_enter(offline):
+def test_entry_gate_wait_with_level_then_enter(offline, monkeypatch):
     fake = offline
+    # v5.4.2: уровень, названный у двери, свеж — у уровня вход без второго вопроса (tests/test_free_pilot_door.py);
+    # здесь свежесть выключена (0): у уровня дверь спрашивается снова, как в 5.4.1, — проверяем историю ответов в промпте
+    monkeypatch.setattr(config, "PYTHIA_ENTRY_FRESH_SEC", 0)
 
     async def scenario():
         m, p = make_pilot()
@@ -328,6 +335,7 @@ def test_entry_gate_wait_with_level_then_enter(offline):
 def test_entry_gate_wait_without_level_uses_wait_minutes_or_cooldown(offline, monkeypatch):
     fake = offline
     monkeypatch.setattr(config, "PYTHIA_ENTRY_CHECK_COOL_SEC", 120)
+    monkeypatch.setattr(config, "PYTHIA_ENTRY_FRESH_SEC", 0)   # v5.4.2: у уровня дверь спрашивается снова (как 5.4.1)
 
     async def scenario():
         m, p = make_pilot()
@@ -396,16 +404,21 @@ def test_entry_gate_silence_and_unknown_answer_block_entry_then_retry(offline, m
         assert p.adopt_forecast(ex("BUY"))
         fake.queue("mission_entry", FakeMoney.SILENT)
         await tick(p, 100.0)
-        assert p.pending is None and p.plan and 50 <= p.plan["gate_after"] - time.time() <= 60
+        # v5.4.2: молчание — не ЖДАТЬ от имени ИИ: запись кода НЕТ_ОТВЕТА, повтор через PYTHIA_SILENT_RETRY_SEC (не COOL)
+        retry = float(config.PYTHIA_SILENT_RETRY_SEC)
+        assert p.pending is None and p.plan and retry - 10 <= p.plan["gate_after"] - time.time() <= retry
         g = p.gates[-1]
-        assert g["decision"] == "ЖДАТЬ" and g["silent"] and "PRO не ответил" in g["why"] and "таймаут" in g["why"]
+        assert g["decision"] == "НЕТ_ОТВЕТА" and g["silent"] and g["source"] == "код" and "PRO не ответил" in g["why"] \
+            and "таймаут" in g["why"] and "решения не было" in g["why"], g
         assert fake.errors and fake.errors[-1][0] == "mission_entry"
         await tick(p, 100.0)
         assert fake.count("mission_entry") == 1, "до срока PRO не спрашиваем"
+        assert "не ответил у двери" in p.last_action and "велел ждать" not in p.last_action, p.last_action
         p.plan["gate_after"] = 0.0
         fake.queue("mission_entry", {"decision": "?!"})
         await tick(p, 100.0)
-        assert p.pending is None and p.gates[-1]["silent"] and "непонятно" in p.gates[-1]["why"] and len(fake.errors) == 2
+        assert p.pending is None and p.gates[-1]["silent"] and p.gates[-1]["decision"] == "НЕ_РАЗОБРАН" \
+            and "непонятно" in p.gates[-1]["why"] and len(fake.errors) == 2
         p.plan["gate_after"] = 0.0
         fake.queue("mission_entry", {"decision": "войти", "why": "ок"})
         await tick(p, 100.0)
@@ -448,8 +461,10 @@ def test_entry_gate_enter_does_not_chase_adverse_drift(offline):
         m, p = make_pilot()
         assert p.adopt_forecast(ex("BUY"))
         gate = asyncio.Event()
+        entered = asyncio.Event()
 
         async def slow(system, user, *, route, max_tokens=None):
+            entered.set()
             await gate.wait()
             fake.calls.append((route, user))
             return {"decision": "ВОЙТИ", "why": "ок"}
@@ -457,19 +472,22 @@ def test_entry_gate_enter_does_not_chase_adverse_drift(offline):
         mission.ai_v5.money_json = slow
         await p.tick(100.0, BOOK)                                   # снимок для PRO — 100
         assert p.plan["gate_busy"]
+        await asyncio.wait_for(entered.wait(), 5)                   # промпт собран: PRO видит 100 и думает
         await p.tick(101.5, dict(BOOK, best_bid=101.4, best_ask=101.6))   # пока думал — цена ушла на +1.5 % (хуже для BUY)
         gate.set()
         await settle_bg(p)
         plan = p.plan
-        assert p.pending is None and not p.broker.placed, "за ценой не гонимся"
-        assert plan["entry"] == 100.0 and plan["kind"] == "откат" and p.state == "ЗАСАДА", plan
-        assert "не гонюсь" in p.gates[-1]["applied"] and "хуже снимка 100" in p.last_action, p.last_action
-        # цена вернулась к снимку → у уровня новая проверка → ВОЙТИ → вход
+        assert p.pending is None and not p.broker.placed, "за уехавшей ценой молча не гонимся"
+        # v5.4.2: не засада по старой цене (в тренде она не исполнится), а сразу новый вопрос с живой ценой и пометкой
+        assert plan["entry"] is None and plan.get("kind") != "откат" and plan["gate_after"] <= time.time(), plan
+        assert plan["gate_note"] == "цена ушла на 1.50% за время раздумий (было 100, стало 101.5)", plan["gate_note"]
+        assert "спрошу сразу по живой" in p.gates[-1]["applied"] and "цена ушла на 1.50%" in p.last_action, p.last_action
+        # следующий тик — дверь снова, пометка о дрейфе в промпте; ВОЙТИ по живой цене → вход
         mission.ai_v5.money_json = fake.money_json
-        plan["gate_after"] = 0.0
-        fake.queue("mission_entry", {"decision": "ВОЙТИ", "why": "вернулась"})
-        await tick(p, 100.03)
-        assert p.pending and fake.count("mission_entry") == 2      # первый вызов — медленный ответ ВОЙТИ, второй — у уровня
+        fake.queue("mission_entry", {"decision": "ВОЙТИ", "why": "импульс жив — беру по 101.5"})
+        await tick(p, 101.5)
+        assert p.pending and fake.count("mission_entry") == 2      # первый вызов — медленный ответ ВОЙТИ, второй — по живой цене
+        assert "ПОМЕТКА К ЭТОМУ ВОПРОСУ: цена ушла на 1.50% за время раздумий" in fake.calls[-1][1]
 
     asyncio.run(scenario())
 
@@ -603,13 +621,16 @@ def test_profit_council_and_silence(offline, monkeypatch):
         pos["opened_ts"] = time.time()
         assert p.adopt_forecast(ex("SELL", None, 95.0, 108.0)) is True and p.plan["side"] == "short"
         p.plan = None
-        # молчание → ДЕРЖАТЬ по правилу, ошибка в панель
-        monkeypatch.setattr(ai_pilot, "PROFIT_TIMEOUT", 0.2)
+        # v5.4.2: молчание → не «ДЕРЖАТЬ» за ИИ: запись кода НЕТ_ОТВЕТА, позиция как есть, скорый повтор, ошибка в панель
         pos["profit_next"] = 0.0
+        inv0 = pos["invalidation"]
         fake.queue("mission_profit", FakeMoney.SILENT)
         await tick(p, entry + 7.5)
         x = p.profits[-1]
-        assert x["decision"] == "ДЕРЖАТЬ" and x["silent"] and "PRO не ответил" in x["why"] and p.position is pos
+        assert x["decision"] == "НЕТ_ОТВЕТА" and x["silent"] and x["source"] == "код" and "PRO не ответил" in x["why"] \
+            and p.position is pos and pos["invalidation"] == inv0, x
+        retry = float(config.PYTHIA_SILENT_RETRY_SEC)
+        assert retry - 10 <= pos["profit_next"] - time.time() <= retry, pos["profit_next"] - time.time()
         assert fake.errors[-1][0] == "mission_profit"
 
     asyncio.run(scenario())
