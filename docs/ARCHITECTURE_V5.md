@@ -687,15 +687,25 @@ store через `_persist`), шина `bus.stage("mission", rid, "explain", sta
   триггера). `status()["pilot"]["exchange_stop"]`; панель предупреждает: при падении программы позиция без защиты.
 - *Узлы у денег — PRO* (`PYTHIA_MONEY_MODEL` pro|flash): трос (`mission_guard`), тейк (`mission_take`), триаж
   (`event_triage`), проверка входа (`mission_entry`), мысль о прибыли (`mission_profit`) идут через
-  `ai_v5.money_json(system, user, route=…)`; таймауты GUARD/TAKE/ENTRY/PROFIT 600 с, TRIAGE 300 с; молчание →
-  безопасное правило (СЛИТЬ / ЗАФИКСИРОВАТЬ / PRO как раньше / входа нет / ДЕРЖАТЬ). `status()["pilot"]["money_model"]`.
+  `ai_v5.money_json(system, user, route=…)`; таймауты GUARD/TAKE 600 с, TRIAGE 300 с, ENTRY/PROFIT — 5.4.2:
+  `PYTHIA_ENTRY_TIMEOUT_SEC`/`PYTHIA_PROFIT_TIMEOUT_SEC` (1200 с) на каждую попытку (`attempt_timeout`); молчание у троса
+  и тейка → безопасное правило (СЛИТЬ / ЗАФИКСИРОВАТЬ), после триажа — PRO как раньше; у двери и в мысли о прибыли
+  (5.4.2) молчание — не решение: запись `decision` «НЕТ_ОТВЕТА» (таймаут/сбой) или «НЕ_РАЗОБРАН» (слово не разобрано),
+  `silent: true`, план и позиция как есть, повтор через `PYTHIA_SILENT_RETRY_SEC`. `status()["pilot"]["money_model"]`.
+  Разбор слова решения во всех узлах — `ai_v5.decision_of(ai_v5.decision_raw(obj), <словарь узла>)`; None → переспрос.
 - *Проверка входа у двери* (`PYTHIA_ENTRY_CHECK`, `MissionPilot._entry_gate`): перед КАЖДОЙ заявкой входа по плану
   (сейчас / откат / прорыв; добор по решению PRO и переворот — тоже; авто-добор по округлению биржи `_topup` — нет)
   PRO смотрит живой рынок: `prompts_mission.entry_check(ticker, name, play, *, situation, plan, history, light, news,
   council_text, scan, scout, partners, memory, guards, time_msk, checks)` → `ENTRY_SCHEMA` {decision:
   ВОЙТИ|ЖДАТЬ|ОТМЕНИТЬ, why, entry, entry_kind, wait_minutes, invalidation, take, council, note}. ЖДАТЬ — новый уровень
   (`entry`+`entry_kind`) или срок (`wait_minutes`), можно поправить стоп/тейк; ОТМЕНИТЬ — план снят, `council=true` →
-  полный совет (handoff kind `entry`); молчание/сбой → входа нет, повтор через `PYTHIA_ENTRY_CHECK_COOL_SEC`. Толмач
+  полный совет (handoff kind `entry`); молчание/сбой → 5.4.2: «НЕТ_ОТВЕТА»/«НЕ_РАЗОБРАН», повтор через
+  `PYTHIA_SILENT_RETRY_SEC` (счёт `plan["gate_silent"]`, после `PYTHIA_ENTRY_SILENT_MAX` — предупреждение; вход без ответа
+  не исполняется). 5.4.2: у плана `src` (council | review | gate_level | profit | topup) и снимок решения
+  (`snap_price`/`snap_ts`); план не от совета, свежий (≤ `PYTHIA_ENTRY_FRESH_SEC`) и без дрейфа хуже
+  `PYTHIA_ENTRY_DRIFT_PCT` бьётся без двери; ВОЙТИ при временном запрете помнится (`approved_until`, 300 с); дрейф после
+  ВОЙТИ — новый вопрос сразу с пометкой `gate_note`, а не засада по старой цене; лотов 0 → план снят, перепроверка с
+  честной причиной. Толмач
   узел `entry_check`. `status()["pilot"]`: `entry_gate` {busy, next_in_s, decision, why, ts, entry, entry_kind} | null
   (последняя проверка по текущему плану), `gates[-10:]` [{ts, decision, why, note, price, entry, entry_kind,
   wait_minutes, council}] (персистятся в state).
@@ -972,8 +982,9 @@ GET    /api/v5/chat/status                                  → {"busy","run_id"
   entry/profit/exec/review/summary): пустой или кривой ответ → один повтор `<route>_retry` с размышлением, иначе
   исключение («молчание» → ответ по правилу), без `_nothink` и без FLASH-починки; своя очередь `SEM_MONEY`.
   5.4.1: узлы у денег (трос, тейк, триаж, проверка входа, мысль о прибыли) зовутся через `ai_v5.money_json(system,
-  user, route=…)` — PRO или FLASH по `PYTHIA_MONEY_MODEL` (умолчание pro), таймауты 600/600/300/600/600 с, при
-  молчании — безопасное правило. `ai.THINK_MARK` ставится всегда, когда content пуст; `finish_reason=length` и
+  user, route=…)` — PRO или FLASH по `PYTHIA_MONEY_MODEL` (умолчание pro), таймауты 600/600/300 с (трос/тейк/триаж) и
+  5.4.2 `PYTHIA_ENTRY_TIMEOUT_SEC`/`PYTHIA_PROFIT_TIMEOUT_SEC` на попытку (`money_json(..., attempt_timeout=…)`); при
+  молчании у троса/тейка — безопасное правило, у двери и в мысли о прибыли — «решения не было» и скорый повтор. `ai.THINK_MARK` ставится всегда, когда content пуст; `finish_reason=length` и
   обрыв потока → `ai.note_error` + пометка в тексте. Модель FLASH — официальное имя `deepseek-flash`
   (V4.1-Flash); `ai._is_v4` узнаёт любое deepseek-* кроме legacy.
 

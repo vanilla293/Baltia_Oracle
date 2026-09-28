@@ -177,7 +177,8 @@ HTML-файл), ИИ DeepSeek (две модели: FLASH для механик�
   стоп-заявок на бирже нет, трос виртуальный — тик за ним закрывает по рынку; панель предупреждает «при падении
   программы позиция без защиты»); узлы у денег на PRO (`PYTHIA_MONEY_MODEL` pro|flash → `ai_v5.money_json(system,
   user, route=…)`, маршруты `mission_guard/mission_take/event_triage/mission_entry/mission_profit`, таймауты
-  600/600/300/600/600 с, молчание → безопасное правило); проверка входа у двери `MissionPilot._entry_gate`
+  600/600/300 с и (5.4.2) `PYTHIA_ENTRY_TIMEOUT_SEC`/`PYTHIA_PROFIT_TIMEOUT_SEC`, молчание у троса/тейка → безопасное
+  правило); проверка входа у двери `MissionPilot._entry_gate`
   (`PYTHIA_ENTRY_CHECK`, `_COOL_SEC`: перед каждой заявкой входа по плану — ВОЙТИ / ЖДАТЬ / ОТМЕНИТЬ,
   `prompts_mission.entry_check` + `ENTRY_SCHEMA`, handoff kind `entry`, толмач `entry_check`, `pilot.entry_gate`/`gates`);
   мысль о прибыли `MissionPilot._profit_watch` (`PYTHIA_PROFIT_THINK`, `_PCT`, `_MIN_PCT`, `_COOL_SEC`: ДЕРЖАТЬ / ВЫЙТИ /
@@ -188,6 +189,22 @@ HTML-файл), ИИ DeepSeek (две модели: FLASH для механик�
   (бейджи по `pilot.money_model`, «PRO проверяет вход…» / «PRO думает о прибыли…», `gates`/`profits` в хронике),
   «трос (в программе)» с предупреждением, приказ «ВНЕ РЫНКА — ждём: …»; логика 5.4.0 (`_stateRefresh`, `S.mission.revision`)
   перенесена в `index.html`, node-тестов 18.
+- **5.4.2 «свободный пилот»** (воля владельца 28.09.2026: «ИИ должен быть полностью свободен… а он ждём, ждём, ждём —
+  не входит и не выходит»; нужен отчёт, как DeepSeek торгует сам): промпты без перекоса ни к ожиданию, ни к входу
+  (закон 3, `BANNED` в обе стороны); `ai_v5.decision_raw/decision_of` + словари узлов (`review_table`, `door_table`,
+  `profit_table`, `guard_table`, `take_table`, `exec_table`) — один разбор слова решения, None → переспрос;
+  `money_json(attempt_timeout=…)`; молчание у двери и в мысли о прибыли — «НЕТ_ОТВЕТА»/«НЕ_РАЗОБРАН» (silent, источник —
+  код), повтор через `PYTHIA_SILENT_RETRY_SEC`, в промптах и панели «решения не было»; неразобранный choice
+  перепроверки → `_review_silent` без записи ЖДЁМ; вход против режима — «ВНЕ_РЕЖИМА» и переспрос, ПЕРЕВЕРНУТЬ против
+  режима → ЗАКРЫТЬ; план несёт `src`/`snap_price`/`snap_ts` — свежий вход не от совета бьётся без двери
+  (`PYTHIA_ENTRY_FRESH_SEC`, `PYTHIA_ENTRY_DRIFT_PCT`), дрейф — новый вопрос, а не засада; WAIT не спит вслепую
+  (`MissionPilot._wait_watch`: уровни WAIT, ритм `PYTHIA_WAIT_REVIEW_SEC`; прокол без плана — роль «вне рынка»; поводы
+  пилота без плана → PRO через `EVENT_MIN_GAP_SEC`); первый совет без приказа → пилот без плана; совет по поводу —
+  не дольше `PYTHIA_COUNCIL_MAX_SEC`; НОВЫЙ_АНАЛИЗ в окне совета откладывается; переворот при молодой позиции —
+  выход без переворота; killswitch — по сделке (`AIPilot._risk_round`), а не по частичке; прорыв не мёртв до касания
+  уровня (`plan["crossed"]`); совет: критик в обе стороны, итог 1:1, пересчёт видит прошлый итог и цены, возраст
+  совета в промптах миссии; толмач и память — «что дало ожидание»; мок-демо отвечает ротацией. Тесты:
+  `tests/test_free_pilot_{pilot,door,cadence,context}.py`; `tests/test_execution_stability.py` не зависит от часов.
 
 Старый бэкенд 4.5.x — библиотека (`ai.py`, `news.py`, `instruments.py`, `moex.py`,
 `tinkoff.py`, `pipeline.py`, `astro.py`, `aether.py`, `kuramoto.py`,
