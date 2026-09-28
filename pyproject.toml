@@ -1,0 +1,11 @@
+[project]
+name = "baltia-oracle"
+version = "0.1.0"
+description = "Личный ИИ-помощник в Telegram на DeepSeek: голос, напоминания, календарь, идеи, проекты, новости, память и своё мнение"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
