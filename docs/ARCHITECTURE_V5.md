@@ -374,7 +374,7 @@ long→BUY, short→SELL, mixed/auto→любое) → FLASH `council.present_fr
 
 **exec-приказ (JSON от PRO, после валидации):**
 ```json
-{"do":"BUY|SELL|WAIT|CLOSE","entry":число|null,"entry_kind":"сейчас|откат|прорыв","take":число|null,
+{"do":"BUY|SELL|WAIT|HOLD|CLOSE","entry":число|null,"entry_kind":"сейчас|откат|прорыв","take":число|null,
  "invalidation":число|null,"why":"1 фраза","plan":"3-6 строк: как ведём, где добавляем/выходим, чего ждём",
  "confidence":0..100,"news_ids":["…"],"levels":[число…],"time_note":"тайминг: когда ждать движения",
  "wait_for":"при WAIT: что должно случиться, чтобы войти; иначе \"\""}
@@ -384,6 +384,10 @@ long→BUY, short→SELL, mixed/auto→любое) → FLASH `council.present_fr
 `{"do":"WAIT","entry":null,"entry_kind":"сейчас","take":null,"invalidation":null,"wait_for":str,"why","plan","confidence",
 "news_ids","levels","time_note"}`, фаза миссии `idle` (пилот ЖДУ_ПЛАН), `m.exec` хранится, дежурный PRO вернётся к нему на
 перепроверке; панель — «ВНЕ РЫНКА — ждём: wait_for» без уровней входа. `CLOSE` — только при позиции (v5.2).
+5.4.2 (ревью): `HOLD` — только при позиции: держать как есть, `invalidation`/`take` — новые или null (прежние), без
+добора (в 5.4.1 «держать» кодировался как BUY/SELL той же стороны с `entry: null`, и пилот добирал до максимума);
+BUY/SELL той же стороны при позиции — «добрать». Слово `do` разбирает `ai_v5.exec_table(in_pos)` (КУПИТЬ/ЛОНГ → BUY,
+ЖДЁМ/NO_TRADE → WAIT без позиции, FLAT/«вне рынка» в позиции → CLOSE, ДЕРЖАТЬ/HOLD в позиции → HOLD).
 Три вида входа (v5.1h): `сейчас` — `entry: null`, входим немедленно (5.4.1: после проверки входа у двери); `откат` — засада: уровень ближе к стопу (BUY ниже цены, SELL выше), вход, когда цена
 подойдёт (`ARM_TICKS`) или уже лучше уровня; `прорыв` — уровень за ценой (BUY выше, SELL ниже),
 вход, когда цена пройдёт уровень (два тика подряд за уровнем, `mission.BREAK_CONFIRM_TICKS`;
@@ -418,7 +422,8 @@ long→BUY, short→SELL, mixed/auto→любое) → FLASH `council.present_fr
 КУПИТЬ/ПРОДАТЬ → `_plan_from_review`: план сейчас / откат / прорыв (геометрия как у приказа);
 дрейф решения НАПРАВЛЕННЫЙ — цена лучше снимка, по которому думал PRO, → входим (баг «войти
 сейчас, а цена ещё лучше — не заходит» закрыт), цена ушла хуже снимка более чем на
-`DRIFT_FRAC` (1%) → не гонимся, засада-откат по цене решения; без валидного stop — аварийный
+`DRIFT_FRAC` (1%) → (5.4.2) план остаётся «сейчас» с пометкой `gate_note` о дрейфе, и решает дверь по живой цене
+(5.4.1: засада-откат по цене решения); снимок цены — после сбора данных, как увидел PRO; без валидного stop — аварийный
 стоп 0.6%; НОВЫЙ_АНАЛИЗ → полный совет (окно `PYTHIA_COUNCIL_GAP_SEC`). История перепроверок
 копится в `mission.status()["reviews"]` (последние 20) и в store.
 
@@ -426,8 +431,9 @@ long→BUY, short→SELL, mixed/auto→любое) → FLASH `council.present_fr
 от дежурного PRO, кнопка ПЕРЕСМОТР и серьёзная новость при миссии без живого пилота.
 Предохранители: пейсинг `REANALYZE_GAP_SEC` (10 мин) считается с ПЕРВОГО принятого плана
 (`MissionPilot.adopt_forecast`); защита от переворота `PYTHIA_FLIP_QUIET_SEC` (1200 с) — вердикт
-другой стороны при позиции моложе порога отклоняется, позиция держится, перепроверка через
-5 мин; той же стороны — обновляет стоп/тейк. Совет и шифровальщик видят строку «ОТКРЫТАЯ
+другой стороны при позиции моложе порога не переворачивает, а (5.4.2) закрывает позицию без переворота
+(«совет: противоположная сторона при молодой позиции»), перепроверка через ≤ 5 мин; той же стороны — обновляет
+стоп/тейк (и добирает), HOLD — только стоп/тейк. Совет и шифровальщик видят строку «ОТКРЫТАЯ
 ПОЗИЦИЯ: …» (`_position_text`, блок ПРОШЛЫЙ РАЗБОР и блок ОТКРЫТАЯ ПОЗИЦИЯ в exec); вердикт
 обязан сказать: держать / закрыть / перевернуть. Повод совета берётся у пилота
 (`MissionPilot.council_reason`, колбэк `_bind_pilot`) — в стадиях и хронике виден настоящий повод.
@@ -693,8 +699,10 @@ store через `_persist`), шина `bus.stage("mission", rid, "explain", sta
   (5.4.2) молчание — не решение: запись `decision` «НЕТ_ОТВЕТА» (таймаут/сбой) или «НЕ_РАЗОБРАН» (слово не разобрано),
   `silent: true`, план и позиция как есть, повтор через `PYTHIA_SILENT_RETRY_SEC`. `status()["pilot"]["money_model"]`.
   Разбор слова решения во всех узлах — `ai_v5.decision_of(ai_v5.decision_raw(obj), <словарь узла>)`; None → переспрос.
-- *Проверка входа у двери* (`PYTHIA_ENTRY_CHECK`, `MissionPilot._entry_gate`): перед КАЖДОЙ заявкой входа по плану
-  (сейчас / откат / прорыв; добор по решению PRO и переворот — тоже; авто-добор по округлению биржи `_topup` — нет)
+- *Проверка входа у двери* (`PYTHIA_ENTRY_CHECK`, `MissionPilot._entry_gate`): перед заявкой входа по плану
+  (сейчас / откат / прорыв; добор по решению PRO и переворот — тоже; авто-добор по округлению биржи `_topup` — нет;
+  5.4.2: план не от совета — перепроверка, уровень от двери, перезаход, добор — свежий, ≤ `PYTHIA_ENTRY_FRESH_SEC`, без
+  дрейфа хуже `PYTHIA_ENTRY_DRIFT_PCT` — бьётся без двери)
   PRO смотрит живой рынок: `prompts_mission.entry_check(ticker, name, play, *, situation, plan, history, light, news,
   council_text, scan, scout, partners, memory, guards, time_msk, checks)` → `ENTRY_SCHEMA` {decision:
   ВОЙТИ|ЖДАТЬ|ОТМЕНИТЬ, why, entry, entry_kind, wait_minutes, invalidation, take, council, note}. ЖДАТЬ — новый уровень
@@ -715,7 +723,8 @@ store через `_persist`), шина `bus.stage("mission", rid, "explain", sta
   `prompts_mission.profit_think(ticker, name, play, *, situation, profit, history, light, plan, news, council_text, scan,
   scout, partners, memory, guards, time_msk, thoughts)` → `PROFIT_SCHEMA` {decision: ДЕРЖАТЬ|ВЫЙТИ|ВЫЙТИ_И_ПЕРЕЗАЙТИ|
   СОВЕТ, why, lock_price, take, reentry, reentry_kind, note}: ДЕРЖАТЬ (+`lock_price` → триггер, `take` → цель) / ВЫЙТИ /
-  ВЫЙТИ_И_ПЕРЕЗАЙТИ (`reentry`, `reentry_kind` → план той же стороны, вход через проверку входа) / СОВЕТ (триггер к
+  ВЫЙТИ_И_ПЕРЕЗАЙТИ (`reentry`, `reentry_kind` → план той же стороны `src: "profit"`; 5.4.2 — вход по этому решению,
+  пока оно свежее, позже — через проверку входа) / СОВЕТ (триггер к
   lock_price, полный совет без очереди, handoff kind `profit`). Толмач узел `profit`. `status()["pilot"]`: `profit`
   {busy, next_in_s, threshold_pct, progress_pct} | null, `profits[-10:]` [{ts, decision, why, note, price, floating,
   lock_price, take, reentry, reentry_kind}] (персистятся).
