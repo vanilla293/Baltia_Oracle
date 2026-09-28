@@ -2353,13 +2353,15 @@ async def s39_council_wait(sc: Scene) -> None:
     r = await mission.council_again(TICKER, "стенд: совет", wait=True)
     assert r["ok"], r
     assert sc.m.exec["do"] == "WAIT" and sc.m.exec["wait_for"] == "закрепление выше 101 на объёме" and sc.m.exec["invalidation"] is None, sc.m.exec
-    assert sc.p.plan is None and sc.p.state == "ЖДУ_ПЛАН" and "вне рынка — ждём: закрепление выше 101" in sc.p.last_action, sc.p.last_action
+    assert sc.p.plan is None and sc.p.state == "ЖДУ_ПЛАН" and "вне рынка — ждал: закрепление выше 101" in sc.p.last_action, sc.p.last_action
+    assert "перевеса нет" not in sc.p.last_action, "5.4.2: текст пилота нейтрален"
     assert mission.status(TICKER)["phase"] == "idle" and mission.status(TICKER)["exec"]["do"] == "WAIT"
     assert "WAIT — вне рынка, ждём: закрепление выше 101" in mission._exec_text(sc.m)
     await sc.tick(100.0)
     await sc.tick(101.5)
     assert sc.p.pending is None and not sc.broker.placed and fake_ai.count("mission_entry") == 0, "WAIT — входа нет"
-    assert sc.p.review_ts > time.time() + 1700
+    # 5.4.2: вне рынка по WAIT перепроверка через PYTHIA_WAIT_REVIEW_SEC (15 мин), а не PYTHIA_REVIEW_SEC (30 мин) вслепую
+    assert abs(sc.p.review_ts - time.time() - ai_pilot.wait_review_sec()) < 30, sc.p.review_ts - time.time()
     assert "ПРИКАЗ СОВЕТА: WAIT" in sc.p._situation_text(101.5)
     await sc.settle_ai()
     assert any(e["title"].startswith("Совет решил ждать (WAIT)") for e in sc.xevents("council")), [e["title"] for e in sc.xevents()]
