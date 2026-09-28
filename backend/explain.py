@@ -337,14 +337,17 @@ def memory_prompt(ctx: dict, why: str, accumulated: str, old: str) -> tuple[str,
     tm = ctx.get("time_msk") or ai_v5.now_msk_str()
     system = (
         f"Ты — память миссии по {ticker} ({name}). Сейчас {tm}. Повод свести память: {_short(why, 160)}.\n"
-        "Дано: прошлая память (если была), накопившееся с тех пор — перепроверки, передачи совету, ответы FLASH "
-        "у троса, объяснения толмача, сделки, новости до последнего совета — и текущий приказ для ориентира.\n"
+        "Дано: прошлая память (если была), накопившееся с тех пор — перепроверки, проверки входа у двери, мысли о "
+        "прибыли, передачи совету, ответы у троса и тейка, объяснения толмача, сделки, новости до последнего совета — "
+        "и текущий приказ для ориентира.\n"
         f"Сведи всё в ОДИН связный абзац не длиннее {MEMORY_LIMIT} символов: что было и чем кончилось, с датами "
         "и временем МСК, с ключевыми числами (входы, стопы, тейки, P/L), какие идеи отработали, какие умерли и "
-        "почему, что из новостей ещё держит рынок.\n"
+        "почему; что дали решения ждать — цена при ЖДАТЬ/WAIT/ЖДЁМ и куда она ушла после (в %), без оценки; что "
+        "из новостей ещё держит рынок.\n"
         "Прошлую память не переписывай с нуля — ужми и продолжи; что уже ни на что не влияет, отпускай. Текущий "
         "приказ дан только как ориентир — в абзац его не переписывай, он живёт в своём блоке.\n"
-        "Только факты из данных, без советов и прогнозов. Верни только абзац.")
+        "Только факты из данных, без советов и прогнозов; «решения не было» (модель не ответила или ответ не "
+        "разобран) — сбой, а не решение ждать. Верни только абзац.")
     parts = [f"ОБЪЕКТ: {ticker} — {name}. ВРЕМЯ: {tm}. Цена: {ctx.get('price')}."]
     if old.strip():
         parts += ["", "═══ ПРОШЛАЯ ПАМЯТЬ ═══", old.strip()]
@@ -355,23 +358,69 @@ def memory_prompt(ctx: dict, why: str, accumulated: str, old: str) -> tuple[str,
     return system, "\n".join(parts)
 
 
+_SILENT = ("НЕТ_ОТВЕТА", "НЕ_РАЗОБРАН")      # v5.4.2: сбой ИИ записан под своим именем — это не решение
+
+
+def _num(x: Any) -> float | None:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def _px(v: float) -> str:
+    return repr(round(v, 6))
+
+
+def _since(price: Any, now: Any) -> str:
+    """Цена решения и ход с тех пор: « @100.0 → сейчас 101.4 (+1.4 %)»; без текущей цены — « @100.0»."""
+    p0 = _num(price)
+    if p0 is None:
+        return ""
+    p1 = _num(now)
+    if p1 is None:
+        return f" @{_px(p0)}"
+    pct = (p1 / p0 - 1) * 100
+    return f" @{_px(p0)} → сейчас {_px(p1)} ({pct:+.1f} %)" if abs(pct) >= 0.1 else \
+        f" @{_px(p0)} → сейчас {_px(p1)} ({pct:+.2f} %)"
+
+
+def _decided(rec: dict, key: str, now: Any) -> str:
+    """Запись узла строкой: «ЖДЁМ @100.0 → сейчас 101.4 (+1.4 %) — почему». Сбой ИИ (silent, НЕТ_ОТВЕТА,
+    НЕ_РАЗОБРАН) — «(модель не ответила — решения не было)», а не ЖДАТЬ: хода цены к нему не приписываем."""
+    d = str(rec.get(key) or "")
+    if rec.get("silent") or d.upper() in _SILENT:
+        return ("(ответ модели не разобран — решения не было)" if d.upper() == "НЕ_РАЗОБРАН"
+                else "(модель не ответила — решения не было)")
+    return f"{d}{_since(rec.get('price'), now)} — {rec.get('why') or ''}"
+
+
 def _accumulated(m: Any, ctx: dict) -> str:
-    """Что сводим: перепроверки, передачи, ответы у троса, объяснения, сделки, старые новости."""
+    """Что сводим: перепроверки, проверки у двери, мысли о прибыли, передачи, ответы у троса и тейка,
+    объяснения, сделки, старые новости. v5.4.2: у решений с ценой — ход с тех пор до текущей цены (ctx price):
+    что дало ожидание, видно числом; молчание модели — «решения не было», не ЖДАТЬ."""
     L: list[str] = []
+    now = ctx.get("price")
     rv = getattr(m, "reviews", None) or []
     if rv:
-        L.append("Перепроверки: " + "; ".join(
-            f"{ai_v5.fmt_ts(r.get('ts'))} {r.get('choice')} — {r.get('why') or ''}"
-            + (f" (цена {r.get('price')})" if r.get("price") is not None else "") for r in rv))
+        L.append("Перепроверки: " + "; ".join(f"{ai_v5.fmt_ts(r.get('ts'))} {_decided(r, 'choice', now)}" for r in rv))
+    p = getattr(m, "pilot", None)
+    since_mem = float(getattr(m, "memory_ts", None) or 0.0)     # двери и прибыль пилот не режет — только новое
+    for attr, title in (("gates", "Проверки входа у двери"), ("profits", "Мысли о прибыли")):
+        xs = [x for x in (list(getattr(p, attr, None) or []) if p is not None else [])
+              if isinstance(x, dict) and float(x.get("ts") or 0) > since_mem]
+        if xs:
+            L.append(f"{title}: " + "; ".join(f"{ai_v5.fmt_ts(x.get('ts'))} {_decided(x, 'decision', now)}" for x in xs))
     hs = getattr(m, "handoffs", None) or []
     if hs:
         L.append("Передачи: " + "; ".join(f"{ai_v5.fmt_ts(h.get('ts'))} [{h.get('kind') or 'council'}] {h.get('reason') or ''}"
                                           for h in hs))
-    p = getattr(m, "pilot", None)
     gs = list(getattr(p, "guards", None) or []) if p is not None else []
     if gs:
-        L.append("FLASH у троса: " + "; ".join(f"{ai_v5.fmt_ts(g.get('ts'))} {g.get('decision')} @{g.get('price')} — {g.get('why') or ''}"
-                                               for g in gs))
+        L.append("Ответы у троса и тейка: " + "; ".join(
+            f"{ai_v5.fmt_ts(g.get('ts'))} {'у тейка ' if g.get('side') == 'take' else ''}{_decided(g, 'decision', now)}"
+            for g in gs))
     ex = text(m, KEEP)
     if ex:
         L.append("Объяснения толмача:\n" + ex)
@@ -615,13 +664,38 @@ if __name__ == "__main__":
         assert out and out.startswith("ПАМЯТЬ:") and len(out) <= MEMORY_LIMIT and m2.memory == out and m2.memory_n == 1
         assert "memory" in fake.calls and persisted == ["mem"]
         um = fake.users[-1]
-        for piece in ("═══ НАКОПИЛОСЬ С ТЕХ ПОР ═══", "Перепроверки:", "план жив 7", "Передачи:", "повод 6", "FLASH у троса:",
+        for piece in ("═══ НАКОПИЛОСЬ С ТЕХ ПОР ═══", "Перепроверки:", "план жив 7", "Передачи:", "повод 6", "Ответы у троса и тейка:",
+                      "ЖДЁМ @100.0 → сейчас 99.52 (-0.5 %) — план жив 7", "ЖДАТЬ @97.0 → сейчас 99.52 (+2.6 %) — г4",
                       "Объяснения толмача:", "объяснение 11", "Сделки:", "Новости до последнего совета:", "старая новость",
                       "═══ ТЕКУЩИЙ ПРИКАЗ"):
             assert piece in um, (piece, um[:2000])
         assert "═══ ПРОШЛАЯ ПАМЯТЬ" not in um
         sm, _ = memory_prompt(ctx_of(m2)(), "после совета", "x", "")
         assert sm.count("\n") < 12 and "МСК" in sm and str(MEMORY_LIMIT) in sm
+        assert "что дали решения ждать — цена при ЖДАТЬ/WAIT/ЖДЁМ и куда она ушла после (в %), без оценки" in sm
+        assert "FLASH" not in sm, "у троса думает модель денег, не обязательно FLASH (v5.4.2)"
+        # ── v5.4.2: ход цены после решения; молчание модели — «решения не было», а не ЖДАТЬ ──
+        t9 = time.time()
+        m9 = SimpleNamespace(ticker="T9", name="т", reviews=[
+            {"ts": t9, "choice": "ЖДЁМ", "why": "коридор", "price": 100.0},
+            {"ts": t9, "choice": "НЕТ_ОТВЕТА", "why": "таймаут", "price": 100.2, "silent": True},
+            {"ts": t9, "choice": "НЕ_РАЗОБРАН", "why": "«может быть»", "price": 100.3}],
+            handoffs=[], memory_ts=t9 - 60, pilot=SimpleNamespace(
+                guards=[{"ts": t9, "decision": "ПОДЕРЖАТЬ", "side": "take", "price": 101.0, "why": "импульс"}],
+                gates=[{"ts": t9 - 600, "decision": "ВОЙТИ", "price": 90.0, "why": "до памяти — уже сведено"},
+                       {"ts": t9, "decision": "ЖДАТЬ", "price": 100.0, "why": "откат к 99.7"},
+                       {"ts": t9, "decision": "ЖДАТЬ", "price": 100.1, "why": "PRO не ответил", "silent": True}],
+                profits=[{"ts": t9, "decision": "ДЕРЖАТЬ", "price": 101.4, "why": "ход жив"}]))
+        acc9 = _accumulated(m9, {"price": 101.4})
+        for piece in ("ЖДЁМ @100.0 → сейчас 101.4 (+1.4 %) — коридор", "(модель не ответила — решения не было)",
+                      "(ответ модели не разобран — решения не было)",
+                      "Проверки входа у двери: ", "ЖДАТЬ @100.0 → сейчас 101.4 (+1.4 %) — откат к 99.7",
+                      "Мысли о прибыли: ", "ДЕРЖАТЬ @101.4 → сейчас 101.4 (+0.00 %) — ход жив",
+                      "у тейка ПОДЕРЖАТЬ @101.0 → сейчас 101.4 (+0.4 %) — импульс"):
+            assert piece in acc9, (piece, acc9)
+        assert "НЕТ_ОТВЕТА" not in acc9 and "НЕ_РАЗОБРАН" not in acc9 and "таймаут" not in acc9, acc9
+        assert "PRO не ответил" not in acc9 and "до памяти" not in acc9 and "ВОЙТИ" not in acc9, acc9
+        assert "ЖДЁМ @100.0 — коридор" in _accumulated(m9, {}), "нет текущей цены — только цена решения"
         assert len(m2.reviews) == KEEP_REVIEWS and m2.reviews[-1]["why"] == "план жив 7"
         assert len(m2.handoffs) == KEEP_HANDOFFS and len(m2.pilot.guards) == KEEP_GUARDS and len(m2.explain) == KEEP_EXPLAIN
         assert events[-1]["stage"] == "memory" and events[-1]["status"] == "done" and events[-1]["data"]["n"] == 1

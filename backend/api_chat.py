@@ -48,7 +48,8 @@ _STATE: dict[str, Any] = {"task": None, "run_id": None, "model": None, "cleared_
 _STUBS: dict[str, Any] = {}   # self-тест: подмены модулей по имени
 
 _PHASE_RU = {"council": "совет думает", "armed": "засада", "entering": "вхожу", "in_position": "в позиции",
-             "stopped": "пилот остановлен", "panic": "паника", "idle": "жду план", "error": "ошибка"}
+             "stopped": "пилот остановлен", "panic": "паника", "idle": "вне рынка / жду план", "error": "ошибка"}
+_SILENT = ("НЕТ_ОТВЕТА", "НЕ_РАЗОБРАН")   # v5.4.2: сбой ИИ — «решения не было», не ЖДАТЬ
 
 
 def _mod(name: str):
@@ -115,6 +116,17 @@ def _dialog_text(h: list[dict]) -> str:
 
 
 # ── контекст ──────────────────────────────────────────────────────────────────
+def _said(rec: dict, key: str) -> str:
+    """Решение узла строкой «ЖДЁМ — почему». Сбой ИИ (silent, НЕТ_ОТВЕТА, НЕ_РАЗОБРАН) — «ответа не было —
+    решения не было», а не его ЖДАТЬ (v5.4.2)."""
+    d = str(rec.get(key) or "")
+    why = str(rec.get("why") or "")[:200]
+    if rec.get("silent") or d.upper() in _SILENT:
+        what = "ответ не разобран" if d.upper() == "НЕ_РАЗОБРАН" else "ответа не было"
+        return f"{what} — решения не было" + (f" ({why})" if why else "")
+    return f"{d} — {why}"
+
+
 def _mission_text() -> tuple[str, dict]:
     """Состояние миссии и пилота одним блоком + мета (тикер, класс) для живого рынка."""
     ms = _mod("mission")
@@ -144,9 +156,19 @@ def _mission_text() -> tuple[str, dict]:
         L.append("Ошибка: " + str(st["error"])[:300])
     ex = st.get("exec") or {}
     if ex:
-        L.append(f"Приказ совета: {ex.get('do')} вход {ex.get('entry') if ex.get('entry') is not None else 'сейчас'}"
-                 f" ({ex.get('entry_kind') or '—'}) тейк {ex.get('take')} стоп {ex.get('invalidation')}"
-                 f" — {str(ex.get('why') or '')[:300]}")
+        do = str(ex.get("do") or "").upper()
+        if do == "WAIT":                         # v5.4.2: WAIT — чего ждал совет и уровни, без «вход сейчас … стоп None»
+            lv = ", ".join(f"{x:g}" if isinstance(x, (int, float)) else str(x) for x in (ex.get("levels") or [])) or "—"
+            L.append(f"Приказ совета ({ai_v5.fmt_ts(st.get('exec_ts'))}): WAIT — совет ждал: "
+                     f"{str(ex.get('wait_for') or '').strip()[:300] or '—'}; уровни: {lv}"
+                     + (f"; почему: {str(ex['why'])[:300]}" if ex.get("why") else ""))
+        elif do == "CLOSE":
+            L.append(f"Приказ совета ({ai_v5.fmt_ts(st.get('exec_ts'))}): CLOSE — закрыть позицию"
+                     + (f" — {str(ex['why'])[:300]}" if ex.get("why") else ""))
+        else:
+            L.append(f"Приказ совета: {ex.get('do')} вход {ex.get('entry') if ex.get('entry') is not None else 'сейчас'}"
+                     f" ({ex.get('entry_kind') or '—'}) тейк {ex.get('take')} стоп {ex.get('invalidation')}"
+                     f" — {str(ex.get('why') or '')[:300]}")
         if ex.get("plan"):
             L.append("План ведения: " + str(ex["plan"])[:600])
     if st.get("account_pos"):
@@ -158,7 +180,7 @@ def _mission_text() -> tuple[str, dict]:
             L.append(f"ПОЗИЦИЯ ПИЛОТА: {pos.get('side')} {pos.get('lots')} лот @{pos.get('entry')}, "
                      f"плавающий P/L {pos.get('floating')} ₽, триггер (мягкий стоп) {pos.get('invalidation')}, "
                      f"аварийный трос биржи {pos.get('hard_stop')}, тейк {pos.get('take')}"
-                     + (f"; FLASH у троса держал {pos.get('holds')} раз" if pos.get("holds") else "")
+                     + (f"; у троса держал {pos.get('holds')} раз" if pos.get("holds") else "")
                      + ("; уровни временные — принята со счёта, ждёт PRO" if pos.get("levels_placeholder") else ""))
         else:
             pl = p.get("plan") or {}
@@ -182,9 +204,10 @@ def _mission_text() -> tuple[str, dict]:
         if p.get("next_review_in_s") is not None:
             L.append(f"Следующая перепроверка дежурного PRO через {int(_f(p['next_review_in_s'], 0) // 60)} мин")
         for g in (p.get("guards") or [])[-3:]:
-            L.append(f"FLASH у троса {ai_v5.fmt_ts(g.get('ts'))}: {g.get('decision')} — {str(g.get('why') or '')[:200]}")
+            L.append(f"Ответ у {'тейка' if g.get('side') == 'take' else 'троса'} {ai_v5.fmt_ts(g.get('ts'))}: "
+                     f"{_said(g, 'decision')}")
     for r in (st.get("reviews") or [])[-5:]:
-        L.append(f"Перепроверка {ai_v5.fmt_ts(r.get('ts'))}: {r.get('choice')} — {str(r.get('why') or '')[:200]}")
+        L.append(f"Перепроверка {ai_v5.fmt_ts(r.get('ts'))}: {_said(r, 'choice')}")
     for h in (st.get("handoffs") or [])[-3:]:
         L.append(f"Передача {ai_v5.fmt_ts(h.get('ts'))} ({h.get('kind')}): {str(h.get('reason') or '')[:200]}")
     tr = st.get("trades") or {}
@@ -203,6 +226,8 @@ def _mission_text() -> tuple[str, dict]:
 
 
 def _council_text() -> str:
+    """Итог общего совета. v5.4.2: summary_text получает строку council_latest — шапку с видом, временем МСК
+    и возрастом пишет он сам («Совет daily от … (N ч назад) — общий по рынку»)."""
     c = _mod("council")
     if not c:
         return ""
@@ -210,9 +235,7 @@ def _council_text() -> str:
         latest = c.latest()
         if not latest:
             return "совета ещё не было"
-        data = latest.get("data") if isinstance(latest, dict) and "data" in latest else latest
-        head = f"Совет ({latest.get('kind') or '—'}, {ai_v5.fmt_ts(latest.get('ts'))}): "
-        return head + (c.summary_text(data) or "")
+        return c.summary_text(latest) or ""
     except Exception as e:                               # noqa: BLE001
         return f"(итог совета недоступен: {str(e)[:80]})"
 
@@ -551,14 +574,14 @@ if __name__ == "__main__":
         def snapshot(cls):
             return cls.snap
 
+    from . import council as _real_council
+
     class StubCouncil:
         @staticmethod
         def latest():
             return {"kind": "daily", "ts": time.time(), "data": {"summary": {"regime": "risk-on"}}}
 
-        @staticmethod
-        def summary_text(d):
-            return "Режим: risk-on"
+        summary_text = staticmethod(_real_council.summary_text)     # v5.4.2: шапку с возрастом пишет совет
 
     class StubNews:
         @staticmethod
@@ -628,11 +651,12 @@ if __name__ == "__main__":
         assert VOICE in s and "ДОКТРИНА" in s, "чат говорит голосом 4.5.4 (v5.4.1)"
         for piece in ("═══ МИССИЯ И ПИЛОТ ═══", "Миссия SBER (Сбербанк, share), режим игры long, фаза: в позиции",
                       "ПОЗИЦИЯ ПИЛОТА: long 8 лот @299.0", "триггер (мягкий стоп) 295.0", "аварийный трос биржи 290.6",
-                      "FLASH у троса держал 1 раз", "биржа даёт купить лотов 3", "Приказ совета: BUY вход сейчас",
-                      "План ведения: держим до 310", "FLASH у троса", "ЖДАТЬ — ложный прокол",
+                      "; у троса держал 1 раз", "биржа даёт купить лотов 3", "Приказ совета: BUY вход сейчас",
+                      "План ведения: держим до 310", "Ответ у троса ", "ЖДАТЬ — ложный прокол",
                       "Перепроверка", "Передача", "(stop)", "Сделок по миссии: 2", "Разведка миссии (последняя)",
                       "ПАМЯТЬ МИССИИ (прошлые этапы", "трос держал", "Толмач", "Вход исполнен): Пилот вошёл в лонг",
-                      "═══ ИТОГ СОВЕТА ═══", "Совет (daily", "Режим: risk-on",
+                      "═══ ИТОГ СОВЕТА ═══", "Совет daily от ", "МСК (0 мин назад) — общий по рынку", "Режим: risk-on",
+                      "Входов совет не назвал",
                       "═══ ЖИВОЙ РЫНОК ПО ИНСТРУМЕНТУ МИССИИ ═══", "SBER: цена 300.5",
                       "═══ ЗАМЕТКИ ДОЗОРА ═══", "серьёзность 80 · санкции на банки · SBER",
                       "═══ НОВОСТИ (время МСК) ═══", "[n1] ЦБ сохранил ставку", "[n2] Сбер: дивиденды",
@@ -641,6 +665,7 @@ if __name__ == "__main__":
                       "═══ СВЯЗАННЫЕ БУМАГИ ИНСТРУМЕНТА МИССИИ (корреляции) ═══", "Связанные бумаги для SBER: VTBR ρ=+0.81",
                       "ВОПРОС ВЛАДЕЛЬЦА: что по SBER, держим?"):
             assert piece in u, (piece, u[:2500])
+        assert "FLASH у троса" not in u and "Совет (daily" not in u, "метки 5.4.2: «у троса», шапка совета — одна"
         assert StubCorrelate.calls == [("SBER", "share")] and "связанные бумаги" in s, "чат видит связанные бумаги миссии"
         assert "память миссии" in s and "толмача" in s, "system упоминает память и толмача (v5.3)"
         assert "═══ ДИАЛОГ" not in u, "первый вопрос — диалога ещё нет"
@@ -704,6 +729,30 @@ if __name__ == "__main__":
         assert _dialog_text(history()).count("\n") == DIALOG_LAST - 1
         clear_history()
         assert history() == []
+
+        # ── v5.4.2: приказ WAIT — чего ждал совет и уровни; фаза idle — «вне рынка / жду план»;
+        #    молчание ИИ — «ответа не было — решения не было», а не ЖДАТЬ ──
+        snap_w = {"active": "SBER", "missions": {"SBER": {
+            "ticker": "SBER", "name": "Сбербанк", "asset_class": "share", "play": "auto", "phase": "idle",
+            "price": 300.5, "started_ts": time.time(), "exec_ts": time.time(),
+            "exec": {"do": "WAIT", "entry": None, "entry_kind": "сейчас", "take": None, "invalidation": None,
+                     "wait_for": "закрепление выше 305 на объёме", "levels": [300.0, 305.5], "why": "коридор"},
+            "pilot": {"state": "ОЖИДАНИЕ", "last_action": "вне рынка", "position": None,
+                      "guards": [{"ts": time.time(), "decision": "НЕТ_ОТВЕТА", "why": "таймаут", "silent": True}]},
+            "reviews": [{"ts": time.time(), "choice": "НЕТ_ОТВЕТА", "why": "таймаут 1200 с"},
+                        {"ts": time.time(), "choice": "НЕ_РАЗОБРАН", "why": "«может быть»"},
+                        {"ts": time.time(), "choice": "ЖДЁМ", "why": "коридор 300–305"}]}}}
+        StubMission.snap = snap_w
+        txt, _ = _mission_text()
+        for piece in ("фаза: вне рынка / жду план", "): WAIT — совет ждал: закрепление выше 305 на объёме; уровни: 300, 305.5",
+                      "почему: коридор", "Ответ у троса", "ответа не было — решения не было (таймаут)",
+                      "Перепроверка", "ответа не было — решения не было (таймаут 1200 с)",
+                      "ответ не разобран — решения не было", "ЖДЁМ — коридор 300–305"):
+            assert piece in txt, (piece, txt)
+        assert "вход сейчас" not in txt and "стоп None" not in txt and "НЕТ_ОТВЕТА —" not in txt, txt
+        snap_w["missions"]["SBER"]["exec"] = {"do": "CLOSE", "why": "слом", "invalidation": 1.0}
+        txt, _ = _mission_text()
+        assert "): CLOSE — закрыть позицию — слом" in txt and "вход сейчас" not in txt, txt
 
         # ── без миссии: честная строка; без ключа — отказ ──
         StubMission.snap = {"active": None, "missions": {}}

@@ -132,21 +132,53 @@ def _pick_line(p: dict) -> str:
             f" — {p.get('why') or ''} | триггер: {p.get('trigger') or '—'} | риск: {p.get('risk') or '—'}")
 
 
+def _age_text(ts) -> str:
+    """Возраст совета: «40 мин назад» / «26 ч назад»."""
+    try:
+        age = max(0.0, time.time() - float(ts))
+    except (TypeError, ValueError):
+        return "возраст неизвестен"
+    return f"{int(age // 60)} мин назад" if age < 3600 else f"{int(age // 3600)} ч назад"
+
+
+def _row_head(meta: dict) -> str:
+    """v5.4.2: шапка итога из строки council_latest (или data совета): вид, время МСК и возраст — вчерашний
+    совет не читается как сегодняшний; совет общий по рынку, у миссии свой приказ."""
+    kind = meta.get("kind") or "—"
+    ts = meta.get("ts")
+    when = f"от {ai_v5.fmt_ts(ts)} МСК ({_age_text(ts)})" if ts else "(время неизвестно)"
+    return f"Совет {kind} {when} — общий по рынку"
+
+
 def summary_text(summary: dict) -> str:
-    """Текст итога совета целиком (без обрезки). Принимает summary, data совета или строку council_latest."""
+    """Текст итога совета целиком (без обрезки). Принимает summary, data совета или строку council_latest.
+    v5.4.2: строка council_latest (или data с ts/kind) → первой строкой шапка «Совет {kind} от ДД.ММ ЧЧ:ММ МСК
+    (N ч назад) — общий по рынку»; голый summary — без шапки, как раньше. Пустые picks — явная строка
+    «Входов совет не назвал»; режим, подставленный по умолчанию (в JSON его не было), — «режим не распознан»."""
     s = summary or {}
+    meta = None
     if isinstance(s, dict) and "data" in s and isinstance(s["data"], dict):
+        meta = s if (s.get("ts") or s.get("kind")) else None
         s = s["data"]
     if isinstance(s, dict) and "summary" in s and isinstance(s["summary"], dict):
+        if meta is None and (s.get("ts") or s.get("kind")):
+            meta = s
         s = s["summary"]
     if not isinstance(s, dict) or not s:
         return "совета ещё не было"
-    lines = [f"Режим: {s.get('regime') or '—'}"]
+    lines = [_row_head(meta)] if meta else []
+    if "regime_raw" in s or not s.get("regime"):
+        raw = str(s.get("regime_raw") or "").strip()
+        lines.append("Режим: режим не распознан" + (f" (в ответе совета «{raw}»)" if raw else " (совет его не назвал)"))
+    else:
+        lines.append(f"Режим: {s.get('regime')}")
     if s.get("summary"):
         lines.append(str(s["summary"]))
     if s.get("picks"):
         lines.append("Входы:")
         lines += ["- " + _pick_line(p) for p in s["picks"]]
+    else:
+        lines.append("Входов совет не назвал")
     if s.get("avoid"):
         lines.append("Избегать: " + "; ".join(f"{a.get('ticker')} ({a.get('why') or ''})" for a in s["avoid"]))
     if s.get("watch"):
@@ -235,15 +267,37 @@ def _tw(items, key="ticker") -> list[dict]:
     return out
 
 
-def validate_summary(obj, human: bool = False) -> dict:
+_SIDE_TABLE = {"long": ai_v5.SYN_BUY, "short": ai_v5.SYN_SELL}
+_decision_of = ai_v5.decision_of          # чистая функция словаря; self-тест подменяет ai_v5 фейком — берём заранее
+
+
+def _pick_side(raw) -> str | None:
+    """Сторона пика терпимо: «long», «LONG », «buy_now», «ЛОНГ (покупка)» → long; не распознано → None."""
+    s = str(raw or "").strip()
+    side = _SIDES.get(s.lower())
+    if side:
+        return side
+    try:
+        return _decision_of(s, _SIDE_TABLE)
+    except Exception:            # noqa: BLE001
+        return None
+
+
+def validate_summary(obj, human: bool = False, dropped: list | None = None) -> dict:
+    """Итог совета по схеме §2.5. v5.4.2: сторона пика — терпимо (ai_v5.decision_of: long ← SYN_BUY,
+    short ← SYN_SELL); пик без распознанной стороны не пропадает молча — строка «ТИКЕР «сторона»» идёт в
+    dropped (вызывающий пишет её в стадию совета «пик без стороны: …»). Режима нет или он не из списка →
+    «смешанно» и ключ regime_raw (что было в ответе) — summary_text скажет «режим не распознан»."""
     s = obj if isinstance(obj, dict) else {}
     regime = str(s.get("regime") or "").strip().lower()
     picks = []
     for p in s.get("picks") or []:
         if not isinstance(p, dict) or not p.get("ticker"):
             continue
-        side = _SIDES.get(str(p.get("side") or "").strip().lower())
+        side = _pick_side(p.get("side"))
         if not side:
+            if dropped is not None:
+                dropped.append(f"{newsflow.norm_ticker(p['ticker'])} «{str(p.get('side') or '')[:40]}»")
             continue
         picks.append({
             "ticker": newsflow.norm_ticker(p["ticker"]), "side": side,
@@ -258,6 +312,8 @@ def validate_summary(obj, human: bool = False) -> dict:
         "picks": picks[:12], "avoid": _tw(s.get("avoid")), "watch": _tw(s.get("watch")),
         "key_times": [str(x)[:120] for x in (s.get("key_times") or []) if str(x).strip()][:12],
     }
+    if regime not in _REGIMES:
+        out["regime_raw"] = regime[:40]
     if human:
         out["human_alignment"] = [
             {"thesis": str(h.get("thesis") or "")[:300],
@@ -323,10 +379,16 @@ async def _deliberate(scope: str, run_id: str, analysis_su: tuple[str, str], str
     s_, u_ = P.summary(vd, human=human, codes_text=codes)
     await bus.stage(scope, run_id, "summary", "start", detail=_sizes("итог в JSON", {"вердикт": vd}, u_))
     obj = await ai_v5.pro_json(s_, u_, route="summary")
-    summary = validate_summary(obj, human=human)
+    dropped: list[str] = []
+    summary = validate_summary(obj, human=human, dropped=dropped)
+    if dropped:                  # v5.4.2: пик без стороны не пропадает молча — заметка в стадии итога
+        log.info("итог совета %s: пик без стороны: %s", run_id, "; ".join(dropped))
+        await bus.stage(scope, run_id, "summary", "progress", n=len(summary["picks"]),
+                        detail="пик без стороны: " + "; ".join(dropped))
     await bus.stage(scope, run_id, "summary", "done", n=len(summary["picks"]),
                     detail=f"{summary['regime']}; входов {len(summary['picks'])}: "
-                           + ", ".join(f"{p['ticker']} {p['side']}" for p in summary["picks"]),
+                           + ", ".join(f"{p['ticker']} {p['side']}" for p in summary["picks"])
+                           + (f"; пик без стороны: {'; '.join(dropped)}" if dropped else ""),
                     data={"regime": summary["regime"],
                           "picks": [{k: p[k] for k in ("ticker", "side", "conviction")} for p in summary["picks"]]})
     return texts, summary
@@ -886,7 +948,41 @@ if __name__ == "__main__":
         # summary_text: по summary, по data, по строке council_latest
         st_ = summary_text(row)
         assert "SBER long 72% день" in st_ and "Избегать: GAZP" in st_ and len(st_) <= 8000
-        assert summary_text(s) == st_ == summary_text(row["data"]) and summary_text({}) == "совета ещё не было"
+        # v5.4.2: строка council_latest → шапка с видом, временем МСК и возрастом; голый summary — как раньше
+        head_, bare_ = st_.split("\n", 1)
+        assert head_.startswith("Совет daily от ") and head_.endswith("МСК (0 мин назад) — общий по рынку"), head_
+        assert summary_text(s) == bare_ and bare_.startswith("Режим: risk-on") and "Входов совет не назвал" not in bare_
+        assert summary_text(row["data"]).startswith("Совет daily от ") and summary_text({}) == "совета ещё не было"
+        # пик GAZP «flat» не пропал молча: заметка в стадии итога
+        notes_ = [e for e in events if e["type"] == "v5" and e["stage"] == "summary" and e["status"] == "progress"]
+        assert notes_ and notes_[0]["detail"] == "пик без стороны: GAZP «flat»", notes_
+        sm_done = [e for e in events if e["type"] == "v5" and e["stage"] == "summary" and e["status"] == "done"][0]
+        assert "пик без стороны: GAZP «flat»" in sm_done["detail"], sm_done["detail"]
+        # стороны пиков — терпимо; спорное и отрицание — в dropped, не угадываем
+        drop_: list = []
+        vs_ = validate_summary({"regime": "risk-off", "picks": [
+            {"ticker": "sber", "side": "buy_now"}, {"ticker": "gazp", "side": "ЛОНГ (покупка)"},
+            {"ticker": "lkoh", "side": "LONG "}, {"ticker": "rosn", "side": "Шорт"}, {"ticker": "vtbr", "side": "продажа"},
+            {"ticker": "mgnt", "side": "flat"}, {"ticker": "tatn", "side": "лонг или шорт"}, {"ticker": "plzl", "side": ""}]},
+            dropped=drop_)
+        assert [(p["ticker"], p["side"]) for p in vs_["picks"]] == [
+            ("SBER", "long"), ("GAZP", "long"), ("LKOH", "long"), ("ROSN", "short"), ("VTBR", "short")], vs_["picks"]
+        assert drop_ == ["MGNT «flat»", "TATN «лонг или шорт»", "PLZL «»"], drop_
+        assert "regime_raw" not in vs_ and vs_["regime"] == "risk-off"
+        assert validate_summary({"picks": [{"ticker": "x", "side": "flat"}]})["picks"] == []   # без dropped — как раньше
+        # режим не распознан: по умолчанию «смешанно» + regime_raw; пустые picks — явной строкой
+        v0 = validate_summary({})
+        assert v0["regime"] == "смешанно" and v0["regime_raw"] == "" and v0["picks"] == []
+        t0_ = summary_text(v0)
+        assert t0_.startswith("Режим: режим не распознан (совет его не назвал)") and "Входов совет не назвал" in t0_, t0_
+        vb_ = validate_summary({"regime": "Bullish", "picks": []})
+        assert vb_["regime"] == "смешанно" and "«bullish»" in summary_text(vb_)
+        old_ = {"kind": "update", "ts": time.time() - 26 * 3600, "run_id": "r0",
+                "data": {"kind": "update", "summary": {"regime": "risk-off", "summary": "вне рынка", "picks": []}}}
+        to_ = summary_text(old_)
+        assert to_.startswith("Совет update от ") and "(26 ч назад) — общий по рынку" in to_.splitlines()[0], to_
+        assert "Режим: risk-off" in to_ and "Входов совет не назвал" in to_ and "режим не распознан" not in to_
+        assert summary_text({"data": {"summary": {"regime": "risk-on"}}}).startswith("Режим: risk-on"), "без ts/kind — без шапки"
         # human
         h = await human("  Сбер пойдёт вверх, ставка не помеха ")
         assert h["kind"] == "human" and h["frame"]["headline"] == "Сбер лонг"

@@ -41,6 +41,8 @@ _STREAM_DELAY = 0.02
 
 _LAST_IDS: list[str] = []          # короткие id, виденные в последних промптах
 _CALLS: dict[str, int] = {}        # счётчик вызовов по route (для отчёта)
+_TURNS: dict[str, int] = {}        # v5.4.2: номер вызова узла (перепроверка/дверь/прибыль/приказ) — ротация ответов
+_POS_RX = re.compile(r"ПОЗИЦИЯ: (long|short) ")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -143,6 +145,25 @@ def _catalog_tickers(text: str) -> list[str]:
         if m:
             out.append(m.group(1))
     return out
+
+
+def _turn(key: str) -> int:
+    """Номер вызова узла 1, 2, 3… — детерминированная ротация демо (v5.4.2): мок нейтрален — не «всегда ждём» и
+    не «всегда входим»; по какому маршруту ни пришёл вопрос (route или схема), счёт один на узел."""
+    _TURNS[key] = _TURNS.get(key, 0) + 1
+    return _TURNS[key]
+
+
+def _pos_side(text: str) -> str | None:
+    """Сторона открытой позиции из ситуации («ПОЗИЦИЯ: long 8 лот …»); позиции нет — None."""
+    m = _POS_RX.search(text or "")
+    return m.group(1) if m else None
+
+
+def _plan_side(text: str) -> str:
+    """Сторона плана у двери: первое long/short в блоке приказа (иначе во всём тексте); по умолчанию long."""
+    m = re.search(r"\b(long|short)\b", _section(text, "ПРИКАЗ И ПЛАН") or text or "")
+    return m.group(1) if m else "long"
 
 
 def _remember(ids: list[str]) -> None:
@@ -307,10 +328,10 @@ def _human_compress(user: str) -> dict:
 def _present(user: str) -> dict:
     tks = [t for t in dict.fromkeys(_TICKER_RX.findall(user)) if t in _KW][:4] or ["SBER"]
     mission = "миссия" in user.lower() or "приказ" in user.lower() or "exec" in user.lower()
-    return {"headline": ("Приказ собран: вход на максимум, стоп задан" if mission
+    return {"headline": ("Приказ собран: сторона, уровни и срок заданы" if mission
                          else "Картина ясна: избирательный лонг, нефть под давлением"),
-            "frame": ("Совет посмотрел на досье инструмента, свежие новости и общий фон. Перевес есть: вход по "
-                      "приказу, перед заявкой дежурный ещё раз посмотрит на живой рынок. Стоп короткий, тейк по плану."
+            "frame": ("Совет посмотрел на досье инструмента, свежие новости и общий фон и свёл это в приказ: "
+                      "сторона или ожидание, уровни и срок; перед заявкой дежурный сверит его с живым рынком."
                       if mission else
                       "Совет разложил новости на потоки, сверил с ценами и астро-фоном. Деньги идут в сильные "
                       "бумаги, нефть слабая, рубль без движения. Ключевые часы — 14:00 и 19:00 МСК."),
@@ -335,15 +356,25 @@ def _impact(user: str) -> dict:
 
 
 def _exec(system: str, user: str) -> dict:
+    """Приказ (v5.4.2): чаще BUY/SELL по режиму, каждый третий вызов без позиции — WAIT с wait_for и уровнями."""
+    n = _turn("exec")
     price = _price_from(system, 0.0) or _price_from(user, 100.0)
     sell_only = "только SELL" in system
     ids = _ids(_section(user, "НОВОСТИ"))[:3]
+    if n % 3 == 0 and "ОТКРЫТАЯ ПОЗИЦИЯ" not in user:          # WAIT — только без позиции
+        lo, hi = round(price * 0.99, 4), round(price * 1.005, 4)
+        edge = f"закрепление ниже {lo} или отскок к {hi}" if sell_only else f"закрепление выше {hi} или откат к {lo}"
+        return {"do": "WAIT", "entry": None, "entry_kind": "сейчас", "take": None, "invalidation": None,
+                "wait_for": edge, "why": f"мок: цена {price:g} в середине коридора {lo}–{hi} — вход у края",
+                "plan": f"Вне рынка до события: {edge}.\nДежурный смотрит на край коридора на перепроверке.",
+                "confidence": 50, "news_ids": ids, "levels": [lo, round(price, 4), hi],
+                "time_note": "край коридора вероятнее к 14:00 МСК (данные по инфляции)"}
     if sell_only:
         do, take, inv = "SELL", round(price * 0.98, 4), round(price * 1.01, 4)
     else:
         do, take, inv = "BUY", round(price * 1.02, 4), round(price * 0.99, 4)
     return {"do": do, "entry": None, "take": take, "invalidation": inv, "wait_for": "",
-            "why": "перевес есть: импульс подтверждён новостями и лентой, стопы толпы уже сняты",
+            "why": "мок: импульс совпал с новостями и лентой, стопы толпы по ту сторону сняты",
             "plan": f"Входим {do} по рынку на максимум объёма.\nТейк {take}, стоп {inv} (короткий).\n"
                     f"Добавляем только после закрепления за {round(price * (1.005 if do == 'BUY' else 0.995), 4)}.\n"
                     f"Перепроверка каждые 30 минут; при слабости ленты — выход по рынку.",
@@ -352,10 +383,35 @@ def _exec(system: str, user: str) -> dict:
             "time_note": "движение ждём в первые 2 часа, к 19:00 МСК ликвидность падает"}
 
 
-def _review(user: str) -> dict:
-    return {"choice": "ЖДЁМ", "why": "план жив: цена в коридоре между стопом и тейком, лента без слома",
-            "invalidation": None, "take": None,
-            "note": "Держим позицию. Стоп на месте, тейк не двигаем.\nСледующая перепроверка через 30 минут."}
+def _review(system: str, user: str) -> dict:
+    """Перепроверка (v5.4.2): ротация по номеру вызова. Вне рынка — ЖДЁМ / КУПИТЬ_СЕЙЧАС (ПРОДАТЬ_СЕЙЧАС, если
+    режим пускает только SELL; invalidation ≈ цена·0.99) / НОВЫЙ_АНАЛИЗ; в позиции — ЖДЁМ / ЗАКРЫТЬ."""
+    n = _turn("review")
+    price = _price_from(user, 0.0)
+    px = f"{price:g}" if price else "текущей цены"
+    pos = _pos_side(user)
+    if pos:
+        if n % 2:
+            return {"choice": "ЖДЁМ", "why": f"мок: позиция {pos} у {px} идёт между триггером и тейком, лента без слома",
+                    "invalidation": None, "take": None,
+                    "note": "Держим позицию: триггер и тейк на месте.\nСледующая перепроверка — по расписанию."}
+        return {"choice": "ЗАКРЫТЬ", "why": f"мок: у {px} импульс выдохся, лента редеет — забираю, что есть",
+                "invalidation": None, "take": None, "note": "Закрываю позицию по рынку."}
+    k = n % 3
+    if k == 1:
+        return {"choice": "ЖДЁМ", "why": f"мок: у {px} цена в середине коридора, до уровней далеко",
+                "invalidation": None, "take": None, "note": "Вне рынка: смотрю на края коридора."}
+    if k == 2:
+        opts = _section(user, "ДОПУСТИМЫЕ choice:", ("\n",)) or system
+        sell = "ПРОДАТЬ_СЕЙЧАС" in opts and "КУПИТЬ_СЕЙЧАС" not in opts
+        choice = "ПРОДАТЬ_СЕЙЧАС" if sell else "КУПИТЬ_СЕЙЧАС"
+        inv = round(price * (1.01 if sell else 0.99), 4) if price else None
+        take = round(price * (0.98 if sell else 1.02), 4) if price else None
+        return {"choice": choice, "why": f"мок: у {px} {'продавцы' if sell else 'покупатели'} держат уровень, лента за сделку",
+                "entry": None, "entry_kind": "сейчас", "invalidation": inv, "take": take,
+                "note": f"Вход {'в шорт' if sell else 'в лонг'} сейчас, триггер {inv}, тейк {take}."}
+    return {"choice": "НОВЫЙ_АНАЛИЗ", "why": "мок: картина поменялась с прошлого совета — нужен свежий разбор",
+            "invalidation": None, "take": None, "note": "Зову полный совет."}
 
 
 def _stream_text(route: str, user: str) -> tuple[str, str]:
@@ -383,9 +439,9 @@ def _stream_text(route: str, user: str) -> tuple[str, str]:
                 f"геополитики — риск гэпа. Стопы обязаны быть короткими (≤1%), размер — с учётом 19:00 МСК, "
                 f"когда ликвидность уходит. Данных по ленте мало — не выдумываем.")
     else:
-        text = (f"ВЕРДИКТ. {t0} — long: крупный игрок набирает у {px}, стопы толпы ниже уже сняты, перевес есть — "
-                f"вход сейчас, стоп {px}×0.99 (там идея мертва), тейк {px}×1.02, уверенность 70%. BR — short от "
-                f"сопротивления, уверенность 58%. SI — вне рынка: перевеса нет, ждём выхода из коридора. "
+        text = (f"ВЕРДИКТ. {t0} — long от {px}: крупный игрок набирает, стопы толпы ниже уже сняты; "
+                f"стоп {px}×0.99 (там идея мертва), тейк {px}×1.02, уверенность 70%. BR — short от "
+                f"сопротивления, уверенность 58%. SI — вне рынка до выхода из коридора. "
                 f"MX смотрим у верхней границы. Пересмотр после 14:00 МСК по данным инфляции.")
     return think, text
 
@@ -425,18 +481,29 @@ def _event_triage(user: str) -> dict:
 
 
 def _entry(user: str) -> dict:
-    """Проверка входа у двери (v5.4.1): мок всегда ВОЙТИ — демо идёт как раньше (пилот входит по приказу),
-    уровни приказа не трогает. Только PYTHIA_MOCK_AI=1; в бой не течёт."""
+    """Проверка входа у двери (v5.4.2): ротация ВОЙТИ / ЖДАТЬ (откат: entry ≈ цена·0.997 для long, ·1.003 для
+    short) / ВОЙТИ. Только PYTHIA_MOCK_AI=1; в бой не течёт."""
+    n = _turn("entry")
     price = _price_from(user, 0.0)
-    return {"decision": "ВОЙТИ", "why": f"мок: цена {price:g} и лента подтверждают приказ, перевес на месте — входим"
-                                        if price else "мок: цена и лента подтверждают приказ — входим",
+    px = f"{price:g}" if price else "текущей цене"
+    if n % 3 == 2:
+        short = _plan_side(user) == "short"
+        entry = round(price * (1.003 if short else 0.997), 4) if price else None
+        return {"decision": "ЖДАТЬ", "why": f"мок: у {px} лента вялая, точка лучше рядом — откат к {entry}",
+                "entry": entry, "entry_kind": "откат", "wait_minutes": None, "invalidation": None, "take": None,
+                "council": False, "note": "мок-ответ у двери"}
+    return {"decision": "ВОЙТИ", "why": f"мок: при {px} лента и стакан не отменили идею приказа — вхожу",
             "entry": None, "entry_kind": None, "wait_minutes": None, "invalidation": None, "take": None,
             "council": False, "note": "мок-ответ у двери"}
 
 
 def _profit(user: str) -> dict:
-    """Мысль о прибыли (v5.4.1): мок всегда ДЕРЖАТЬ, триггер и цель не двигает — позиция идёт к тейку как раньше."""
-    return {"decision": "ДЕРЖАТЬ", "why": "мок: ход жив, лента не редеет — держим, цель та же",
+    """Мысль о прибыли (v5.4.2): ротация ДЕРЖАТЬ / ВЫЙТИ / ДЕРЖАТЬ; триггер и цель не двигает."""
+    n = _turn("profit")
+    if n % 3 == 2:
+        return {"decision": "ВЫЙТИ", "why": "мок: рывок выдохся, лента редеет — забираю прибыль",
+                "lock_price": None, "take": None, "reentry": None, "reentry_kind": None, "note": "мок-ответ о прибыли"}
+    return {"decision": "ДЕРЖАТЬ", "why": "мок: ход жив, лента не редеет — держу, цель та же",
             "lock_price": None, "take": None, "reentry": None, "reentry_kind": None, "note": "мок-ответ о прибыли"}
 
 
@@ -511,7 +578,7 @@ def _answer(route: str, system: str, user: str, json_mode: bool):
     if r == "mission_exec":
         return _exec(system, user)
     if r in ("mission_review", "aip_review"):
-        return _review(user)
+        return _review(system, user)
     if r == "shrink":
         m = re.search(r"ЛИМИТ:\s*(\d+)", user)
         lim = int(m.group(1)) if m else 4000
@@ -525,9 +592,9 @@ def _answer(route: str, system: str, user: str, json_mode: bool):
         return _take(user)
     if r == "event_triage":                      # v5.3 W2: триаж события
         return _event_triage(user)
-    if r == "mission_entry":                     # v5.4.1: проверка входа у двери — ВОЙТИ
+    if r == "mission_entry":                     # v5.4.1: проверка входа у двери (5.4.2: ротация ответов)
         return _entry(user)
-    if r == "mission_profit":                    # v5.4.1: мысль о прибыли — ДЕРЖАТЬ
+    if r == "mission_profit":                    # v5.4.1: мысль о прибыли (5.4.2: ротация ответов)
         return _profit(user)
     if r == "scout":                             # v5.2: разведка данных перед советом/миссией/чатом
         return _scout(user)
@@ -544,7 +611,7 @@ def _answer(route: str, system: str, user: str, json_mode: bool):
         if '"cards"' in system:
             return _distribute(user)
         if '"choice"' in system:
-            return _review(user)
+            return _review(system, user)
         if '"do"' in system:
             return _exec(system, user)
         if '"severity"' in system:
@@ -1152,13 +1219,46 @@ if __name__ == "__main__":
         i1 = await ai.ask_json("s", "ИТОГ СОВЕТА:\n…\n\nНОВЫЕ НОВОСТИ:\n[aaaaaa] ЦБ повысил ставку", route="impact")
         i2 = await ai.ask_json("s", "ИТОГ СОВЕТА:\n…\n\nНОВЫЕ НОВОСТИ:\n[aaaaaa] Лукойл дивиденды", route="impact")
         assert i1["severity"] == 80 and i1["recommend_rerun"] and i2["severity"] == 30
-        # exec: BUY entry null, take/inv от цены
-        e = await ai.ask_json("… Цена 285.4.\n…", "ОБЪЕКТ: SBER", route="mission_exec")
-        assert e["do"] == "BUY" and e["entry"] is None and abs(e["take"] - 285.4 * 1.02) < 0.01 \
-            and abs(e["invalidation"] - 285.4 * 0.99) < 0.01
-        e2 = await ai.ask_json("Цена 100. Режим: только SELL", "x", route="mission_exec")
-        assert e2["do"] == "SELL" and e2["take"] < 100 < e2["invalidation"]
-        assert (await ai.ask_json("s", "u", route="mission_review"))["choice"] == "ЖДЁМ"
+        # exec (v5.4.2): BUY/SELL по режиму, иногда WAIT с wait_for и уровнями; стороны уровней — только не у WAIT
+        def check_exec(e_, px_, sell_):
+            assert e_["do"] in ({"SELL", "WAIT"} if sell_ else {"BUY", "WAIT"}), e_
+            assert "перевес есть" not in e_["why"] and "вход сейчас" not in e_["why"], e_["why"]
+            if e_["do"] == "WAIT":
+                assert e_["wait_for"] and e_["levels"] and e_["invalidation"] is None and e_["entry"] is None \
+                    and e_["take"] is None, e_
+            elif sell_:
+                assert e_["take"] < px_ < e_["invalidation"] and e_["entry"] is None, e_
+            else:
+                assert e_["entry"] is None and abs(e_["take"] - px_ * 1.02) < 0.01 \
+                    and abs(e_["invalidation"] - px_ * 0.99) < 0.01 and e_["wait_for"] == "", e_
+        ex_do = []
+        for _ in range(3):
+            e = await ai.ask_json("… Цена 285.4.\n…", "ОБЪЕКТ: SBER", route="mission_exec")
+            check_exec(e, 285.4, False)
+            ex_do.append(e["do"])
+        assert "BUY" in ex_do and "WAIT" in ex_do and ex_do.count("BUY") >= 2, ex_do
+        for _ in range(3):
+            check_exec(await ai.ask_json("Цена 100. Режим: только SELL", "x", route="mission_exec"), 100.0, True)
+        for _ in range(3):                           # открытая позиция — WAIT нельзя (только без позиции)
+            e = await ai.ask_json("… Цена 100.\n…", "═══ ОТКРЫТАЯ ПОЗИЦИЯ ═══\nlong 8 лот", route="mission_exec")
+            assert e["do"] == "BUY", e
+        # перепроверка (v5.4.2): ротация, вне рынка ЖДЁМ / КУПИТЬ_СЕЙЧАС (invalidation ≈ цена·0.99) / НОВЫЙ_АНАЛИЗ
+        rv_u = "ОБЪЕКТ: SBER. ДОПУСТИМЫЕ choice: КУПИТЬ_СЕЙЧАС | ЖДЁМ | ПРОДАТЬ_СЕЙЧАС | НОВЫЙ_АНАЛИЗ\n\n" \
+               "═══ СИТУАЦИЯ ПИЛОТА ═══\nЦена сейчас: 285.4\nПозиции нет, засады нет — полностью вне рынка"
+        rv = [await ai.ask_json("s", rv_u, route="mission_review") for _ in range(3)]
+        rv_c = [x["choice"] for x in rv]
+        assert set(rv_c) <= {"ЖДЁМ", "КУПИТЬ_СЕЙЧАС", "НОВЫЙ_АНАЛИЗ"} and len(set(rv_c)) >= 2, rv_c
+        buy = [x for x in rv if x["choice"] == "КУПИТЬ_СЕЙЧАС"]
+        assert buy and abs(buy[0]["invalidation"] - 285.4 * 0.99) < 0.01 and buy[0]["take"] > 285.4, buy
+        assert all("перевес есть" not in x["why"] and "Держим позицию" not in x["note"] for x in rv), rv
+        rv_s = [await ai.ask_json("s", rv_u.replace("КУПИТЬ_СЕЙЧАС | ", ""), route="mission_review") for _ in range(3)]
+        sell_ = [x for x in rv_s if x["choice"] == "ПРОДАТЬ_СЕЙЧАС"]
+        assert sell_ and "КУПИТЬ_СЕЙЧАС" not in [x["choice"] for x in rv_s] and sell_[0]["invalidation"] > 285.4, rv_s
+        rv_p = [(await ai.ask_json("s", "Цена сейчас: 290\nПОЗИЦИЯ: long 8 лот @285.4, в рынке 5 мин",
+                                   route="mission_review"))["choice"] for _ in range(2)]
+        assert sorted(rv_p) == ["ЖДЁМ", "ЗАКРЫТЬ"], rv_p
+        assert (await ai.ask_json('… {"choice":"из списка"} …', rv_u, route="z"))["choice"] in (
+            "ЖДЁМ", "КУПИТЬ_СЕЙЧАС", "НОВЫЙ_АНАЛИЗ"), "по схеме — тот же обработчик"
         # v5.3 W2: мягкий тейк чередует ПОДЕРЖАТЬ / ЗАФИКСИРОВАТЬ (lock_price/tp_next от цены), триаж — по кругу
         t1 = await ai.ask_json("s", "Цена сейчас: 100", route="mission_take")
         t2 = await ai.ask_json("s", "Цена сейчас: 100", route="mission_take")
@@ -1167,18 +1267,41 @@ if __name__ == "__main__":
         tr = [(await ai.ask_json("s", "Цена сейчас: 100", route="event_triage"))["urgency"] for _ in range(3)]
         assert tr == ["ПЛАНОВО", "САМ", "СЕЙЧАС"], tr
         assert (await ai.ask_json('… {"urgency":"…"} …', "Цена сейчас: 100", route="x"))["urgency"] in ("ПЛАНОВО", "САМ", "СЕЙЧАС")
-        # v5.4.1: проверка входа — всегда ВОЙТИ (демо входит как раньше), мысль о прибыли — всегда ДЕРЖАТЬ; по схеме тоже
-        en = await ai.ask_json("s", "Цена сейчас: 285.4", route="mission_entry")
-        assert en["decision"] == "ВОЙТИ" and en["entry"] is None and en["council"] is False and "285.4" in en["why"], en
-        assert (await ai.ask_json("s", "u", route="mission_entry"))["decision"] == "ВОЙТИ"
-        pf = await ai.ask_json("s", "Цена сейчас: 289", route="mission_profit")
-        assert pf["decision"] == "ДЕРЖАТЬ" and pf["lock_price"] is None and pf["take"] is None and pf["reentry"] is None, pf
-        assert (await ai.ask_json('… {"decision":"ВОЙТИ|ЖДАТЬ|ОТМЕНИТЬ","wait_minutes":число|null,"council":true|false} …', "u", route="y"))["decision"] == "ВОЙТИ"
-        assert (await ai.ask_json('… {"decision":"ДЕРЖАТЬ|…","lock_price":число|null,"reentry":число|null} …', "u", route="y"))["decision"] == "ДЕРЖАТЬ"
+        # v5.4.2: у двери ротация ВОЙТИ / ЖДАТЬ (откат ≈ цена·0.997) / ВОЙТИ, прибыль ДЕРЖАТЬ / ВЫЙТИ / ДЕРЖАТЬ; по схеме тоже
+        ens = [await ai.ask_json("s", "Цена сейчас: 285.4\n\n═══ ПРИКАЗ И ПЛАН ═══\nBUY long сейчас", route="mission_entry")
+               for _ in range(3)]
+        assert [x["decision"] for x in ens] == ["ВОЙТИ", "ЖДАТЬ", "ВОЙТИ"], ens
+        assert ens[0]["entry"] is None and ens[0]["council"] is False and "285.4" in ens[0]["why"], ens[0]
+        assert ens[1]["entry_kind"] == "откат" and abs(ens[1]["entry"] - 285.4 * 0.997) < 0.01, ens[1]
+        assert all("перевес" not in x["why"] for x in ens), ens
+        en_s = [await ai.ask_json("s", "Цена сейчас: 100\n\n═══ ПРИКАЗ И ПЛАН ═══\nSELL short сейчас", route="mission_entry")
+                for _ in range(3)]
+        assert en_s[1]["decision"] == "ЖДАТЬ" and en_s[1]["entry"] > 100, en_s[1]
+        pfs = [await ai.ask_json("s", "Цена сейчас: 289", route="mission_profit") for _ in range(3)]
+        assert [x["decision"] for x in pfs] == ["ДЕРЖАТЬ", "ВЫЙТИ", "ДЕРЖАТЬ"], pfs
+        assert all(x["lock_price"] is None and x["take"] is None and x["reentry"] is None for x in pfs), pfs
+        assert (await ai.ask_json('… {"decision":"ВОЙТИ|ЖДАТЬ|ОТМЕНИТЬ","wait_minutes":число|null,"council":true|false} …', "u", route="y"))["decision"] in ("ВОЙТИ", "ЖДАТЬ")
+        assert (await ai.ask_json('… {"decision":"ДЕРЖАТЬ|…","lock_price":число|null,"reentry":число|null} …', "u", route="y"))["decision"] in ("ДЕРЖАТЬ", "ВЫЙТИ")
         assert (await ai.ask_json('… {"decision":"ЗАФИКСИРОВАТЬ|ПОДЕРЖАТЬ","lock_price":число|null,"tp_next":число|null} …', "Цена сейчас: 100", route="y"))["decision"] in ("ПОДЕРЖАТЬ", "ЗАФИКСИРОВАТЬ")
-        assert calls()["mission_entry"] == 2 and calls()["mission_profit"] == 1
+        assert calls()["mission_entry"] == 6 and calls()["mission_profit"] == 3
         ex_ = await ai.ask_json("… Цена 100.\n…", "ОБЪЕКТ: SBER", route="mission_exec")
-        assert ex_["wait_for"] == "" and "главное войти" not in ex_["why"] and "оттягивать" not in ex_["plan"]
+        assert "главное войти" not in ex_["why"] and "оттягивать" not in ex_["plan"] and "перевес есть" not in ex_["why"]
+        # ключи маршрутизации по настоящим промптам (audit mock-prompt-text-keys): неизвестный route → обработчик по схеме
+        from . import prompts_mission as _pm
+        _ctx = {"time_msk": "28.09.2026 12:00 МСК", "price": 285.4, "asset_class": "share"}
+        _se, _ue = _pm.exec_order("SBER", "Сбербанк", "auto", 285.4, "вердикт", _ctx)
+        assert _price_from(_se) == 285.4 and "только SELL" in _pm.exec_order("SBER", "Сбербанк", "short", 285.4, "в", _ctx)[0]
+        assert _answer("??", _se, _ue, True)["do"] in ("BUY", "SELL", "WAIT")
+        _kw = dict(situation="Цена сейчас: 285.4", history="", light="", plan="", news="", council_text="")
+        _sr, _ur = _pm.review("SBER", "Сбербанк", "auto", situation="Цена сейчас: 285.4", light="", council_text="",
+                              prev_exec="", news="", watch="", astro_line="", in_pos=False, time_msk="28.09 12:00 МСК")
+        assert _answer("??", _sr, _ur, True)["choice"] in ("ЖДЁМ", "КУПИТЬ_СЕЙЧАС", "НОВЫЙ_АНАЛИЗ")
+        _sn, _un = _pm.entry_check("SBER", "Сбербанк", "auto", **_kw)
+        assert _answer("??", _sn, _un, True)["decision"] in ("ВОЙТИ", "ЖДАТЬ")
+        _sp, _up = _pm.profit_think("SBER", "Сбербанк", "auto", profit="+1.2 %", **_kw)
+        assert _answer("??", _sp, _up, True)["decision"] in ("ДЕРЖАТЬ", "ВЫЙТИ")
+        _st_, _ut_ = _pm.take_guard("SBER", "Сбербанк", "auto", take="290", **_kw)
+        assert _answer("??", _st_, _ut_, True)["decision"] in ("ПОДЕРЖАТЬ", "ЗАФИКСИРОВАТЬ")
         # толмач и память (v5.3): живой текст по данным, без «мок» в каждом слове
         ex_u = ("ОБЪЕКТ: SBER — Сбербанк. ВРЕМЯ: 23.09.2026 14:35 МСК. Цена: 285.4.\n\n═══ ЧТО ПРОИЗОШЛО ═══\n"
                 "23.09 14:35 · Вход исполнен: long 8 лот @285.4\n23.09 14:35 · FLASH у троса: ЖДАТЬ: прокол\n\n"

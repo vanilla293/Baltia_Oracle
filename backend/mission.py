@@ -470,14 +470,14 @@ def _validate_exec(ex: Any, play: str, price, in_pos: bool = False) -> tuple[dic
 
 # ── тексты для промптов ───────────────────────────────────────────────────────
 def _council_text() -> str:
+    """Итог общего совета для промптов миссии. v5.4.2: в summary_text идёт строка council_latest целиком —
+    шапка с видом, временем МСК и возрастом («Совет daily от … (N ч назад) — общий по рынку»)."""
     c = _mod("council")
     try:
         if c:
             latest = c.latest()
             if latest:
-                data = latest.get("data") if isinstance(latest, dict) and "data" in latest else latest
-                summ = (data or {}).get("summary") if isinstance(data, dict) else None
-                return c.summary_text(summ if summ else data) or "совета ещё не было"
+                return c.summary_text(latest) or "совета ещё не было"
     except Exception as e:                           # noqa: BLE001
         log.info("итог совета недоступен: %s", str(e)[:80])
     return "совета ещё не было"
