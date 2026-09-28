@@ -171,6 +171,74 @@ async def money_json(system: str, user: str, *, route: str, max_tokens: int | No
     return await flash_json(system, user, think=True, route=route, max_tokens=max_tokens)
 
 
+# ── v5.4.2: разбор слова решения из JSON-ответа ИИ — один на все узлы у денег ──────────────────────────────
+# До 5.4.2 каждый узел искал подстроки («КУП», «ВОЙ», «ЖД»…) и всё непонятое молча превращал в ЖДЁМ / ЖДАТЬ /
+# ДЕРЖАТЬ: «BUY», «ВОЙТИ», «CLOSE», «ЗАФИКСИРОВАТЬ» у перепроверки и мысли о прибыли становились ожиданием, а
+# «НЕ ВХОДИТЬ» у двери — входом. Здесь: целые слова (Ё=Е, регистр, латиница, знаки и markdown не мешают), ключ
+# decision|choice|do|action, отрицание в начале и два разных решения → None. None — «решения нет»: вызывающий
+# пишет «ответ не разобран» и переспрашивает, а не выбирает за ИИ.
+DECISION_KEYS = ("decision", "choice", "do", "action", "решение", "выбор")
+_NEGATIONS = frozenset({"НЕ", "НЕТ", "NOT", "NO", "DONT", "DO_NOT", "НЕЛЬЗЯ"})
+
+SYN_BUY = ("КУПИТЬ", "КУПИТЬ_СЕЙЧАС", "КУПИТЬ_НА_ОТКАТЕ", "КУПИТЬ_НА_ПРОБОЕ", "КУПИТЬ_НА_ПРОРЫВЕ", "ПОКУПКА", "ПОКУПАТЬ",
+           "ПОКУПАЕМ", "ПОКУПАЮ", "ЛОНГ", "В_ЛОНГ", "BUY", "BUY_NOW", "LONG", "GO_LONG")
+SYN_SELL = ("ПРОДАТЬ", "ПРОДАТЬ_СЕЙЧАС", "ПРОДАТЬ_НА_ОТКАТЕ", "ПРОДАТЬ_НА_ПРОБОЕ", "ПРОДАТЬ_НА_ПРОРЫВЕ", "ПРОДАЖА",
+            "ПРОДАВАТЬ", "ПРОДАЕМ", "ПРОДАЮ", "ШОРТ", "В_ШОРТ", "SELL", "SELL_NOW", "SHORT", "GO_SHORT")
+SYN_ENTER = ("ВОЙТИ", "ВОЙТИ_СЕЙЧАС", "ВХОД", "ВХОДИМ", "ВХОДИТЬ", "ВХОЖУ", "ЗАЙТИ", "ENTER", "ENTRY", "GO", "YES", "ДА")
+SYN_WAIT = ("ЖДАТЬ", "ЖДЕМ", "ЖДУ", "ПОДОЖДАТЬ", "ОЖИДАТЬ", "ВНЕ_РЫНКА", "WAIT", "STAY_OUT", "NO_TRADE", "NONE", "PASS")
+SYN_HOLD = ("ДЕРЖАТЬ", "ДЕРЖИМ", "ДЕРЖУ", "ПОДЕРЖАТЬ", "ОСТАВИТЬ", "HOLD", "KEEP")
+SYN_CLOSE = ("ЗАКРЫТЬ", "ЗАКРЫВАЕМ", "ЗАКРЫВАТЬ", "ВЫЙТИ", "ВЫХОД", "ВЫХОДИМ", "СЛИТЬ", "СЛИВАЕМ", "ЗАФИКСИРОВАТЬ",
+             "ФИКСИРОВАТЬ", "ФИКСИРУЕМ", "ЗАБРАТЬ", "ЗАБРАТЬ_ПРИБЫЛЬ", "ФИКСИРОВАТЬ_ПРИБЫЛЬ", "ЗАФИКСИРОВАТЬ_ПРИБЫЛЬ",
+             "CLOSE", "EXIT", "FLAT", "TAKE_PROFIT", "CLOSE_ALL")
+SYN_CANCEL = ("ОТМЕНИТЬ", "ОТМЕНА", "ОТМЕНЯЕМ", "ОТКАЗ", "ОТКАЗАТЬСЯ", "CANCEL", "SKIP", "ABORT")
+SYN_ADD = ("ДОБРАТЬ", "ДОБОР", "ДОКУПИТЬ", "УСИЛИТЬ", "НАРАСТИТЬ", "ADD", "TOPUP", "TOP_UP", "SCALE_IN")
+SYN_FLIP = ("ПЕРЕВЕРНУТЬ", "ПЕРЕВОРОТ", "РАЗВЕРНУТЬ", "РАЗВОРОТ_ПОЗИЦИИ", "FLIP", "REVERSE")
+SYN_COUNCIL = ("НОВЫЙ_АНАЛИЗ", "СОВЕТ", "НОВЫЙ_СОВЕТ", "ПЕРЕАНАЛИЗ", "COUNCIL", "REANALYZE", "NEW_ANALYSIS")
+SYN_REENTER = ("ВЫЙТИ_И_ПЕРЕЗАЙТИ", "ВЫЙТИ_ПЕРЕЗАЙТИ", "ПЕРЕЗАЙТИ", "ПЕРЕЗАХОД", "REENTER", "REENTRY", "RE_ENTER",
+               "RE_ENTRY", "EXIT_AND_REENTER")
+
+
+def _norm_word(x: Any) -> str:
+    """«Ждём!» → «ЖДЕМ», «buy-now» → «BUY_NOW», «**ВОЙТИ**» → «ВОЙТИ»: верхний регистр, Ё=Е, всё, что не буква и не
+    цифра, — разделитель слов (подчёркивание тоже)."""
+    import re
+    s = str(x or "").upper().replace("Ё", "Е")
+    return " ".join(re.sub(r"[^0-9A-ZА-Я]+", " ", s).split())
+
+
+def decision_raw(obj: Any, keys: tuple[str, ...] = DECISION_KEYS) -> str:
+    """Сырое слово решения из ответа: строка как есть или первый непустой ключ из keys (без учёта регистра)."""
+    if isinstance(obj, str):
+        return obj.strip()
+    if isinstance(obj, dict):
+        low = {str(k).strip().lower(): v for k, v in obj.items()}
+        for k in keys:
+            v = low.get(k)
+            if v not in (None, "") and not isinstance(v, (dict, list)):
+                return str(v).strip()
+    return ""
+
+
+def decision_of(raw: Any, table: dict[str, tuple[str, ...]]) -> str | None:
+    """Каноническое решение узла или None. table: {токен узла: синонимы} (токен сам себе синоним).
+    Сначала весь ответ целиком, потом первые 3 / 2 / 1 слова; попадание в два разных решения → None;
+    «НЕ …» в начале и «… или …» → None (не угадываем ни в сторону входа, ни в сторону ожидания)."""
+    words = _norm_word(raw).split()
+    if not words or words[0] in _NEGATIONS or "ИЛИ" in words or "OR" in words:
+        return None                        # «НЕ ВХОДИТЬ», «ВОЙТИ или ЖДАТЬ» — решения нет, переспросить
+    idx: dict[str, set[str]] = {}
+    for tok, syns in table.items():
+        for w in (tok, *syns):
+            idx.setdefault("_".join(_norm_word(w).split()), set()).add(tok)
+    for n in (len(words), 3, 2, 1):
+        if n > len(words):
+            continue
+        hit = idx.get("_".join(words[:n]))
+        if hit:
+            return next(iter(hit)) if len(hit) == 1 else None
+    return None
+
+
 async def pro_text(system: str, user: str, *, route: str = "pro",
                    max_tokens: int | None = None) -> str:
     return await ai.ask(system, user, model=_pro(), thinking=True,
@@ -308,4 +376,16 @@ if __name__ == "__main__":
     ai._tok.update(_saved_tok)
     for _r, _v in _saved_routes.items():
         ai._tok_routes[_r] = dict(_v)
+    # v5.4.2: разбор слова решения — целые слова, синонимы, отрицание и «или» → None (решения нет, переспросить)
+    _door = {"ВОЙТИ": SYN_ENTER + SYN_BUY, "ЖДАТЬ": SYN_WAIT, "ОТМЕНИТЬ": SYN_CANCEL}
+    for _raw, _want in (("ВОЙТИ", "ВОЙТИ"), ("**войти**", "ВОЙТИ"), ("BUY", "ВОЙТИ"), ("ENTRY", "ВОЙТИ"),
+                        ("Ждём!", "ЖДАТЬ"), ("ЖДАТЬ, хотя можно и войти", "ЖДАТЬ"), ("ЖДАТЬ ВХОДА НА ОТКАТЕ", "ЖДАТЬ"),
+                        ("ОТКАЗ", "ОТМЕНИТЬ"), ("НЕ ВХОДИТЬ", None), ("ВОЙТИ или ЖДАТЬ", None), ("", None), ("?!", None)):
+        assert decision_of(_raw, _door) == _want, (_raw, decision_of(_raw, _door), _want)
+    _rev = {"КУПИТЬ_СЕЙЧАС": SYN_BUY, "ПРОДАТЬ_СЕЙЧАС": SYN_SELL, "ЖДЁМ": SYN_WAIT + SYN_HOLD, "НОВЫЙ_АНАЛИЗ": SYN_COUNCIL}
+    assert decision_of("КУПИТЬ_СЕЙЧАС — анализ подтверждён", _rev) == "КУПИТЬ_СЕЙЧАС", "не совет вместо входа"
+    assert decision_of("ЖДЁМ (не покупать до 101)", _rev) == "ЖДЁМ" and decision_of("не покупать", _rev) is None
+    assert decision_of("ЖДЕМ", _rev) == "ЖДЁМ" and decision_of("новый анализ", _rev) == "НОВЫЙ_АНАЛИЗ"
+    assert decision_raw({"Decision": "buy"}) == "buy" and decision_raw({"choice": "", "do": "SELL"}) == "SELL"
+    assert decision_raw({}) == "" and decision_raw("ВОЙТИ ") == "ВОЙТИ" and decision_raw({"choice": {"x": 1}}) == ""
     print("ai_v5 self-test OK:", s)
