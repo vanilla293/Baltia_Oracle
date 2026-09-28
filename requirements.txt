@@ -1,0 +1,12 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.32,<1
+httpx>=0.28,<1
+feedparser>=6.0.11
+openai>=1.66,<2
+pydantic>=2.10,<3
+websockets>=14,<17
+wsproto
+python-dotenv
+skyfield>=1.45
+numpy>=1.26
+jplephem>=2.21

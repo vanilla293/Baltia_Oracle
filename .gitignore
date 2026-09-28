@@ -1,0 +1,14 @@
+# ОРАКУЛ // ПИФИЯ — служебное
+.venv/
+__pycache__/
+*.pyc
+data/
+config_user.json
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+.DS_Store
+.claude/
+archive/**/__pycache__/
+.pytest_cache/

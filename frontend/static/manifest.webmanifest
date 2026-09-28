@@ -1,0 +1,10 @@
+{
+  "name": "ПИФИЯ · Совет",
+  "short_name": "ПИФИЯ",
+  "description": "Локальный торговый терминал: новости → совет ИИ → миссия по инструменту",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "icons": [{ "src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}
