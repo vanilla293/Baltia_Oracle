@@ -419,7 +419,12 @@ if __name__ == "__main__":
                 assert "не ответила за" in str(e) and seen == ["mission_entry"], (e, seen)
         finally:
             ai.ask = real_ask
-    asyncio.run(_t_att())
+    _real_key = key
+    key = lambda: "sk-test"                 # noqa: E731 — ключ из пула не нужен: ai.ask подменён
+    try:
+        asyncio.run(_t_att())
+    finally:
+        key = _real_key
     # v5.4.2: разбор слова решения — целые слова, синонимы, отрицание и «или» → None (решения нет, переспросить)
     _door = {"ВОЙТИ": SYN_ENTER + SYN_BUY, "ЖДАТЬ": SYN_WAIT, "ОТМЕНИТЬ": SYN_CANCEL}
     for _raw, _want in (("ВОЙТИ", "ВОЙТИ"), ("**войти**", "ВОЙТИ"), ("BUY", "ВОЙТИ"), ("ENTRY", "ВОЙТИ"),
