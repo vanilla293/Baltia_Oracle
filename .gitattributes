@@ -1,0 +1,4 @@
+# Скрипты запуска должны пережить клон на Windows с core.autocrlf
+*.sh   text eol=lf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf

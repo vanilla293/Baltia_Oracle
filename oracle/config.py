@@ -180,10 +180,17 @@ class Settings:
         if not self.bot_token:
             out.append("нет BOT_TOKEN — возьми у @BotFather и впиши в .env")
         if not self.llm_api_key:
-            out.append("нет DEEPSEEK_API_KEY — ключ с platform.deepseek.com")
+            out.append("нет DEEPSEEK_API_KEY — ключ с platform.deepseek.com" if self.is_deepseek else
+                       "нет LLM_API_KEY — ключ провайдера из LLM_BASE_URL (для Ollama / LM Studio — любое слово)")
         if not self.owner_id:
             out.append("нет OWNER_ID — напиши боту /start, он пришлёт твой id, впиши его в .env")
         return out
+
+
+def _rooted(p: str) -> Path:
+    """Относительный путь из .env — от папки проекта, а не от текущего каталога запуска."""
+    path = Path(p).expanduser()
+    return path if path.is_absolute() else ROOT / path
 
 
 def load(env_file: str | os.PathLike | None = None) -> Settings:
@@ -194,18 +201,20 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
     except ImportError:  # python-dotenv не обязателен, если переменные заданы окружением
         pass
 
-    data_dir = Path(_get("DATA_DIR", str(ROOT / "data")))
-    if not data_dir.is_absolute():
-        data_dir = ROOT / data_dir
-    session = _get("USERBOT_SESSION", str(data_dir / "userbot"))
+    data_dir = _rooted(_get("DATA_DIR", str(ROOT / "data")))
+    session = str(_rooted(_get("USERBOT_SESSION", str(data_dir / "userbot"))))
+    # ключ — под адрес: DEEPSEEK_API_KEY не должен уйти стороннему сервису, если тот сменили в LLM_BASE_URL
+    base_url = _get("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/")
+    ds_key, other_key = _get("DEEPSEEK_API_KEY"), _get("LLM_API_KEY")
+    api_key = (ds_key or other_key) if "deepseek" in base_url.lower() else (other_key or ds_key)
 
     return Settings(
         bot_token=_get("BOT_TOKEN"),
         owner_id=_int("OWNER_ID", 0),
         bot_name=_get("BOT_NAME", "Оракул"),
         owner_name=_get("OWNER_NAME", ""),
-        llm_api_key=_get("DEEPSEEK_API_KEY") or _get("LLM_API_KEY"),
-        llm_base_url=_get("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/"),
+        llm_api_key=api_key,
+        llm_base_url=base_url,
         llm_model=_get("LLM_MODEL", "deepseek-flash"),
         llm_model_deep=_get("LLM_MODEL_DEEP", _get("LLM_MODEL", "deepseek-flash")),
         llm_fast_thinking=_get("LLM_FAST_THINKING", "off").lower(),
@@ -250,6 +259,6 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
         userbot_session=session,
         userbot_notify=_bool("USERBOT_NOTIFY", False),
         data_dir=data_dir,
-        db_path=Path(_get("DB_PATH", str(data_dir / "oracle.db"))),
+        db_path=_rooted(_get("DB_PATH", str(data_dir / "oracle.db"))),
         log_level=_get("LOG_LEVEL", "INFO").upper(),
     )

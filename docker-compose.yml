@@ -1,0 +1,28 @@
+# Baltia Oracle: docker compose up -d
+#   лог:                 docker compose logs -f
+#   остановить:          docker compose down
+#   поменял .env:        docker compose up -d --force-recreate
+#   обновил код:         docker compose up -d --build
+#   вход userbot:        docker compose run --rm oracle python -m oracle.userbot_login
+services:
+  oracle:
+    build:
+      context: .
+      args:
+        # 1 — поставить локальное распознавание голоса (faster-whisper, образ станет тяжелее)
+        LOCAL_WHISPER: "0"
+    image: baltia-oracle
+    container_name: baltia-oracle
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # Ollama / LM Studio на этой же машине: LLM_BASE_URL=http://host.docker.internal:11434/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -66,7 +66,8 @@ def build_system(*, name: str, owner_name: str = "", now: str,
                  nags: list[dict] | None = None, deep: bool = False,
                  extra: str = "") -> str:
     """Системный промпт: характер + живое состояние (память, позиции, дневник, конспект, будильники)."""
-    owner = owner_name.strip() or "владельца"
+    # имя хранится в именительном («Андрей»), а в шаблоне нужен родительный — «владельца (Андрей)»
+    owner = f"владельца ({owner_name.strip()})" if owner_name.strip() else "владельца"
     parts = [PERSONA.format(name=name, owner=owner).rstrip()]
     parts.append(f"СЕЙЧАС: {now}")
     if owner_name.strip():

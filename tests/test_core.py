@@ -30,6 +30,9 @@ def test_parse_local_formats(clock):
     assert d.hour == 7
     with pytest.raises(ValueError):
         timeutil.parse_local("завтра утром", MSK)
+    for odd in ("9999-12-31 23:30", "0001-01-01 01:00", "31.12.2300"):    # опечатки модели → ValueError,
+        with pytest.raises(ValueError, match="год"):                        # а не OverflowError дальше
+            timeutil.parse_local(odd, MSK)
 
 
 def test_next_occurrence_once_and_daily(clock):
@@ -90,6 +93,35 @@ async def test_db_kv_messages_search(db):
     assert await db.search("idea", "кофейня") == []
     await db.index_delete("idea", 2)
     assert await db.search("idea", "тренировки") == []
+    assert await db.kv_delete("x") is True and await db.kv_get("x") is None
+    assert await db.kv_delete("x") is False
+
+
+def test_config_key_follows_base_url_and_paths_are_rooted(monkeypatch, tmp_path):
+    from oracle import config
+    for k in ("DEEPSEEK_API_KEY", "LLM_API_KEY", "LLM_BASE_URL", "DATA_DIR", "DB_PATH", "USERBOT_SESSION"):
+        monkeypatch.delenv(k, raising=False)
+    env = tmp_path / "none.env"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-ds")
+    monkeypatch.setenv("LLM_API_KEY", "sk-or")
+    assert config.load(env).llm_api_key == "sk-ds"                   # адрес DeepSeek — его ключ
+    monkeypatch.setenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    assert config.load(env).llm_api_key == "sk-or"                   # чужой адрес — ключ DeepSeek не уходит
+    monkeypatch.delenv("LLM_API_KEY")
+    assert config.load(env).llm_api_key == "sk-ds"                   # другого ключа нет — берём, что есть
+    monkeypatch.setenv("DB_PATH", "var/o.db")
+    monkeypatch.setenv("USERBOT_SESSION", "var/ub")
+    s = config.load(env)
+    assert s.db_path == config.ROOT / "var" / "o.db"                # от папки проекта, а не от cwd
+    assert s.userbot_session == str(config.ROOT / "var" / "ub")
+    assert s.data_dir == config.ROOT / "data"
+
+
+def test_persona_owner_name_reads_right():
+    from oracle.persona import build_system
+    s = build_system(name="Оракул", owner_name="Андрей", now="сейчас")
+    assert "личный ИИ владельца (Андрей)." in s and "ВЛАДЕЛЕЦ: Андрей" in s
+    assert "личный ИИ владельца." in build_system(name="Оракул", now="сейчас")
 
 
 def test_payload_fast_disables_thinking(cfg):

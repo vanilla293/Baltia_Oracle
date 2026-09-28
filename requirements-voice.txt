@@ -1,0 +1,4 @@
+# Локальное распознавание голоса (STT_PROVIDER=local): faster-whisper на этой машине.
+# Работает без интернета, но медленнее облака. Модель (сотни МБ) скачается один раз в data/whisper.
+# Ставить поверх основных: pip install -r requirements.txt -r requirements-voice.txt
+faster-whisper>=1.1

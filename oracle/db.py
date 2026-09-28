@@ -329,6 +329,10 @@ class DB:
             "INSERT INTO kv(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, json.dumps(value, ensure_ascii=False)))
 
+    async def kv_delete(self, key: str) -> bool:
+        """Удалить ключ. True — был."""
+        return await self.execute("DELETE FROM kv WHERE key=?", (key,)) > 0
+
     # ── поиск ──
     async def index_put(self, kind: str, ref_id: int, body: str) -> None:
         """Положить/заменить текст записи в поисковый индекс."""

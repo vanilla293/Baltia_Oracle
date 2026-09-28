@@ -1,0 +1,4 @@
+# Для разработки: всё для работы + тесты (python -m pytest -q)
+-r requirements.txt
+pytest>=8
+pytest-asyncio>=0.24

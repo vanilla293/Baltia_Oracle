@@ -1,0 +1,54 @@
+# Baltia Oracle как служба systemd (Linux-сервер: бот сам поднимается после перезагрузки и падений).
+#
+# Установка (пример: код лежит в /opt/baltia-oracle, бот работает от пользователя oracle):
+#   sudo useradd --system --home-dir /opt/baltia-oracle --shell /usr/sbin/nologin oracle
+#   sudo git clone <адрес репозитория> /opt/baltia-oracle      # или скопируй туда папку
+#   sudo chown -R oracle:oracle /opt/baltia-oracle
+#   cd /opt/baltia-oracle
+#   sudo -u oracle cp .env.example .env && sudo chmod 600 .env && sudo nano .env   # впиши ключи
+#   sudo -u oracle ./start.sh      # первый раз руками: создаст .venv, поставит зависимости,
+#                                  # проверит ключи; бот запустится — останови его Ctrl+C
+#   sudo cp docs/oracle.service /etc/systemd/system/baltia-oracle.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now baltia-oracle
+#
+# Дальше:
+#   journalctl -u baltia-oracle -f          — лог
+#   sudo systemctl restart baltia-oracle    — после правки .env или обновления кода
+#   sudo systemctl status baltia-oracle     — жив ли
+#
+# Другая папка или пользователь — поправь WorkingDirectory, ExecStart, User и Group ниже.
+# Userbot: войти один раз от того же пользователя:
+#   cd /opt/baltia-oracle && sudo -u oracle .venv/bin/python -m oracle.userbot_login
+
+[Unit]
+Description=Baltia Oracle — личный ИИ-помощник в Telegram
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=oracle
+Group=oracle
+WorkingDirectory=/opt/baltia-oracle
+ExecStart=/opt/baltia-oracle/.venv/bin/python -m oracle
+Environment=PYTHONUNBUFFERED=1
+# Бот сам читает .env из своей папки. Сюда — только если хранишь настройки отдельно
+# (минус в начале: файла может и не быть). Формат тот же: KEY=value, комментарии — отдельной строкой.
+EnvironmentFile=-/etc/baltia-oracle.env
+
+Restart=always
+RestartSec=10
+# Ctrl+C-остановка: бот успевает аккуратно закрыть базу и соединения
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# Защита: писать бот может только в свою папку (data/ там же)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+# Если код лежит в /home/…, убери следующую строку — иначе бот не увидит свою папку
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

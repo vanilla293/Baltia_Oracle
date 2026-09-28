@@ -98,6 +98,9 @@ _DT_FORMATS = (
 )
 
 
+YEAR_RANGE = (1900, 2199)   # даты от модели вне этого — опечатка (и OverflowError в арифметике дальше)
+
+
 def parse_local(s: str, tz: ZoneInfo, *, default_time: time = time(9, 0),
                 prefer_future: bool = True) -> datetime:
     """Строка от модели → aware локальное время.
@@ -105,7 +108,15 @@ def parse_local(s: str, tz: ZoneInfo, *, default_time: time = time(9, 0),
     Понимает 'YYYY-MM-DD HH:MM[:SS]', ISO с 'T' (и со смещением — тогда переводит в tz),
     'DD.MM.YYYY HH:MM', одну дату 'YYYY-MM-DD' / 'DD.MM.YYYY' (время = default_time)
     и одно время 'HH:MM' (сегодня, а если уже прошло и prefer_future — завтра).
+    Год вне YEAR_RANGE — ValueError.
     """
+    d = _parse_local(s, tz, default_time, prefer_future)
+    if not YEAR_RANGE[0] <= d.year <= YEAR_RANGE[1]:
+        raise ValueError(f"странная дата «{s}» — год должен быть между {YEAR_RANGE[0]} и {YEAR_RANGE[1]}")
+    return d
+
+
+def _parse_local(s: str, tz: ZoneInfo, default_time: time, prefer_future: bool) -> datetime:
     if not isinstance(s, str) or not s.strip():
         raise ValueError("пустая дата/время")
     raw = s.strip().replace("Z", "+00:00")
@@ -114,7 +125,7 @@ def parse_local(s: str, tz: ZoneInfo, *, default_time: time = time(9, 0),
         try:
             d = datetime.fromisoformat(raw)
             return d.astimezone(tz)
-        except ValueError:
+        except (ValueError, OverflowError):
             pass
     for fmt in _DT_FORMATS:
         try:

@@ -1,0 +1,23 @@
+# в образ не попадают: секреты, данные, окружения и мусор
+.env
+.env.*
+!.env.example
+data/
+*.session
+*.session-journal
+.venv/
+venv/
+.git/
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+start.bat
