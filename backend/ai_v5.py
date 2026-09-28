@@ -241,12 +241,17 @@ def decision_of(raw: Any, table: dict[str, tuple[str, ...]]) -> str | None:
     Сначала весь ответ целиком, потом первые 3 / 2 / 1 слова; попадание в два разных решения → None;
     «НЕ …» в начале и «… или …» → None (не угадываем ни в сторону входа, ни в сторону ожидания)."""
     words = _norm_word(raw).split()
-    if not words or words[0] in _NEGATIONS or "ИЛИ" in words or "OR" in words:
-        return None                        # «НЕ ВХОДИТЬ», «ВОЙТИ или ЖДАТЬ» — решения нет, переспросить
+    if not words:
+        return None
     idx: dict[str, set[str]] = {}
     for tok, syns in table.items():
         for w in (tok, *syns):
             idx.setdefault("_".join(_norm_word(w).split()), set()).add(tok)
+    whole = idx.get("_".join(words))       # точное слово словаря целиком («NO_TRADE») — раньше проверки отрицания
+    if whole:
+        return next(iter(whole)) if len(whole) == 1 else None
+    if words[0] in _NEGATIONS or "ИЛИ" in words or "OR" in words:
+        return None                        # «НЕ ВХОДИТЬ», «ВОЙТИ или ЖДАТЬ» — решения нет, переспросить
     for n in (len(words), 3, 2, 1):
         if n > len(words):
             continue
@@ -494,5 +499,8 @@ if __name__ == "__main__":
     assert decision_of("TAKE_PROFIT", take_table()) == "ЗАФИКСИРОВАТЬ" and decision_of("ДЕРЖАТЬ", take_table()) == "ПОДЕРЖАТЬ"
     assert decision_of("FLAT", exec_table(True)) == "CLOSE" and decision_of("FLAT", exec_table(False)) == "WAIT"
     assert decision_of("КУПИТЬ", exec_table(False)) == "BUY" and decision_of("ЖДЁМ", exec_table(False)) == "WAIT"
+    assert decision_of("NO_TRADE", exec_table(False)) == "WAIT" and decision_of("no trade", exec_table(False)) == "WAIT", \
+        "слово словаря целиком — не отрицание"
+    assert decision_of("NO BUY", exec_table(False)) is None and decision_of("НЕ ВХОДИТЬ", door_table("long")) is None
     assert decision_raw({}) == "" and decision_raw("ВОЙТИ ") == "ВОЙТИ" and decision_raw({"choice": {"x": 1}}) == ""
     print("ai_v5 self-test OK:", s)
