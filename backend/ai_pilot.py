@@ -111,8 +111,7 @@ ADOPT_COOL_SEC = 180.0         # после собственного закры�
                                # при двух сверках подряд (лаг портфеля брокера — не фантом)
 BOOK_FRESH_SEC = 180.0         # стакан старше — рынок «мёртв»: ни входов,
                                # ни перепроверок по замороженной картинке
-DRIFT_FRAC = 0.01              # решение перепроверки протухло: цена ушла >1%
-                               # от снимка → вместо входа новый разбор
+# DRIFT_FRAC (решение протухло: цена ушла от снимка) — из конфига, см. ниже после _setting (v5.4.2)
 PLAN_TTL_SEC = float(os.getenv("PYTHIA_AIP_PLAN_TTL", "5400"))
                                # СРОК ЖИЗНИ ПРИКАЗА (1.5 ч): пилот работает
                                # весь день, и засада, выставленная утром, к
@@ -126,8 +125,7 @@ MX_TTL_SEC = 20.0              # кэш «сколько даёт биржа» (
 TOPUP_GAP_SEC = 8.0            # добор после исполнения — не раньше чем через N с
 GUARD_TIMEOUT = 600.0          # мягкий стоп: ИИ у денег (PRO, v5.4.1) обязан ответить за N с, иначе стоп по правилу
 TAKE_TIMEOUT = 600.0           # мягкий тейк (v5.3 W2): ответ за N с, иначе фиксация по правилу
-ENTRY_TIMEOUT = 600.0          # v5.4.1: проверка входа у двери — PRO обязан ответить за N с, иначе входа нет
-PROFIT_TIMEOUT = 600.0         # v5.4.1: мысль о прибыли — PRO обязан ответить за N с, иначе ДЕРЖАТЬ
+# ENTRY_TIMEOUT / PROFIT_TIMEOUT (проверка входа у двери / мысль о прибыли) — из конфига, см. ниже после _setting
 GATES_KEEP = 20                # сколько проверок входа помним (в status — последние 10)
 PROFITS_KEEP = 20              # сколько мыслей о прибыли помним (в status — последние 10)
 GATE_WAIT_MIN_SEC = 60.0       # ЖДАТЬ у двери со сроком: не меньше минуты …
@@ -162,6 +160,53 @@ def _setting(name: str, default):
         return default if v is None else v
     except Exception:                                        # noqa: BLE001
         return default
+
+
+# ── v5.4.2 «СВОБОДНЫЙ ПИЛОТ»: сроки PRO у денег и допуск ухода цены — из конфига, живьём ──────────────────────────
+# 600 с из 5.4.1 резали треть ответов PRO (он думает ~10 мин), и код писал за ИИ «ЖДАТЬ»/«ДЕРЖАТЬ». Имена констант
+# оставлены для совместимости — это снимок конфига при импорте; живое значение (панель меняет конфиг без рестарта) —
+# entry_timeout() / profit_timeout() / drift_frac(). Константу, подменённую стендом или тестом (monkeypatch), функции
+# уважают: подмена главнее конфига. Трос и тейк (GUARD_TIMEOUT / TAKE_TIMEOUT) — как в 5.4.1, 600 с.
+ENTRY_TIMEOUT = float(_setting("PYTHIA_ENTRY_TIMEOUT_SEC", 1200))    # проверка входа у двери: срок ответа PRO, с
+PROFIT_TIMEOUT = float(_setting("PYTHIA_PROFIT_TIMEOUT_SEC", 1200))  # мысль о прибыли: срок ответа PRO, с
+DRIFT_FRAC = float(_setting("PYTHIA_ENTRY_DRIFT_PCT", 1.0)) / 100.0  # решение протухло: цена ушла от снимка дальше
+_LIVE_SNAPSHOT = {"ENTRY_TIMEOUT": ENTRY_TIMEOUT, "PROFIT_TIMEOUT": PROFIT_TIMEOUT, "DRIFT_FRAC": DRIFT_FRAC}
+
+
+def _live(name: str, key: str, default: float, scale: float = 1.0) -> float:
+    """Живое значение настройки key (× scale); константа name, подменённая после импорта, — главнее конфига."""
+    cur = globals().get(name)
+    if cur != _LIVE_SNAPSHOT.get(name):                      # стенд/тест подменил константу модуля
+        return float(cur)
+    try:
+        return float(_setting(key, default)) * scale
+    except (TypeError, ValueError):
+        return float(cur)
+
+
+def entry_timeout() -> float:
+    """Сколько ждать ответа PRO у двери, с (PYTHIA_ENTRY_TIMEOUT_SEC, живьём)."""
+    return _live("ENTRY_TIMEOUT", "PYTHIA_ENTRY_TIMEOUT_SEC", 1200.0)
+
+
+def profit_timeout() -> float:
+    """Сколько ждать ответа PRO в мысли о прибыли, с (PYTHIA_PROFIT_TIMEOUT_SEC, живьём)."""
+    return _live("PROFIT_TIMEOUT", "PYTHIA_PROFIT_TIMEOUT_SEC", 1200.0)
+
+
+def drift_frac() -> float:
+    """Допуск ухода цены хуже снимка решения, доля (PYTHIA_ENTRY_DRIFT_PCT / 100, живьём)."""
+    return _live("DRIFT_FRAC", "PYTHIA_ENTRY_DRIFT_PCT", 1.0, 0.01)
+
+
+def wait_review_sec() -> float:
+    """Приказ совета WAIT без позиции и плана: через сколько секунд дежурный PRO смотрит заново
+    (PYTHIA_WAIT_REVIEW_SEC, живьём; не дольше плановой REVIEW_SEC)."""
+    try:
+        sec = float(_setting("PYTHIA_WAIT_REVIEW_SEC", 900))
+    except (TypeError, ValueError):
+        sec = 900.0
+    return max(1.0, min(sec, REVIEW_SEC))
 
 FRAME = ("⚫ ИИ-пилот: реальные деньги на максимум по решению ИИ — личный тест "
          "владельца. Тормоза: killswitch, маржевой дозор, биржевой трос, "
@@ -256,6 +301,7 @@ class AIPilot:
         self.state = "ЖДУ_ПЛАН"
         self.last_action = "—"
         self.review_ts = time.time() + REVIEW_SEC
+        self._wait_order = False               # v5.4.2: последний приказ совета — WAIT (шаг перепроверки вне рынка короче)
         self.last_review: dict | None = None
         self._review_busy = False
         self._reanalyzing = False
@@ -333,7 +379,7 @@ class AIPilot:
                                       "levels_placeholder", "topup_left",
                                       # v5.3 W2: мягкий тейк — сколько раз «подержали», срок следующего вопроса
                                       "take_holds", "take_next", "exit_order", "close_fail",
-                                      "close_reanalyze", "exit_pnl_total", "stop_request",
+                                      "close_reanalyze", "exit_pnl_total", "risk_fed", "stop_request",
                                       "restop", "restop_after",
                                       # W4: сверка остатка со счётом перед повторной заявкой / новым тросом
                                       "exit_check", "exit_check_strict", "verify_lots",
@@ -423,8 +469,8 @@ class AIPilot:
                          "inv0": p.get("inv0") or p.get("invalidation"),
                          "holds": int(p.get("holds") or 0),
                          "topup_left": int(p.get("topup_left") or 0)}
-        for key in ("exit_order", "close_fail", "close_reanalyze", "exit_pnl_total", "stop_request", "restop", "restop_after",
-                    "exit_check", "exit_check_strict", "verify_lots"):
+        for key in ("exit_order", "close_fail", "close_reanalyze", "exit_pnl_total", "risk_fed", "stop_request", "restop",
+                    "restop_after", "exit_check", "exit_check_strict", "verify_lots"):
             if p.get(key) is not None:
                 self.position[key] = p[key]
         if p.get("levels_placeholder"):
@@ -590,16 +636,29 @@ class AIPilot:
         return True
 
     # ── весь счёт по инструменту: позиция бота = позиция на счёте (v5.2) ────
-    def _realize(self, pos: dict, lots: int, px: float, why: str) -> float:
+    def _realize(self, pos: dict, lots: int, px: float, why: str, *, risk: bool = True) -> float:
         """Зафиксировать P/L части позиции (владелец продал/перевернул руками) —
-        в killswitch и журнал; честно: по цене тика, не по факту исполнения."""
+        в killswitch и журнал; честно: по цене тика, не по факту исполнения.
+        v5.4.2: risk=False — кусок выхода (исполнение частями, остаток ушёл со счёта перед закрытием): в журнал
+        (self.pnls) сразу, а killswitch увидит итог круга один раз — _risk_round из _finish_closed / _reduce."""
         sgn = 1.0 if pos["side"] == "long" else -1.0
         pnl = (px - pos["entry"]) * sgn * int(lots) * self.point_value if px else 0.0
         self.pnls.append(pnl)
-        if self.session_risk:
+        if risk and self.session_risk:
             self.session_risk.record(pnl)
         log.warning("ИИ-пилот %s: %s — %d лот, P/L ≈%+.0f", self.base, why, lots, pnl)
         return pnl
+
+    def _risk_round(self, pos: dict, pnl: float = 0.0) -> None:
+        """v5.4.2: killswitch (серия убытков, дневной лимит) видит СДЕЛКУ, а не кусок исполнения: один выход,
+        исполненный тремя частями, — одна запись серии, а не «три убытка подряд — стоп сессии». Сюда приходит итог
+        круга (закрытие) или одного ужатия: куски выхода, ещё не отданные killswitch'у (exit_pnl_total − risk_fed),
+        плюс pnl этого события (внешнее закрытие по сверке, переворот руками)."""
+        total = _f(pos.get("exit_pnl_total"))
+        unfed = total - _f(pos.get("risk_fed"))
+        pos["risk_fed"] = total
+        if self.session_risk:
+            self.session_risk.record(unfed + pnl)
 
     def _absorb_account(self, real: int, avg: float | None, price: float | None, why: str) -> bool:
         """Счёт — истина. Всё по figi становится позицией бота: владелец докупил → больше,
@@ -616,7 +675,8 @@ class AIPilot:
         old_stop = None
         if own and real * own < 0:             # владелец перевернул руками: старую фиксируем
             pos = self.position
-            self._realize(pos, pos["lots"], px, "владелец перевернул позицию руками")
+            flip_pnl = self._realize(pos, pos["lots"], px, "владелец перевернул позицию руками", risk=False)
+            self._risk_round(pos, flip_pnl)    # круг старой позиции — одна запись killswitch (v5.4.2)
             old_stop = pos.get("stop_id")      # её трос на бирже снимет restop новой позиции
                                                # (сирота-стоп иначе удвоил бы новую сторону)
             self.position = None
@@ -894,18 +954,28 @@ class AIPilot:
             return False
         ex = (forecast or {}).get("exec") if isinstance(forecast, dict) else None
         do = str((ex or {}).get("do") or "").upper().strip() if isinstance(ex, dict) else ""
+        self._wait_order = False               # v5.4.2: действующий приказ совета — WAIT? (шаг плановой перепроверки)
         if do in ("WAIT", "ЖДАТЬ", "HOLD_FLAT"):
-            # приказ WAIT (v5.4.1): перевеса нет / вход не сейчас — плана нет, стоим вне рынка; дежурный PRO
-            # вернётся к этому на плановой перепроверке (и может войти сам). При позиции WAIT отсекает
+            # приказ WAIT (v5.4.1): вход не сейчас — плана нет, стоим вне рынка; дежурный PRO
+            # вернётся к этому на перепроверке (и может войти сам). При позиции WAIT отсекает
             # валидатор миссии (_validate_exec); здесь — только на всякий случай: позицию не трогаем
             self.plan = None
             if self.pending:
                 self._cancel_entry = True
             wait_for = str(ex.get("wait_for") or ex.get("why") or "").strip()[:200]
+            now = time.time()
             if not self.position:
                 self.state = "ЖДУ_ПЛАН"
-            self.last_action = "совет: вне рынка — ждём: " + (wait_for or "перевеса нет")
-            self.review_ts = time.time() + REVIEW_SEC
+                # v5.4.2: вне рынка по WAIT дежурный PRO смотрит заново через PYTHIA_WAIT_REVIEW_SEC (15 мин), а не спит
+                # PYTHIA_REVIEW_SEC вслепую; перепроверку, которую уже подтянули раньше (повод, событие), не отодвигаем
+                wait_sec = wait_review_sec()
+                self.review_ts = min(self.review_ts, now + wait_sec) if self.review_ts > now else now + wait_sec
+                self._wait_order = True
+            else:
+                self.review_ts = now + REVIEW_SEC
+            mins = max(0, int((self.review_ts - now + 59) // 60))
+            self.last_action = (f"совет: вне рынка — ждал: {wait_for or 'условие не названо'}; "
+                                f"перепроверка через {mins} мин")
             log.info("ИИ-пилот %s: %s", self.base, self.last_action)
             return True
         if do in ("CLOSE", "ЗАКРЫТЬ", "FLAT", "EXIT"):
@@ -1409,8 +1479,11 @@ class AIPilot:
                 self._fire_reanalyze("приказ протух")
             else:
                 inv = _f(self.plan.get("invalidation"))
-                dead = ((self.plan["side"] == "long" and price <= inv)
-                        or (self.plan["side"] == "short" and price >= inv))
+                # v5.4.2: план «прорыв» до пробития уровня ещё не в рынке — классика «BUY stop 101, стоп 100.5 при цене
+                # 100»: invalidation вступает только после пробития (откат / сейчас — как было)
+                unbroken = self._breakout_unbroken(price)
+                dead = not unbroken and ((self.plan["side"] == "long" and price <= inv)
+                                         or (self.plan["side"] == "short" and price >= inv))
                 if dead and self.position:
                     # добор при цене ЗА стопом — усиление мёртвой идеи, пока FLASH решает у троса:
                     # план снимаем, позицию ведут трос/триггер (v5.2, проверяющий)
@@ -1465,8 +1538,29 @@ class AIPilot:
                 self.review_ts = time.time() + 600     # рынок мёртв — отложили
                 self.last_action = "перепроверка отложена: рынок мёртв"
             else:
-                self.review_ts = time.time() + REVIEW_SEC
+                self.review_ts = time.time() + self._review_gap()
                 self._spawn_background(self._review_bg(price))
+
+    def _review_gap(self) -> float:
+        """Шаг плановой перепроверки: REVIEW_SEC; v5.4.2 — последний приказ совета WAIT, а позиции, плана и заявки
+        нет: не реже PYTHIA_WAIT_REVIEW_SEC (вне рынка PRO смотрит заново, а не спит полчаса вслепую)."""
+        if getattr(self, "_wait_order", False) and not (self.position or self.plan or self.pending):
+            return wait_review_sec()
+        return REVIEW_SEC
+
+    def _breakout_unbroken(self, price: float) -> bool:
+        """v5.4.2: план «прорыв» (kind от наследника; вход ЗА ценой по ходу сделки: BUY выше, SELL ниже), уровень
+        которого цена ещё ни разу не пробила? Пока нет — идея не в рынке, и invalidation (стоп под уровнем пробоя)
+        её не хоронит. Пробитие помечается в плане (crossed): откат обратно за invalidation после пробоя — идея
+        мертва, как у любого плана. Не «прорыв» или нет уровня — False (проверка как была)."""
+        plan = self.plan or {}
+        lvl = plan.get("entry")
+        if plan.get("kind") != "прорыв" or lvl is None or not price:
+            return False
+        lvl = _f(lvl)
+        if (price >= lvl) if plan.get("side") == "long" else (price <= lvl):
+            plan["crossed"] = True
+        return not plan.get("crossed")
 
     # ── момент входа по уровню (наследник добавляет свои виды входа, напр. прорыв) ─
     def _entry_ready(self, price: float, lvl: float) -> bool:
@@ -2137,7 +2231,8 @@ class AIPilot:
         if real < pos["lots"]:
             cut = pos["lots"] - real
             px = (self._stop_price(pos) if at_stop else 0.0) or est_px
-            pnl = self._realize(pos, cut, px, f"{why}: {cut} лот ушли со счёта без моей заявки (трос биржи / владелец)")
+            pnl = self._realize(pos, cut, px, f"{why}: {cut} лот ушли со счёта без моей заявки (трос биржи / владелец)",
+                                risk=False)    # кусок выхода: killswitch увидит итог круга (_finish_closed)
             pos["exit_pnl_total"] = _f(pos.get("exit_pnl_total")) + pnl
             pos["lots"] = real
             if real == 0:
@@ -2310,7 +2405,7 @@ class AIPilot:
             else:
                 real = await self._real_own_lots(pos)
                 if real == 0 and not pos.get("stop_request"):
-                    pnl = self._realize(pos, pos["lots"], self._stop_price(pos) or est_px, why)
+                    pnl = self._realize(pos, pos["lots"], self._stop_price(pos) or est_px, why, risk=False)
                     pos["exit_pnl_total"] = _f(pos.get("exit_pnl_total")) + pnl
                     pos["lots"] = 0
                     self._finish_closed(pos, why, reanalyze)
@@ -2383,7 +2478,8 @@ class AIPilot:
         order["seen_exec_lots"] = cumulative
         delta = min(int(pos["lots"]), max(0, cumulative - int(order.get("accounted") or 0)))
         if delta:
-            pnl = self._realize(pos, delta, price, order.get("why") or "исполнение выхода")
+            # v5.4.2: кусок исполнения — в журнал сразу, в killswitch итогом круга/ужатия (_risk_round), не куском
+            pnl = self._realize(pos, delta, price, order.get("why") or "исполнение выхода", risk=False)
             pos["exit_pnl_total"] = _f(pos.get("exit_pnl_total")) + pnl
             pos["lots"] -= delta
             self._closed_ts = time.time()
@@ -2403,6 +2499,7 @@ class AIPilot:
 
     def _finish_closed(self, pos: dict, why: str, reanalyze: bool) -> None:
         pnl = _f(pos.get("exit_pnl_total"))
+        self._risk_round(pos)                  # v5.4.2: круг закрыт — killswitch видит его итог один раз
         self.position = None
         self._mx = None                        # позиции нет — «сколько даёт биржа» заново (иначе флип берёт sell с закрытием лонга)
         self._closed_ts = time.time()          # лаг портфеля: позицию «со счёта» примем не раньше двух сверок
@@ -2443,12 +2540,16 @@ class AIPilot:
                     self.last_action = f"ужатие отбито биржей — повторю тиком ({why})"
                     self._save_state()
                     return
+            order = pos.get("exit_order")
             terminal = await self._poll_exit_order(pos, price)
             if terminal:
                 if pos["lots"] <= 0:
                     self._finish_closed(pos, why, False)
-                elif not pos.get("close_fail"):
-                    await self._replace_stop(pos)
+                else:
+                    if int((order or {}).get("accounted") or 0) > 0:
+                        self._risk_round(pos)  # v5.4.2: одно ужатие — одна запись killswitch (не по кускам)
+                    if not pos.get("close_fail"):
+                        await self._replace_stop(pos)
         finally:
             pos.pop("closing", None)
 
@@ -2528,8 +2629,7 @@ class AIPilot:
             est = (self._stop_price(pos) or _f(pos.get("invalidation"))) or price
             pnl = (est - pos["entry"]) * sgn_f * pos["lots"] * self.point_value
             self.pnls.append(pnl)
-            if self.session_risk:
-                self.session_risk.record(pnl)
+            self._risk_round(pos, pnl)         # v5.4.2: круг — одна запись (с кусками выхода, если были)
             self._save_state()
             self.state = "ЖДУ_ПЛАН"
             self.last_action = (f"позицию закрыла биржа/владелец (трос?): "
@@ -2639,33 +2739,17 @@ class AIPilot:
             self._review_busy = False
 
     @staticmethod
-    def _parse_choice(raw: str, in_pos: bool, side: str | None = None) -> str:
-        """Нестрогий разбор решения: «ЗАКРЫТЬ ВСЁ», «КУПИТЬ СЕЙЧАС!», ё/е,
-        регистр — всё это валидные решения, а не молчаливый ЖДЁМ.
-        v5.2 в позиции: ДОБРАТЬ (докупить до максимума) и ПЕРЕВЕРНУТЬ; «купить» при лонге —
-        добор, «продать» при лонге — закрыть (сторона позиции — side)."""
-        c = (raw or "").upper().replace("Ё", "Е")
-        if "АНАЛИЗ" in c or "НОВЫЙ" in c or "НОВЫИ" in c:
-            return "НОВЫЙ_АНАЛИЗ"
-        if in_pos:
-            if "ПЕРЕВЕРН" in c or "ФЛИП" in c or "РАЗВЕРН" in c or "FLIP" in c:
-                return "ПЕРЕВЕРНУТЬ"
-            if "ДОБ" in c or "ДОКУП" in c or "УСИЛ" in c or "НАРАСТ" in c:
-                return "ДОБРАТЬ"
-            if "ЗАКР" in c or "ВЫЙТИ" in c or "ВЫХОД" in c or "СЛИТЬ" in c:
-                return "ЗАКРЫТЬ"
-            if side == "long" and "КУП" in c:
-                return "ДОБРАТЬ"
-            if side == "short" and "ПРОДА" in c:
-                return "ДОБРАТЬ"
-            if "ПРОДА" in c or "КУП" in c:
-                return "ЗАКРЫТЬ"
-            return "ЖДЁМ"
-        if "КУП" in c:
-            return "КУПИТЬ_СЕЙЧАС"
-        if "ПРОДА" in c or "ШОРТ" in c:
-            return "ПРОДАТЬ_СЕЙЧАС"
-        return "ЖДЁМ"
+    def _parse_choice(raw: str, in_pos: bool, side: str | None = None) -> str | None:
+        """Разбор решения перепроверки (v5.4.2): целые слова через ai_v5.decision_of по таблице
+        ai_v5.review_table(in_pos, side) — «ЗАКРЫТЬ ВСЁ», «КУПИТЬ СЕЙЧАС!», BUY/LONG/SELL/SHORT, CLOSE/EXIT/
+        ЗАФИКСИРОВАТЬ, ё/е, регистр. В позиции: ДОБРАТЬ и ПЕРЕВЕРНУТЬ; «купить» при лонге — добор, «продать» при
+        лонге — закрыть (сторона позиции — side). Возврат: канонический токен или None — решения нет (пусто,
+        непонятно, «НЕ …», «… или …»): код не выбирает за ИИ ни ЖДЁМ, ни вход — вызывающий переспрашивает."""
+        try:
+            from . import ai_v5 as _a
+        except ImportError:
+            import ai_v5 as _a                               # noqa: E401
+        return _a.decision_of(raw, _a.review_table(in_pos, side))
 
     async def _review(self, price: float) -> None:
         try:
@@ -2694,8 +2778,10 @@ class AIPilot:
         if not isinstance(obj, dict):
             log.warning("перепроверка: ИИ не дал JSON — держу как есть")
             return
+        # путь 4.x (PYTHIA_LEGACY_PILOT): поведение как было — непонятый ответ держит всё как есть (ЖДЁМ);
+        # миссия v5 (MissionPilot) разбирает сама и None не подменяет
         choice = self._parse_choice(str(obj.get("choice") or ""), in_pos,
-                                    (self.position or {}).get("side"))
+                                    (self.position or {}).get("side")) or "ЖДЁМ"
         why = str(obj.get("why") or "")[:300]
         self.last_review = {"choice": choice, "why": why, "ts": time.time()}
         log.info("ИИ-пилот %s: перепроверка → %s (%s)", self.base, choice, why)
@@ -2717,7 +2803,7 @@ class AIPilot:
         # решение по протухшему снимку не исполняется: цена ушла >1% от
         # снимка, по которому думал ИИ → честный свежий разбор (находка веера)
         drift = abs(cur - price) / price if price else 0.0
-        if choice in ("КУПИТЬ_СЕЙЧАС", "ПРОДАТЬ_СЕЙЧАС") and drift > DRIFT_FRAC:
+        if choice in ("КУПИТЬ_СЕЙЧАС", "ПРОДАТЬ_СЕЙЧАС") and drift > drift_frac():
             log.warning("перепроверка протухла: цена ушла %.2f%% за время "
                         "раздумий — вместо входа прошу свежий разбор",
                         drift * 100)
@@ -3705,6 +3791,19 @@ if __name__ == "__main__":
         assert AIPilot._parse_choice("ПЕРЕВЕРНУТЬ в шорт", True, "long") == "ПЕРЕВЕРНУТЬ"
         assert AIPilot._parse_choice("СЛИТЬ", True, "long") == "ЗАКРЫТЬ" and AIPilot._parse_choice("ЗАКРЫТЬ ВСЁ", True) == "ЗАКРЫТЬ"
         assert AIPilot._parse_choice("КУПИТЬ_СЕЙЧАС", False) == "КУПИТЬ_СЕЙЧАС"
+        #     v5.4.2: латиница и синонимы — решения, а не молчаливый ЖДЁМ; пусто / непонятно / «НЕ …» / «… или …» → None
+        for raw_c, in_p, side_c, want in (("BUY", False, None, "КУПИТЬ_СЕЙЧАС"), ("long", False, None, "КУПИТЬ_СЕЙЧАС"),
+                                          ("SELL", False, None, "ПРОДАТЬ_СЕЙЧАС"), ("ШОРТ", False, None, "ПРОДАТЬ_СЕЙЧАС"),
+                                          ("ЖДЁМ", False, None, "ЖДЁМ"), ("WAIT", False, None, "ЖДЁМ"),
+                                          ("CLOSE", True, "long", "ЗАКРЫТЬ"), ("EXIT", True, "short", "ЗАКРЫТЬ"),
+                                          ("ЗАФИКСИРОВАТЬ", True, "long", "ЗАКРЫТЬ"), ("SELL", True, "long", "ЗАКРЫТЬ"),
+                                          ("BUY", True, "short", "ЗАКРЫТЬ"), ("СОВЕТ", False, None, "НОВЫЙ_АНАЛИЗ"),
+                                          ("", False, None, None), ("", True, "long", None), ("ВОЙТИ", False, None, None),
+                                          ("НЕ ПОКУПАТЬ, ЖДЁМ", False, None, None), ("ДЕРЖАТЬ, не закрывать", True, "long", "ЖДЁМ"),
+                                          ("КУПИТЬ или ЖДАТЬ", False, None, None), ("НЕ ЗАКРЫВАТЬ", True, "long", None)):
+            got = AIPilot._parse_choice(raw_c, in_p, side_c)
+            assert got == want, (raw_c, in_p, side_c, got, want)
+        assert AIPilot._parse_choice("КУПИТЬ", True, None) is None, "в позиции без стороны «купить» не угадываем"
 
         # 25) МЯГКИЙ СТОП: у триггера спрашивают FLASH; на бирже — аварийный трос дальше стопа;
         #     ЖДАТЬ → новый триггер, задача Совету; за аварийным тросом — закрытие без вопросов;
@@ -4187,13 +4286,77 @@ if __name__ == "__main__":
         n_c = len(pv.broker.stop_cancels)
         await pv._close_all(90000.0, "тест: освободить-30", reanalyze=False)
         assert pv.position is None and len(pv.broker.stop_cancels) == n_c, "закрытие без стопа — снимать нечего"
-        #     приказ WAIT: плана нет, вне рынка, перепроверка по расписанию, входа нет
+        #     приказ WAIT: плана нет, вне рынка, входа нет; v5.4.2 — перепроверка через PYTHIA_WAIT_REVIEW_SEC, а не
+        #     PYTHIA_REVIEW_SEC вслепую; раньше подтянутая перепроверка остаётся; текст без «перевеса нет»
         pw = mk()
-        assert pw.adopt_forecast({"exec": {"do": "WAIT", "wait_for": "закрепление выше 90500", "why": "перевеса нет"}}) is True
-        assert pw.plan is None and pw.state == "ЖДУ_ПЛАН" and "вне рынка — ждём: закрепление выше 90500" in pw.last_action
-        assert pw.review_ts - time.time() > REVIEW_SEC - 5
+        assert pw.adopt_forecast({"exec": {"do": "WAIT", "wait_for": "закрепление выше 90500", "why": "т"}}) is True
+        w_sec = wait_review_sec()
+        assert w_sec <= REVIEW_SEC and abs(pw.review_ts - time.time() - w_sec) < 5, (pw.review_ts - time.time(), w_sec)
+        assert pw.plan is None and pw.state == "ЖДУ_ПЛАН" and "вне рынка — ждал: закрепление выше 90500" in pw.last_action
+        assert f"перепроверка через {int((w_sec + 59) // 60)} мин" in pw.last_action and "перевеса нет" not in pw.last_action
         await pw.tick(90000.0, BOOK)
         assert pw.pending is None and not pw.broker.placed, "WAIT — входа нет"
+        pw.review_ts = time.time() + 60                 # повод уже подтянул перепроверку — WAIT её не отодвигает
+        assert pw.adopt_forecast({"exec": {"do": "WAIT"}}) and pw.review_ts - time.time() < 61
+        assert "ждал: условие не названо" in pw.last_action and "перевеса нет" not in pw.last_action, pw.last_action
+        pw.review_ts = time.time() - 5                  # срок прошёл — WAIT ставит полный шаг вне рынка
+        assert pw.adopt_forecast({"exec": {"do": "WAIT"}}) and abs(pw.review_ts - time.time() - w_sec) < 5
+
+        async def _no_review(price):
+            return None
+        pw._review_bg = _no_review
+        pw.review_ts = 0.0                              # плановая пришла: следующий шаг вне рынка по WAIT — тоже короткий
+        await pw.tick(90000.0, BOOK)
+        assert abs(pw.review_ts - time.time() - w_sec) < 5, pw.review_ts - time.time()
+        assert pw.adopt_forecast(ex("BUY", inv=89000.0)) and pw._review_gap() == REVIEW_SEC, "не WAIT — шаг прежний"
+        #     v5.4.2: сроки у двери / в мысли о прибыли и допуск дрейфа — из конфига живьём; подмена константы главнее
+        assert entry_timeout() == float(_setting("PYTHIA_ENTRY_TIMEOUT_SEC", 1200)) == ENTRY_TIMEOUT
+        assert profit_timeout() == float(_setting("PYTHIA_PROFIT_TIMEOUT_SEC", 1200)) == PROFIT_TIMEOUT
+        assert abs(drift_frac() - float(_setting("PYTHIA_ENTRY_DRIFT_PCT", 1.0)) / 100) < 1e-12
+        _saved_et = globals()["ENTRY_TIMEOUT"]
+        globals()["ENTRY_TIMEOUT"] = 0.3
+        try:
+            assert entry_timeout() == 0.3, "подмена стенда главнее конфига"
+        finally:
+            globals()["ENTRY_TIMEOUT"] = _saved_et
+        #     v5.4.2: killswitch видит круг, а не кусок: убыточный выход тремя частями — одна запись серии
+        pk = mk()
+        pk.adopt_forecast(ex("BUY", inv=89000.0)); await pk.tick(90000.0, BOOK); await pk.tick(90000.0, BOOK)
+        assert pk.position and pk.position["lots"] >= 3, pk.position
+        n_lots, n_pnl = pk.position["lots"], len(pk.pnls)
+        oid_k = f"F-{pk.broker._n + 1}"
+        pk.broker.partial[oid_k] = 1
+        await pk._close_all(89900.0, "тест: выход частями", reanalyze=False)
+        assert pk.position and pk.position["lots"] == n_lots - 1 and pk.session_risk.streak == 0
+        pk.broker.partial[oid_k] = 2
+        await pk.tick(89900.0, BOOK)
+        del pk.broker.partial[oid_k]
+        await pk.tick(89900.0, BOOK)
+        assert pk.position is None and len(pk.pnls) == n_pnl + 3, (pk.pnls, pk.last_action)
+        assert pk.session_risk.streak == 1 and not pk.session_risk.locked, pk.session_risk.state()
+        assert abs(pk.session_risk.pnl - sum(pk.pnls[n_pnl:])) < 1e-6
+        #     v5.4.2: план «прорыв» (вход на пробитии 90500, стоп 90200) при цене 90000 — за стопом, но уровень не
+        #     пробит: не «мертва до входа»; пробил и откатился за стоп — мертва
+        class BreakPilot(AIPilot):
+            def _entry_ready(self, price, lvl):
+                return False                  # подтверждения пробоя в тесте не ждём — входа нет
+
+        pbk = mk(cls=BreakPilot)
+        fired_b = []
+
+        async def cb_b():
+            fired_b.append(1)
+
+        pbk.reanalyze_cb = cb_b
+        assert pbk.adopt_forecast(ex("BUY", entry=90500.0, take=92000.0, inv=90200.0))
+        pbk.plan["kind"] = "прорыв"
+        await pbk.tick(90000.0, BOOK)
+        assert pbk.plan and "мертва" not in pbk.last_action and not fired_b, pbk.last_action
+        await pbk.tick(90510.0, BOOK)
+        assert pbk.plan and pbk.plan.get("crossed")
+        await pbk.tick(90100.0, BOOK)
+        await asyncio.sleep(0)
+        assert pbk.plan is None and "мертва ДО входа" in pbk.last_action and fired_b
         #     хуки: базовый _entry_gate → вход сразу; наследник, ответивший «нет», — входа нет; авто-добор без проверки
         class GatePilot(AIPilot):
             allow = False
@@ -4271,6 +4434,9 @@ if __name__ == "__main__":
               "проверяющий: трос не сирота при перевороте руками, добор за стопом отменён, одно закрытие на две задачи; "
               "рыночные часы: закрыто → стопор (заявка снята, трос лежит, PRO ждёт открытия), открылось → сверка и перепроверка; "
               "v5.4.1: стопы только в программе (ни одной стоп-заявки, виртуальный трос закрывает по рынку, старый стоп снят "
-              "один раз, переключение в бою), приказ WAIT, хуки проверки входа и мысли о прибыли, персист gates/profits")
+              "один раз, переключение в бою), приказ WAIT, хуки проверки входа и мысли о прибыли, персист gates/profits; "
+              "v5.4.2: разбор перепроверки без молчаливого ЖДЁМ (None — решения нет), WAIT → перепроверка через "
+              "PYTHIA_WAIT_REVIEW_SEC, killswitch по кругу (не по куску исполнения), «прорыв» не мёртв до пробития, "
+              "сроки у денег и дрейф из конфига живьём")
 
     asyncio.run(main())

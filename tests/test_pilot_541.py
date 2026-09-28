@@ -189,8 +189,8 @@ def test_adopt_wait_leaves_pilot_out_of_market_and_exec_text_shows_it():
     m, p = make_pilot()
     ex1, _ = mission._validate_exec({"do": "WAIT", "wait_for": "закрепление выше 101", "why": "перевеса нет"}, "auto", 100)
     assert p.adopt_forecast({"exec": ex1}) is True
-    assert p.plan is None and p.state == "ЖДУ_ПЛАН" and "вне рынка — ждём: закрепление выше 101" in p.last_action
-    assert p.review_ts - time.time() > ai_pilot.REVIEW_SEC - 5
+    assert p.plan is None and p.state == "ЖДУ_ПЛАН" and "вне рынка — ждал: закрепление выше 101" in p.last_action
+    assert abs(p.review_ts - time.time() - ai_pilot.wait_review_sec()) < 5   # v5.4.2: PYTHIA_WAIT_REVIEW_SEC, не REVIEW_SEC
     m.exec, m.exec_ts = ex1, time.time()
     txt = mission._exec_text(m)
     assert "WAIT — вне рынка, ждём: закрепление выше 101" in txt and "перевеса нет" in txt
@@ -282,9 +282,16 @@ def test_guard_take_triage_go_through_money_json_with_pro_texts(offline, monkeyp
     asyncio.run(scenario())
 
 
-def test_timeouts_are_ten_minutes_and_five_for_triage():
+def test_timeouts_entry_profit_from_config_guard_take_ten_triage_five(monkeypatch):
+    # v5.4.2: у двери и в мысли о прибыли срок — из конфига (PYTHIA_ENTRY_TIMEOUT_SEC / PYTHIA_PROFIT_TIMEOUT_SEC, живьём);
+    # трос и тейк — 10 мин, триаж — 5 мин, как в 5.4.1
     assert ai_pilot.GUARD_TIMEOUT == 600.0 and ai_pilot.TAKE_TIMEOUT == 600.0
-    assert ai_pilot.ENTRY_TIMEOUT == 600.0 and ai_pilot.PROFIT_TIMEOUT == 600.0
+    assert ai_pilot.ENTRY_TIMEOUT == float(config.PYTHIA_ENTRY_TIMEOUT_SEC) == ai_pilot.entry_timeout()
+    assert ai_pilot.PROFIT_TIMEOUT == float(config.PYTHIA_PROFIT_TIMEOUT_SEC) == ai_pilot.profit_timeout()
+    assert ai_pilot.DRIFT_FRAC == float(config.PYTHIA_ENTRY_DRIFT_PCT) / 100 == ai_pilot.drift_frac()
+    monkeypatch.setattr(config, "PYTHIA_ENTRY_TIMEOUT_SEC", 1800)
+    monkeypatch.setattr(config, "PYTHIA_PROFIT_TIMEOUT_SEC", 1500)
+    assert ai_pilot.entry_timeout() == 1800.0 and ai_pilot.profit_timeout() == 1500.0
     assert mission.EVENT_TRIAGE_TIMEOUT == 300.0
     assert {"mission_entry", "mission_profit"} <= set(ai_v5.MONEY_ROUTES)
 
