@@ -93,7 +93,7 @@ _REPAIR_SYS = ("Тебе дан текст, который должен быть
 
 
 async def _json_with_repair(system: str, user: str, *, model: str, think: bool,
-                            route: str, max_tokens: int | None) -> Any:
+                            route: str, max_tokens: int | None, attempt_timeout: float | None = None) -> Any:
     """JSON-стадия (24.09.2026).
     • деньги (MONEY_ROUTES): на любую беду — пустой ответ (модель ушла в размышления) или кривой JSON — ровно ОДИН
       повтор той же моделью с тем же размышлением; снова беда → исключение, для вызывающего это «молчание» → его
@@ -102,8 +102,21 @@ async def _json_with_repair(system: str, user: str, *, model: str, think: bool,
       черновик из размышления решением не становится (находка проверяющего);
     • механика: повтор без размышления, затем дешёвая починка FLASH (весь текст, без среза) с записью в панель проблем."""
     lg = logging.getLogger("pythia.ai_v5")
-    raw = await ai.ask(system, user, model=model, json_mode=True, thinking=think,
-                       max_tokens=max_tokens, route=route, api_key=key())
+
+    async def _ask(rt: str) -> str:
+        # v5.4.2: у каждой попытки свой срок (attempt_timeout) — повтор после пустого/кривого ответа не умирает внутри
+        # чужого таймера вызывающего; таймаут попытки — исключение сразу, без повтора (ещё один такой же долгий
+        # вызов вызывающий всё равно не дождётся).
+        coro = ai.ask(system, user, model=model, json_mode=True, thinking=think,
+                      max_tokens=max_tokens, route=rt, api_key=key())
+        if attempt_timeout:
+            try:
+                return await asyncio.wait_for(coro, float(attempt_timeout))
+            except asyncio.TimeoutError:
+                raise asyncio.TimeoutError(f"[{rt}] модель не ответила за {int(attempt_timeout)} с") from None
+        return await coro
+
+    raw = await _ask(route)
     if route in MONEY_ROUTES:
         for attempt in (1, 2):
             if raw.startswith(ai.THINK_MARK):
@@ -117,8 +130,7 @@ async def _json_with_repair(system: str, user: str, *, model: str, think: bool,
                 ai.note_error(f"{why} и после повтора — решение по правилу", route)
                 raise RuntimeError(f"[{route}] {why} и после повтора — решение по правилу")
             lg.warning("[%s] %s — один повтор с размышлением", route, why)
-            raw = await ai.ask(system, user, model=model, json_mode=True, thinking=think,
-                               max_tokens=max_tokens, route=route + "_retry", api_key=key())
+            raw = await _ask(route + "_retry")
     if think and raw.startswith(ai.THINK_MARK):
         lg.warning("[%s] модель ушла в размышления без ответа — повтор без thinking", route)
         raw = await ai.ask(system, user, model=model, json_mode=True, thinking=False,
@@ -138,10 +150,11 @@ async def _json_with_repair(system: str, user: str, *, model: str, think: bool,
 # = high, как в первой ПИФИИ 4.5.4); max_tokens шлём явно = максимум модели 393 216 (без него сервер режет 64K
 # вместе с размышлением). think=False только там, где ИИ не судит о рынке: починка JSON и health. Воля владельца 24.09.2026.
 async def flash_json(system: str, user: str, *, think: bool = True,
-                     route: str = "flash", max_tokens: int | None = None) -> Any:
+                     route: str = "flash", max_tokens: int | None = None,
+                     attempt_timeout: float | None = None) -> Any:
     async with _sem_for(route):
         return await _json_with_repair(system, user, model=_flash(), think=think,
-                                       route=route, max_tokens=max_tokens)
+                                       route=route, max_tokens=max_tokens, attempt_timeout=attempt_timeout)
 
 
 async def flash_text(system: str, user: str, *, think: bool = True,
@@ -152,9 +165,9 @@ async def flash_text(system: str, user: str, *, think: bool = True,
 
 
 async def pro_json(system: str, user: str, *, route: str = "pro",
-                   max_tokens: int | None = None) -> Any:
+                   max_tokens: int | None = None, attempt_timeout: float | None = None) -> Any:
     return await _json_with_repair(system, user, model=_pro(), think=True,
-                                   route=route, max_tokens=max_tokens)
+                                   route=route, max_tokens=max_tokens, attempt_timeout=attempt_timeout)
 
 
 def money_model() -> str:
@@ -163,12 +176,16 @@ def money_model() -> str:
     return "flash" if str(getattr(config, "PYTHIA_MONEY_MODEL", "pro") or "pro").strip().lower() == "flash" else "pro"
 
 
-async def money_json(system: str, user: str, *, route: str, max_tokens: int | None = None) -> Any:
+async def money_json(system: str, user: str, *, route: str, max_tokens: int | None = None,
+                     attempt_timeout: float | None = None) -> Any:
     """Узел у денег (route ∈ MONEY_ROUTES): PRO или FLASH по money_model(), всегда с размышлением, ровно один
-    повтор той же моделью, без починки чужой моделью и без повтора без размышления (см. _json_with_repair)."""
+    повтор той же моделью, без починки чужой моделью и без повтора без размышления (см. _json_with_repair).
+    v5.4.2: attempt_timeout — срок каждой попытки (таймаут → исключение без повтора; повтор после пустого или
+    кривого ответа получает свой срок, а не остаток чужого)."""
+    extra = {"attempt_timeout": attempt_timeout} if attempt_timeout else {}   # подменам в тестах ключ не навязываем
     if money_model() == "pro":
-        return await pro_json(system, user, route=route, max_tokens=max_tokens)
-    return await flash_json(system, user, think=True, route=route, max_tokens=max_tokens)
+        return await pro_json(system, user, route=route, max_tokens=max_tokens, **extra)
+    return await flash_json(system, user, think=True, route=route, max_tokens=max_tokens, **extra)
 
 
 # ── v5.4.2: разбор слова решения из JSON-ответа ИИ — один на все узлы у денег ──────────────────────────────
@@ -376,6 +393,33 @@ if __name__ == "__main__":
     ai._tok.update(_saved_tok)
     for _r, _v in _saved_routes.items():
         ai._tok_routes[_r] = dict(_v)
+    # v5.4.2: срок попытки — таймаут сразу исключением, без повтора; пустой ответ → повтор со своим сроком
+    async def _t_att():
+        seen = []
+
+        async def slow_ask(system, user, **kw):
+            seen.append(kw.get("route"))
+            if kw.get("route") == "mission_entry":
+                await asyncio.sleep(0.2)
+                return "[⚠ модель ушла в размышления — ниже финальная часть]\nчерновик"
+            return '{"decision": "ВОЙТИ"}'
+
+        real_ask = ai.ask
+        ai.ask = slow_ask
+        try:
+            got = await _json_with_repair("s", "u", model="m", think=True, route="mission_entry", max_tokens=None,
+                                          attempt_timeout=0.5)
+            assert got == {"decision": "ВОЙТИ"} and seen == ["mission_entry", "mission_entry_retry"], seen
+            seen.clear()
+            try:
+                await _json_with_repair("s", "u", model="m", think=True, route="mission_entry", max_tokens=None,
+                                        attempt_timeout=0.05)
+                raise AssertionError("таймаут попытки должен быть исключением")
+            except asyncio.TimeoutError as e:
+                assert "не ответила за" in str(e) and seen == ["mission_entry"], (e, seen)
+        finally:
+            ai.ask = real_ask
+    asyncio.run(_t_att())
     # v5.4.2: разбор слова решения — целые слова, синонимы, отрицание и «или» → None (решения нет, переспросить)
     _door = {"ВОЙТИ": SYN_ENTER + SYN_BUY, "ЖДАТЬ": SYN_WAIT, "ОТМЕНИТЬ": SYN_CANCEL}
     for _raw, _want in (("ВОЙТИ", "ВОЙТИ"), ("**войти**", "ВОЙТИ"), ("BUY", "ВОЙТИ"), ("ENTRY", "ВОЙТИ"),
