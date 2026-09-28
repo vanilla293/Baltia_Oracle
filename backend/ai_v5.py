@@ -256,6 +256,50 @@ def decision_of(raw: Any, table: dict[str, tuple[str, ...]]) -> str | None:
     return None
 
 
+def _side_syn(side: str | None, long_syn: tuple[str, ...], short_syn: tuple[str, ...]) -> tuple[str, ...]:
+    return long_syn if side == "long" else short_syn if side == "short" else ()
+
+
+def review_table(in_pos: bool, side: str | None = None) -> dict[str, tuple[str, ...]]:
+    """Перепроверка дежурного PRO. «ВОЙТИ» без стороны сюда не входит — иначе скрытый крен в лонг (находка проверяющего).
+    В позиции «SELL» у лонга — закрыть, «BUY» у лонга — добрать (зеркально для шорта)."""
+    if in_pos:
+        return {"ЗАКРЫТЬ": SYN_CLOSE + _side_syn(side, SYN_SELL, SYN_BUY),
+                "ЖДЁМ": SYN_WAIT + SYN_HOLD,
+                "ДОБРАТЬ": SYN_ADD + _side_syn(side, SYN_BUY, SYN_SELL),
+                "ПЕРЕВЕРНУТЬ": SYN_FLIP,
+                "НОВЫЙ_АНАЛИЗ": SYN_COUNCIL}
+    return {"КУПИТЬ_СЕЙЧАС": SYN_BUY, "ПРОДАТЬ_СЕЙЧАС": SYN_SELL, "ЖДЁМ": SYN_WAIT + SYN_HOLD, "НОВЫЙ_АНАЛИЗ": SYN_COUNCIL}
+
+
+def door_table(side: str | None) -> dict[str, tuple[str, ...]]:
+    """Проверка входа у двери: BUY/LONG — «войти» только для плана лонга, SELL/SHORT — только для шорта."""
+    return {"ВОЙТИ": SYN_ENTER + _side_syn(side, SYN_BUY, SYN_SELL), "ЖДАТЬ": SYN_WAIT, "ОТМЕНИТЬ": SYN_CANCEL}
+
+
+def profit_table(side: str | None) -> dict[str, tuple[str, ...]]:
+    """Мысль о прибыли: «SELL» у лонга (и «BUY» у шорта) — выйти."""
+    return {"ВЫЙТИ": SYN_CLOSE + _side_syn(side, SYN_SELL, SYN_BUY), "ВЫЙТИ_И_ПЕРЕЗАЙТИ": SYN_REENTER,
+            "СОВЕТ": SYN_COUNCIL, "ДЕРЖАТЬ": SYN_HOLD + SYN_WAIT}
+
+
+def guard_table() -> dict[str, tuple[str, ...]]:
+    """Мягкий стоп у троса: СЛИТЬ = выйти, ЖДАТЬ = держать и передать совету."""
+    return {"СЛИТЬ": SYN_CLOSE, "ЖДАТЬ": SYN_WAIT + SYN_HOLD}
+
+
+def take_table() -> dict[str, tuple[str, ...]]:
+    """Мягкий тейк: ЗАФИКСИРОВАТЬ = выйти, ПОДЕРЖАТЬ = держать."""
+    return {"ЗАФИКСИРОВАТЬ": SYN_CLOSE, "ПОДЕРЖАТЬ": SYN_HOLD + SYN_WAIT}
+
+
+def exec_table(in_pos: bool) -> dict[str, tuple[str, ...]]:
+    """Приказ шифровальщика: FLAT при позиции — закрыть, без позиции — вне рынка (WAIT)."""
+    close = SYN_CLOSE if in_pos else tuple(x for x in SYN_CLOSE if x != "FLAT")
+    wait = SYN_WAIT + (("HOLD_FLAT",) if in_pos else ("FLAT", "HOLD_FLAT"))
+    return {"BUY": SYN_BUY, "SELL": SYN_SELL, "WAIT": wait, "CLOSE": close}
+
+
 async def pro_text(system: str, user: str, *, route: str = "pro",
                    max_tokens: int | None = None) -> str:
     return await ai.ask(system, user, model=_pro(), thinking=True,
@@ -436,5 +480,19 @@ if __name__ == "__main__":
     assert decision_of("ЖДЁМ (не покупать до 101)", _rev) == "ЖДЁМ" and decision_of("не покупать", _rev) is None
     assert decision_of("ЖДЕМ", _rev) == "ЖДЁМ" and decision_of("новый анализ", _rev) == "НОВЫЙ_АНАЛИЗ"
     assert decision_raw({"Decision": "buy"}) == "buy" and decision_raw({"choice": "", "do": "SELL"}) == "SELL"
+    # словари узлов: стороны и позиция
+    assert decision_of("BUY", review_table(False)) == "КУПИТЬ_СЕЙЧАС" and decision_of("ВОЙТИ", review_table(False)) is None
+    assert decision_of("CLOSE", review_table(True, "long")) == "ЗАКРЫТЬ" and decision_of("SELL", review_table(True, "long")) == "ЗАКРЫТЬ"
+    assert decision_of("BUY", review_table(True, "long")) == "ДОБРАТЬ" and decision_of("BUY", review_table(True, "short")) == "ЗАКРЫТЬ"
+    assert decision_of("ЗАФИКСИРОВАТЬ", review_table(True, "long")) == "ЗАКРЫТЬ" and decision_of("HOLD", review_table(True, "long")) == "ЖДЁМ"
+    assert decision_of("BUY", door_table("long")) == "ВОЙТИ" and decision_of("BUY", door_table("short")) is None
+    assert decision_of("ВОЙТИ", door_table("short")) == "ВОЙТИ" and decision_of("SKIP", door_table("long")) == "ОТМЕНИТЬ"
+    assert decision_of("ВЫЙТИ И ПЕРЕЗАЙТИ", profit_table("long")) == "ВЫЙТИ_И_ПЕРЕЗАЙТИ"
+    assert decision_of("ЗАФИКСИРОВАТЬ ПРИБЫЛЬ", profit_table("long")) == "ВЫЙТИ" and decision_of("SELL", profit_table("long")) == "ВЫЙТИ"
+    assert decision_of("ДЕРЖАТЬ, НЕ ВЫХОДИТЬ", profit_table("long")) == "ДЕРЖАТЬ" and decision_of("СОВЕТ", profit_table("long")) == "СОВЕТ"
+    assert decision_of("CLOSE", guard_table()) == "СЛИТЬ" and decision_of("HOLD", guard_table()) == "ЖДАТЬ"
+    assert decision_of("TAKE_PROFIT", take_table()) == "ЗАФИКСИРОВАТЬ" and decision_of("ДЕРЖАТЬ", take_table()) == "ПОДЕРЖАТЬ"
+    assert decision_of("FLAT", exec_table(True)) == "CLOSE" and decision_of("FLAT", exec_table(False)) == "WAIT"
+    assert decision_of("КУПИТЬ", exec_table(False)) == "BUY" and decision_of("ЖДЁМ", exec_table(False)) == "WAIT"
     assert decision_raw({}) == "" and decision_raw("ВОЙТИ ") == "ВОЙТИ" and decision_raw({"choice": {"x": 1}}) == ""
     print("ai_v5 self-test OK:", s)
