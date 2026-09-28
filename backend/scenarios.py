@@ -1297,15 +1297,21 @@ async def s15_stop_refused(sc: Scene) -> None:
 
 
 async def s16_flip_quiet(sc: Scene) -> None:
-    """Переворот по свежему совету при позиции моложе тишины — отклонён; позже — исполнен."""
+    """Переворот по свежему совету при позиции моложе тишины — переворота нет, но выход исполнен (v5.4.2: совет сказал
+    другую сторону — позиция закрыта без переворота, вход в другую сторону решит PRO); позже — переворот исполнен."""
     sc.patch(config, "PYTHIA_EXCHANGE_STOP", True)     # сцена про трос НА БИРЖЕ (умолчание 5.4.1 — только в программе)
     pos = await sc.open_position("long", inv=98.0)
     assert sc.p.adopt_forecast(sc.ex("SELL", None, 90.0, 102.0)) is False
     assert sc.p.position is pos and "переворот отклонён" in sc.p.last_action and sc.p.plan is None
+    assert sc.p._close_pending and "закрываю без переворота" in sc.p.last_action, sc.p.last_action
     assert sc.p.review_ts <= time.time() + 300, "перепроверка через 5 мин решит сама"
+    assert "закрыта без переворота" in (sc.p._review_reason or ""), sc.p._review_reason
     n_o = len(sc.broker.placed)
+    await sc.tick(100.0)                          # выход: закрыть лонг, шорт не открывать
+    assert sc.p.position is None and len(sc.broker.placed) == n_o + 1 and sc.broker.placed[-1]["tag"] == "aip-close"
     await sc.tick(100.0)
-    assert sc.p.position is pos and len(sc.broker.placed) == n_o
+    assert sc.p.position is None and sc.p.pending is None and len(sc.broker.placed) == n_o + 1, "переворота нет"
+    pos = await sc.open_position("long", inv=98.0)
     pos["opened_ts"] -= float(config.PYTHIA_FLIP_QUIET_SEC) + 100
     assert sc.p.adopt_forecast(sc.ex("SELL", None, 90.0, 102.0)) is True and sc.p.plan["side"] == "short"
     await sc.tick(100.0)                          # флип: закрыть лонг
@@ -1315,13 +1321,13 @@ async def s16_flip_quiet(sc: Scene) -> None:
     q = sc.p.position
     assert q and q["side"] == "short" and q["lots"] == 8 and q["hard_stop"] > 102.0 and q["take"] == 90.0, q
     tags = [x["tag"] for x in sc.broker.placed]
-    assert tags == ["aip-entry", "aip-close", "aip-entry"], tags
+    assert tags == ["aip-entry", "aip-close", "aip-entry", "aip-close", "aip-entry"], tags
     assert sc.broker.stops[-1]["direction"] == BUY
     # переворот по совету, позванному мягким стопом, — без тишины
     q["opened_ts"] = time.time()
     sc.p._council_kind = "stop"
     assert sc.p.adopt_forecast(sc.ex("BUY", None, 110.0, 98.0)) is True and sc.p.plan["side"] == "long"
-    sc.note = "молодая позиция — переворот отклонён; после тишины — закрыт лонг, открыт шорт"
+    sc.note = "молодая позиция — переворота нет, выход по слову совета исполнен; после тишины — закрыт лонг, открыт шорт"
 
 
 async def s17_topup_zero(sc: Scene) -> None:
@@ -1575,10 +1581,15 @@ async def s22_event_triage(sc: Scene) -> None:
     assert fake_ai.count("event_triage") == n_tr and sc.m.handoffs[-1]["kind"] == "news" and not sc.m.handoffs[-1].get("triage")
     sc.patch(config, "PYTHIA_EVENT_TRIAGE", True)
     pos["opened_ts"] = time.time()
+    # v5.4.2: молодая позиция — событие всё равно идёт к триажу: СЕЙЧАС/ПЛАНОВО решает ИИ, а не тишина кода
+    sc.p.review_ts = time.time() + 1800
+    fake_ai.queue("event_triage", {"urgency": "ПЛАНОВО", "action": None, "why": "позиция молодая, трос рядом — подождёт"})
     await mission.on_serious_news({"note": "Молодая позиция", "severity": 90})
-    assert fake_ai.count("event_triage") == n_tr and "моложе" in sc.p.last_action, sc.p.last_action
+    assert fake_ai.count("event_triage") == n_tr + 1 and sc.p.triages[-1]["urgency"] == "ПЛАНОВО", sc.p.triages[-1:]
+    assert sc.m.handoffs[-1]["deferred"] and "ПЛАНОВО" in sc.p.last_action and sc.p.review_ts >= time.time() + 1790, sc.p.last_action
     assert sc.p.position is pos
-    sc.note = "ПЛАНОВО → PRO не дёргают; САМ → триггер 98→101 без PRO; молчание → PRO; новость СЕЙЧАС → PRO"
+    sc.note = ("ПЛАНОВО → PRO не дёргают; САМ → триггер 98→101 без PRO; молчание → PRO; новость СЕЙЧАС → PRO; "
+               "молодая позиция → тоже триаж")
 
 
 def _punc(side: str, lo: float, hi: float, pers: float) -> dict:
@@ -1710,7 +1721,8 @@ async def s24_puncture_against_position(sc: Scene) -> None:
 
 async def s25_puncture_below_threshold(sc: Scene) -> None:
     """Прокол ниже порога (стойкость 50 % < PYTHIA_PUNCTURE_MIN 60 %) — тишина с честной причиной; без позиции и
-    плана — сторона не важна, тишина; выключено конфигом — тишина; порог опущен — прокол становится поводом."""
+    плана (v5.4.2) — «вне рынка»: возможный вход в сторону прокола → PRO сразу (против режима игры — тишина);
+    выключено конфигом — тишина; порог опущен — прокол становится поводом."""
     sc.patch(mission, "PUNCTURE_CHECK_SEC", 0.0)
     pos = await sc.open_position("long", inv=97.0, take=120.0, age_s=1300)
     n_h = len(sc.m.handoffs)
@@ -1720,13 +1732,26 @@ async def s25_puncture_below_threshold(sc: Scene) -> None:
     pn = sc.p._puncture_now or {}
     assert sc.p.puncture is None and "ниже порога 60 %" in pn.get("state", "") and pn.get("role") == "угроза", pn
     assert len(sc.m.handoffs) == n_h and fake_ai.count("event_triage") == 0 and fake_ai.count("mission_review") == 0
-    # позиции и плана нет → сторона не важна
+    # v5.4.2: позиции и плана нет → «вне рынка»: возможный вход в сторону прокола — PRO сразу (без триажа, позиции нет)
     sc.p.position, sc.p.plan = None, None
+    sc.p.review_ts, sc.p._last_review_ts, sc.p._last_event_review_ts = time.time() + 1800, 0.0, 0.0
+    sc.patch(sc.m, "play", "long")                # режим long: прокол вниз — вход в шорт закрыт владельцем → тишина
     StubScan.puncture = _punc("вниз", 97.2, 97.6, 0.9)
     await sc.tick(100.0)
     pn = sc.p._puncture_now or {}
-    assert sc.p.puncture is None and "сторона не важна" in pn.get("state", "") and pn.get("role") is None, pn
+    assert sc.p.puncture is None and "режим игры long" in pn.get("state", "") and pn.get("role") == "вне рынка", pn
     assert len(sc.m.handoffs) == n_h
+    sc.patch(sc.m, "play", "auto")
+    fake_ai.queue("mission_review", {"choice": "ЖДЁМ", "why": "полоса вниз, но лента двусторонняя", "note": "ок"})
+    await sc.tick(100.0)
+    pu = sc.p.puncture or {}
+    assert pu.get("role") == "вне рынка" and pu.get("our_side") is None and len(sc.m.handoffs) == n_h + 1, pu
+    assert sc.m.handoffs[-1]["kind"] == "puncture" and not sc.m.handoffs[-1]["deferred"] and fake_ai.count("event_triage") == 0
+    assert "мы вне рынка без плана — прокол вне рынка — возможный момент входа" in pu.get("text", ""), pu.get("text")
+    assert await sc.settle(lambda: fake_ai.count("mission_review") == 1 and not sc.p._review_busy)
+    assert fake_ai.last_user["mission_review"].index("ПРОКОЛ СКАНЕРА") < fake_ai.last_user["mission_review"].index("Цена сейчас")
+    sc.p._last_puncture_ts, sc.p.puncture = 0.0, None   # пейсинг проколов — дальше проверяется порог
+    n_h = len(sc.m.handoffs)
     # выключено конфигом → тишина
     sc.p.position = pos
     sc.patch(config, "PYTHIA_PUNCTURE", False)
@@ -1742,7 +1767,7 @@ async def s25_puncture_below_threshold(sc: Scene) -> None:
     assert sc.p.puncture and sc.p.puncture["persistence"] == 0.5 and len(sc.m.handoffs) == n_h + 1
     assert sc.m.handoffs[-1]["kind"] == "puncture" and fake_ai.count("event_triage") == 1
     assert sc.p.status()["puncture_min"] == 0.4 and "ПРОКОЛ СКАНЕРА" in fake_ai.last_user["event_triage"]
-    sc.note = "50 % < 60 % → тишина; без позиции и плана → тишина; выкл → тишина; порог 40 % → повод"
+    sc.note = "50 % < 60 % → тишина; без позиции и плана → «вне рынка» → PRO (против режима — тишина); выкл → тишина; порог 40 % → повод"
 
 
 async def s26_stop_request_stale(sc: Scene) -> None:
@@ -2107,7 +2132,8 @@ async def s32_gate_wait(sc: Scene) -> None:
 
 
 async def s33_gate_cancel(sc: Scene) -> None:
-    """PRO у двери: ОТМЕНИТЬ — план снят, ЖДУ_ПЛАН (фаза idle), повод дежурному PRO копится к плановой (kind pilot);
+    """PRO у двери: ОТМЕНИТЬ — план снят, ЖДУ_ПЛАН (фаза idle), повод дежурному PRO (kind pilot; v5.4.2: вне рынка без
+    плана — перепроверка через EVENT_MIN_GAP_SEC, а не плановая);
     с council=true — полный совет без очереди (handoff kind entry), совет даёт BUY → снова через проверку у двери → вход."""
     b = sc.broker
     sc.p.review_ts = time.time() + 1800
@@ -2117,9 +2143,9 @@ async def s33_gate_cancel(sc: Scene) -> None:
     await sc.tick(100.0)
     assert sc.p.plan is None and sc.p.state == "ЖДУ_ПЛАН" and sc.p.pending is None and not b.placed, sc.p.last_action
     assert sc.p.gates[-1]["decision"] == "ОТМЕНИТЬ" and "план снят" in sc.p.gates[-1]["applied"], sc.p.gates[-1]
-    assert len(sc.m.handoffs) == n_h + 1 and sc.m.handoffs[-1]["kind"] == "pilot" and sc.m.handoffs[-1]["deferred"], sc.m.handoffs[-1]
+    assert len(sc.m.handoffs) == n_h + 1 and sc.m.handoffs[-1]["kind"] == "pilot" and not sc.m.handoffs[-1]["deferred"], sc.m.handoffs[-1]
     assert "вход отменён" in sc.m.handoffs[-1]["reason"] and "отыграна" in (sc.p._review_reason or "")
-    assert sc.p.review_ts >= time.time() + 1790, "повод копится к плановой перепроверке"
+    assert sc.p.review_ts <= time.time() + mission.EVENT_MIN_GAP_SEC + 1, "v5.4.2: вне рынка без плана — PRO решает скоро"
     assert mission.status(TICKER)["phase"] == "idle" and sc.p.status()["entry_gate"] is None and sc.p.status()["gates"][-1]["decision"] == "ОТМЕНИТЬ"
     assert fake_ai.count("mission_review") == 0 and fake_ai.count("mission_exec") == 0
     # council=true → полный совет без очереди → BUY → проверка у двери (ВОЙТИ по умолчанию) → вход
@@ -2392,7 +2418,7 @@ async def s39_council_wait(sc: Scene) -> None:
     sc.p.plan = None
     sc.p._last_reanalyze_ts = time.time() - 4000
     fake_ai.queue("mission_exec", {"do": "WAIT", "wait_for": "закрепление выше 101 на объёме", "why": "перевеса нет: стакан двусторонний",
-                                   "plan": "ждём", "confidence": 35})
+                                   "plan": "ждём", "confidence": 35, "levels": [101.0]})
     r = await mission.council_again(TICKER, "стенд: совет", wait=True)
     assert r["ok"], r
     assert sc.m.exec["do"] == "WAIT" and sc.m.exec["wait_for"] == "закрепление выше 101 на объёме" and sc.m.exec["invalidation"] is None, sc.m.exec
@@ -2400,11 +2426,22 @@ async def s39_council_wait(sc: Scene) -> None:
     assert "перевеса нет" not in sc.p.last_action, "5.4.2: текст пилота нейтрален"
     assert mission.status(TICKER)["phase"] == "idle" and mission.status(TICKER)["exec"]["do"] == "WAIT"
     assert "WAIT — совет ждал: закрепление выше 101" in mission._exec_text(sc.m)
-    await sc.tick(100.0)
+    await sc.tick(100.0, n=2)                     # первый тик — стакан появился, второй — рынок жив
+    # v5.4.2: WAIT — не сон на PYTHIA_REVIEW_SEC: дежурный PRO не реже раза в PYTHIA_WAIT_REVIEW_SEC
+    assert sc.p.review_ts <= sc.m.exec_ts + float(config.PYTHIA_WAIT_REVIEW_SEC) + 1, sc.p.review_ts - time.time()
+    assert sc.p.review_ts > time.time() + float(config.PYTHIA_WAIT_REVIEW_SEC) - 60
+    # …и уровень приказа (101) под наблюдением: цена прошла его → внеплановая перепроверка (один уровень — один повод)
+    fake_ai.queue("mission_review", {"choice": "ЖДЁМ", "why": "пробой без объёма", "note": "ждём"})
     await sc.tick(101.5)
+    assert sc.m.handoffs[-1]["kind"] == "wait_level" and "прошла уровень 101" in sc.m.handoffs[-1]["reason"], sc.m.handoffs[-1]
+    assert not sc.m.handoffs[-1]["deferred"], "перепроверка поднята сразу (тем же тиком)"
     assert sc.p.pending is None and not sc.broker.placed and fake_ai.count("mission_entry") == 0, "WAIT — входа нет"
-    # 5.4.2: вне рынка по WAIT перепроверка через PYTHIA_WAIT_REVIEW_SEC (15 мин), а не PYTHIA_REVIEW_SEC (30 мин) вслепую
-    assert abs(sc.p.review_ts - time.time() - ai_pilot.wait_review_sec()) < 30, sc.p.review_ts - time.time()
+    assert await sc.settle(lambda: fake_ai.count("mission_review") == 1 and not sc.p._review_busy)
+    assert "прошла уровень 101 из приказа совета" in fake_ai.last_user["mission_review"]
+    n_h = len(sc.m.handoffs)
+    await sc.tick(100.5)
+    await sc.tick(101.6)
+    assert len(sc.m.handoffs) == n_h, "тот же уровень второй раз не будит"
     sit = sc.p._situation_text(101.5)
     assert "ПРИКАЗ СОВЕТА (" in sit and "совет ждал: закрепление выше 101" in sit and "прошлое мнение, а не запрет" in sit, sit
     await sc.settle_ai()
@@ -2413,7 +2450,7 @@ async def s39_council_wait(sc: Scene) -> None:
     sc.p.review_ts = 0.0
     fake_ai.queue("mission_review", {"choice": "КУПИТЬ_СЕЙЧАС", "why": "закрепились выше 101", "invalidation": 99.0, "take": 108.0})
     await sc.tick(101.5)
-    assert await sc.settle(lambda: fake_ai.count("mission_review") == 1 and not sc.p._review_busy)
+    assert await sc.settle(lambda: fake_ai.count("mission_review") == 2 and not sc.p._review_busy)
     ur = fake_ai.last_user["mission_review"]
     assert "совет ждал: закрепление выше 101" in ur and sc.p.plan and sc.p.plan["side"] == "long", sc.p.last_action
     assert sc.p.plan["src"] == "review" and sc.p.plan["snap_price"] == 101.5, sc.p.plan
@@ -2423,7 +2460,8 @@ async def s39_council_wait(sc: Scene) -> None:
     assert sc.p.position and sc.p.position["invalidation"] == 99.0 and mission.status(TICKER)["phase"] == "in_position"
     await sc.settle_ai()
     assert any(e["title"] == f"Вход по свежему решению {MM()}" for e in sc.xevents()), [e["title"] for e in sc.xevents()]
-    sc.note = "WAIT → ЖДУ_ПЛАН/idle, входа нет, WAIT — прошлое мнение в ситуации; PRO КУПИТЬ → вход по свежему решению → позиция"
+    sc.note = ("WAIT → ЖДУ_ПЛАН/idle, входа нет, WAIT — прошлое мнение в ситуации, ритм WAIT, уровень 101 пройден → PRO; "
+               "PRO КУПИТЬ → вход по свежему решению без второго вопроса у двери → позиция")
 
 
 async def s40_program_stops(sc: Scene) -> None:
