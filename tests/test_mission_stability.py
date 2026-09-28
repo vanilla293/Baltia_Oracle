@@ -79,15 +79,19 @@ def test_waiting_council_owns_task_instead_of_borrowing_caller(monkeypatch):
 
 
 def test_late_ai_answer_after_cancellation_cannot_launch_pilot(monkeypatch):
+    # 5.4.2: приказ уходит пилоту ДО рамки (рамка — фоном), поэтому «поздний ответ ИИ» — это шифровальщик (exec)
     entered = asyncio.Event()
 
-    async def frame(*args, **kwargs):
+    async def late_exec(*args, **kwargs):
         entered.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             # Some adapters finish returning a buffered response during cancel.
-            return {"headline": "late result"}
+            return {"do": "BUY", "entry": 99, "take": 103, "invalidation": 98}
+
+    async def frame(*args, **kwargs):
+        return {"headline": "frame"}
 
     async def fit(blocks):
         return blocks, []
@@ -106,13 +110,12 @@ def test_late_ai_answer_after_cancellation_cannot_launch_pilot(monkeypatch):
     monkeypatch.setattr(mission, "_fit_blocks", fit)
     monkeypatch.setattr(mission, "_shrink_one", AsyncMock(side_effect=lambda text, label: text))
     monkeypatch.setattr(mission, "_stream_stage", AsyncMock(return_value="offline analysis"))
-    monkeypatch.setattr(mission.ai_v5, "pro_json", AsyncMock(return_value={
-        "do": "BUY", "entry": 99, "take": 103, "invalidation": 98}))
+    monkeypatch.setattr(mission.ai_v5, "pro_json", late_exec)
     monkeypatch.setattr(mission, "_mod", lambda name: SimpleNamespace(present_frame=frame))
 
     async def scenario():
         await mission.start("SBER", "auto")
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 10)
         await mission.stop("SBER")
         m = mission._M["SBER"]
         assert m.council_task.cancelled()
