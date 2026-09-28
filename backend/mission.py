@@ -4748,7 +4748,7 @@ if __name__ == "__main__":
         pu = p.puncture
         assert pu and pu["role"] == "угроза" and pu["in_pos"] and pu["pending"] and pu["side"] == "вниз", pu
         assert pu["text"].startswith("ПРОКОЛ СКАНЕРА: сторона ВНИЗ, стойкость 78 % (полосу держат 94 тиков), полоса 97.2–97.6"), pu["text"]
-        assert "мы в позиции long — прокол против нас — угроза" in pu["text"] and "Хоукс по ленте n=0.71" in pu["text"]
+        assert "мы в позиции long — прокол против нас — возможная угроза" in pu["text"] and "Хоукс по ленте n=0.71" in pu["text"]
         ut_p = fake_ai.last_user["event_triage"]
         assert ut_p.index("ПРОКОЛ СКАНЕРА") < ut_p.index("Цена сейчас") and "СОБЫТИЕ: прокол сканера вниз 78 % (угроза" in ut_p, ut_p[:500]
         assert len(m.handoffs) == n_h + 1 and m.handoffs[-1]["kind"] == "puncture" and not m.handoffs[-1]["deferred"]

@@ -1603,7 +1603,7 @@ async def s23_puncture_plan(sc: Scene) -> None:
     assert await sc.settle(lambda: fake_ai.count("mission_review") == 1 and not sc.p._review_busy)
     ur = fake_ai.last_user["mission_review"]
     assert ur.index("ПРОКОЛ СКАНЕРА: сторона ВНИЗ, стойкость 70 %") < ur.index("Цена сейчас"), ur[:300]
-    assert "мы вне рынка, план/приказ long — прокол против плана — предупреждение" in ur and "полоса 97.9–98.3" in ur, ur[:600]
+    assert "мы вне рынка, план/приказ long — прокол против плана — возможный довод против входа" in ur and "полоса 97.9–98.3" in ur, ur[:600]
     assert not sc.p.puncture["pending"] and sc.p.puncture["state"].startswith("PRO решил: ЖДЁМ")
     # 2) прокол в сторону плана — под пейсингом молчит (честная причина), после окна → «вход» → PRO входит сейчас
     StubScan.puncture = _punc("вверх", 101.4, 101.9, 0.78)
@@ -1657,7 +1657,7 @@ async def s24_puncture_against_position(sc: Scene) -> None:
     assert pu and pu["role"] == "угроза" and pu["in_pos"] and pu["pending"] and pu["triage"].startswith("СЕЙЧАС"), pu
     ut = fake_ai.last_user["event_triage"]
     assert ut.index("ПРОКОЛ СКАНЕРА: сторона ВНИЗ, стойкость 78 %") < ut.index("Цена сейчас"), ut[:300]
-    assert "мы в позиции long — прокол против нас — угроза" in ut and "СОБЫТИЕ: прокол сканера вниз 78 % (угроза" in ut
+    assert "мы в позиции long — прокол против нас — возможная угроза" in ut and "СОБЫТИЕ: прокол сканера вниз 78 % (угроза" in ut
     h = sc.m.handoffs[-1]
     assert len(sc.m.handoffs) == n_h + 1 and h["kind"] == "puncture" and not h["deferred"] and h["triage"].startswith("СЕЙЧАС"), h
     assert sc.p._review_pulled and sc.p.review_ts <= time.time() + mission.EVENT_MIN_GAP_SEC + 1 and "PRO решит" in pu["state"]

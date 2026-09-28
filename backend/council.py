@@ -290,8 +290,11 @@ async def _stream_stage(scope: str, run_id: str, stage: str, system: str, user: 
 
 
 async def _deliberate(scope: str, run_id: str, analysis_su: tuple[str, str], streams_brief: str,
-                      astro_line: str, human: bool = False, analysis_detail: str = "") -> tuple[dict, dict]:
+                      astro_line: str, human: bool = False, analysis_detail: str = "",
+                      prices: str = "", prev_text: str = "") -> tuple[dict, dict]:
     """analysis → critique → verdict (stream) → summary (json). Возврат: (texts, summary).
+    v5.4.2: критик и председатель видят цены (prices — снимок, что видел аналитик), председатель при
+    пересчёте — итог прошлого совета (prev_text): живые входы не теряются молча.
     Кресла читают друг друга целиком, но в разумных пределах: перед каждым PRO-вызовом
     блоки идут через compress.fit/shrink — блок выше PYTHIA_CTX_LIMIT (200 000 симв.) или
     сумма выше PYTHIA_PROMPT_SOFT FLASH сжимает без потери нитей; ниже — как есть.
@@ -301,14 +304,16 @@ async def _deliberate(scope: str, run_id: str, analysis_su: tuple[str, str], str
 
     # критик: анализ (shrink по умолчанию = PYTHIA_CTX_LIMIT) + краткие потоки
     an = await compress.shrink(texts["analysis"], None, "анализ совета")
-    cb = await compress.fit({"анализ": an, "потоки": streams_brief})
+    cb = await compress.fit({"анализ": an, "потоки": streams_brief, "цены": prices or ""})
     an = cb["анализ"]
-    s_, u_ = P.critique(an, cb["потоки"])
+    s_, u_ = P.critique(an, cb["потоки"], prices=cb["цены"])
     texts["critique"] = await _stream_stage(scope, run_id, "critique", s_, u_, detail=_sizes("критик", cb, u_))
 
     # вердикт: анализ + критика + потоки под общим пределом
-    vb = await compress.fit({"анализ": an, "критика": texts["critique"], "потоки": cb["потоки"]})
-    s_, u_ = P.verdict(vb["анализ"], vb["критика"], vb["потоки"], astro_line, human=human)
+    vb = await compress.fit({"анализ": an, "критика": texts["critique"], "потоки": cb["потоки"],
+                             "цены": cb["цены"], "прошлый итог": prev_text or ""})
+    s_, u_ = P.verdict(vb["анализ"], vb["критика"], vb["потоки"], astro_line, human=human,
+                       prev_summary=vb["прошлый итог"], prices=vb["цены"])
     texts["verdict"] = await _stream_stage(scope, run_id, "verdict", s_, u_, detail=_sizes("вердикт", vb, u_))
 
     # итог: вердикт целиком (shrink лишь выше PYTHIA_CTX_LIMIT)
@@ -423,7 +428,7 @@ async def daily(days: float | None = None, reason: str = "по кнопке") ->
         su = P.analysis_daily(days, blocks["статистика"], blocks["цены"], blocks["астро"], blocks["новости"],
                               extra=blocks["разведка"])
         texts, summary = await _deliberate(scope, run_id, su, _streams_brief(streams), astro_line,
-                                           analysis_detail=_sizes("аналитик", blocks, su[1]))
+                                           analysis_detail=_sizes("аналитик", blocks, su[1]), prices=blocks["цены"])
         data.update({"texts": texts, "summary": summary})
 
         data["cards"] = await newsflow.distribute(run_id, summary, days)
@@ -480,7 +485,8 @@ async def update_with_news(new_ids: list[str], reason: str) -> dict:
                                extra=blocks["разведка"])
         brief = _streams_brief(streams) + "\nНОВЫЕ:\n" + newsflow.render(new_items, limit=None)
         texts, summary = await _deliberate(scope, run_id, su, brief, astro_line,
-                                           analysis_detail=_sizes("аналитик (пересчёт)", blocks, su[1]))
+                                           analysis_detail=_sizes("аналитик (пересчёт)", blocks, su[1]),
+                                           prices=blocks["цены"], prev_text=blocks["итог"])
         data.update({"texts": texts, "summary": summary})
         data["cards"] = await newsflow.distribute(run_id, summary, days)
         data["tokens"] = _tokens_diff(t0)
@@ -557,7 +563,8 @@ async def human(text: str) -> dict:
                               extra=blocks["разведка"])
         texts, summary = await _deliberate(
             scope, run_id, su, _streams_brief(streams), astro_line, human=True,
-            analysis_detail=_sizes("аналитик (взгляд)", {"взгляд": P._j(comp), **blocks}, su[1]))
+            analysis_detail=_sizes("аналитик (взгляд)", {"взгляд": P._j(comp), **blocks}, su[1]),
+            prices=blocks["цены"], prev_text=blocks["итог"])
         data.update({"texts": texts, "summary": summary})
         data["cards"] = await newsflow.distribute(run_id, summary, days)
 

@@ -7,6 +7,10 @@
 «флета нет» / «главное войти, а не оттягивать» нет; приказ допускает WAIT с wait_for; system ≤ 20 строк; слово
 «json» в каждой JSON-стадии; время МСК всегда дано; entry_check/profit_think отдают (system, user) с нужными
 блоками; ai_v5.money_json выбирает PRO/FLASH по PYTHIA_MONEY_MODEL; MONEY_ROUTES знает mission_entry/mission_profit.
+v5.4.2 «СВОБОДНЫЙ ПИЛОТ» (воля владельца 28.09.2026: «ждём, ждём, ждём — не входит и не выходит»): пункт 7 доктрины —
+свобода решения (все ходы равноправны, у каждого своя цена); BANNED ловит подталкивания в ОБЕ стороны — и «главное
+войти», и «вне рынка — не трусость» / «только с перевесом» / «сомнение — ждать» / «не входить вслепую»; шифровальщик
+переводит вердикт как есть; критик ищет и слабый вход, и упущенный ход; совет — входов столько, сколько даёт картина.
 Без сети: ИИ не зовётся (money_json — на подменённых pro_json/flash_json)."""
 import asyncio
 
@@ -79,9 +83,12 @@ def test_doctrine_is_compact_and_says_the_right_things():
     assert 6 <= len(pm.DOCTRINE.splitlines()) <= 9 and 1 <= len(pm.PERSONA.splitlines()) <= 2
     assert pm.VOICE == f"{pm.PERSONA}\n{pm.DOCTRINE}" and len(pm.VOICE.splitlines()) <= 11
     for piece in ("кухню рынка", "НАБИРАЕТ", "РАЗДАЁТ", "ВЫНОСИТ стопы", "Конкретика", "таймингом", "Сценарии", "отменой",
-                  "Холодный расчёт", "решителен", "честен", "асимметрия", "рынок ошибается", "вне рынка (WAIT / ЖДАТЬ)",
-                  "решение, а не трусость"):
+                  "Холодный расчёт", "решителен", "честен", "асимметрия", "рынок ошибается", "стоять вне рынка",
+                  "равноправные ходы", "ни один не выбор по умолчанию", "лишний вход", "пропущенный ход"):
         assert piece in pm.DOCTRINE, piece
+    # v5.4.2: п.7 не оправдывает одно ожидание и не делает вход «дороже» пропуска
+    for absent in ("трусост", "хуже пропущенного", "Нет перевеса — вне рынка"):
+        assert absent not in pm.DOCTRINE, absent
     assert "стратег" in pm.PERSONA and "двигает рынок" in pm.PERSONA
     # пункты 4/5/5a/5b доктрины 4.5.4 (как читать небо, Вайкофф, первоисточник, эфир) не перенесены: слои идут данными
     for absent in ("ГАНН", "Ганну", "IAU", "PLV", "тропическ", "ОБЯЗАН опереться"):
@@ -96,7 +103,7 @@ def test_mission_node_voice_lines_time_json(name):
     assert pm.VOICE in s and pm.DOCTRINE in s and pm.PERSONA in s and pm.FREEDOM in s, name
     assert pm.system_lines(s) <= pm.SYSTEM_MAX_LINES == 20, (name, pm.system_lines(s))
     assert "МСК" in s and "МСК" in u, (name, "время МСК всегда дано")
-    assert not any(b in s.lower() for b in pm.BANNED), (name, "подталкивание к немедленному входу")
+    assert not any(b in s.lower() for b in pm.BANNED), (name, "подталкивание к входу или к ожиданию")
     assert "SBER" in u and "Сбербанк" in s
     if name in JSON_MISSION:
         assert "json" in s.lower() and "строго один JSON-объект" in s, (name, "правило JSON-режима DeepSeek")
@@ -106,33 +113,53 @@ def test_mission_node_voice_lines_time_json(name):
     assert "FLASH" not in role, (name, "роль не привязана к FLASH: модель у денег — PYTHIA_MONEY_MODEL")
 
 
+def test_banned_catches_nudges_both_ways():
+    """v5.4.2: BANNED — подталкивания и к входу (5.1–5.4.0), и к ожиданию (5.4.1); сравнение по system.lower()."""
+    assert all(b == b.lower() for b in pm.BANNED)
+    for nudge in ("флета нет", "главное войти", "а не оттягивать",              # к входу
+                  "не трусость", "хуже пропущенного", "только с перевесом",    # к ожиданию
+                  "сомнение — ждать", "вслепую", "не лезем", "не от скуки"):
+        assert nudge in pm.BANNED, nudge
+
+
 def test_exec_order_allows_wait_as_decision():
     s, _ = MISSION["exec_order"]
     assert '"do":"BUY|SELL|WAIT|CLOSE"' in pm.EXEC_SCHEMA and '"wait_for"' in pm.EXEC_SCHEMA
     assert '"invalidation":число|null' in pm.EXEC_SCHEMA, "при WAIT стопа нет"
-    assert "WAIT — решение, не трусость" in pm.EXEC_RULE and "wait_for" in pm.EXEC_RULE and "дежурный PRO вернётся" in pm.EXEC_RULE
+    assert "wait_for" in pm.EXEC_RULE and "дежурный PRO вернётся" in pm.EXEC_RULE
+    # v5.4.2: шифровальщик переводит вердикт как есть в обе стороны и сам решение не пересматривает
+    assert "Переводи решение вердикта как есть" in pm.EXEC_RULE and "вердикт BUY/SELL" in pm.EXEC_RULE
+    assert "трусост" not in pm.EXEC_RULE and "наугад" not in pm.EXEC_RULE
     assert "при WAIT — null" in s and "после проверки у двери" in s and pm.EXEC_SCHEMA in s
     assert "флета нет" not in s.lower() and "немедленно и на максимум" not in s
 
 
-def test_verdict_and_review_treat_out_of_market_as_decision():
+def test_verdict_and_review_treat_all_moves_as_equal():
     sv, _ = MISSION["verdict"]
-    assert "вне рынка" in sv and "только с перевесом" in sv and "на откате" in sv and "на пробитии уровня" in sv
-    assert "держать" in sv and "перевернуть" in sv
+    assert "вне рынка" in sv and "по тому, что сильнее в данных" in sv and "на откате" in sv and "на пробитии уровня" in sv
+    assert "держать" in sv and "перевернуть" in sv and "добрать" in sv
+    assert "только с перевесом" not in sv and "весомых новых основаниях" not in sv, "у статус-кво нет форы"
     sr, ur = MISSION["review"]
-    assert "Приказ совета WAIT" in sr and "wait_for" in sr and "ЖДЁМ — решение, не трусость" in sr and "у двери" in sr
+    assert "Приказ совета WAIT" in sr and "wait_for" in sr and "ориентир, а не условие" in sr and "у двери" in sr
+    assert "Все choice равноправны" in sr and "не якорь" in sr and "порядок ничего не значит" in sr
     assert "WAIT — ждём 283" in ur, "перепроверка видит приказ WAIT"
+    assert pm.review_options("auto", False).split(" | ")[0] != "ЖДЁМ" and pm.review_options("auto", True).split(" | ")[0] != "ЖДЁМ"
+    sc, _ = MISSION["critique"]
+    assert "в обе стороны" in sc and "Перестраховка" in sc and "упустил ли вход или выход" in sc
 
 
 def test_guards_ask_by_picture_not_by_rule():
     sg, _ = MISSION["stop_guard"]
     assert "дежурный миссии у троса" in sg and "слить" in sg.lower() and "Совету" in sg and pm.GUARD_SCHEMA in sg
+    assert "решаешь ты" in sg and "Оба ответа равноправны" in sg
     assert "вынос стопов" in sg and "Аварийный трос" in sg and "ещё 2 раза" in sg
     st, _ = MISSION["take_guard"]
     assert "дежурный миссии у тейка" in st and "зафиксировать" in st.lower() and pm.TAKE_SCHEMA in st and "287.8" in st
+    assert "решаешь ты" in st
     se, ue = MISSION["event_triage"]
     assert pm.TRIAGE_SCHEMA in se and "СЕЙЧАС" in se and "ПЛАНОВО" in se and "САМ" in se and "через 22 мин" in se
     assert "за секунды" not in se, "триаж на PRO: обещаний «за секунды» нет"
+    assert "пора забирать прибыль" in se, "рывок в нашу сторону тоже может звать PRO — за выходом"
     assert "СКАНЕР" not in ue and "РАЗВЕДК" not in ue, "триаж короткий: без сканера и разведки"
 
 
@@ -141,9 +168,11 @@ def test_entry_check_blocks_and_schema():
     assert pm.ENTRY_SCHEMA in s and '"decision":"ВОЙТИ|ЖДАТЬ|ОТМЕНИТЬ"' in pm.ENTRY_SCHEMA
     for field in ('"entry"', '"entry_kind":"сейчас|откат|прорыв"|null', '"wait_minutes"', '"invalidation"', '"take"', '"council":true|false', '"note"'):
         assert field in pm.ENTRY_SCHEMA, field
-    assert "у самой двери" in s and "не входить вслепую" in s and "только с перевесом здесь и сейчас" in s and "ОТМЕНИТЬ" in s
+    assert "у самой двери" in s and "сверь приказ с живым рынком" in s and "три исхода равноправны" in s and "ОТМЕНИТЬ" in s
+    assert "анализ заново не пересобирай" in s and "не входить вслепую" not in s and "сомнение — ЖДАТЬ" not in s
     for piece in (f"ВРЕМЯ: {TIME}", "═══ СИТУАЦИЯ ═══", "Цена 285.4, позиция long 10 @279", "═══ ПРИКАЗ И ПЛАН", "BUY сейчас, стоп 281",
                   "═══ ХОД ЦЕНЫ", "285.0 → 285.4", "═══ ЖИВОЙ РЫНОК ═══", "плита на покупку", "═══ ПРОШЛЫЕ ОТВЕТЫ У ДВЕРИ", "14:20 ЖДАТЬ @285",
+                  "не обязательство",
                   "═══ ПРОШЛЫЕ ОТВЕТЫ У ТРОСА И ТЕЙКА ═══", "10:40 трос: ЖДАТЬ", "═══ ПАМЯТЬ МИССИИ", "═══ СКАНЕР СТАКАНА ═══",
                   "═══ ДАННЫЕ РАЗВЕДКИ ═══", "MX 2 791", "═══ СВЯЗАННЫЕ БУМАГИ", "ρ=+0.81", "═══ ИТОГ ОБЩЕГО СОВЕТА ═══",
                   "═══ СВЕЖИЕ НОВОСТИ (время МСК) ═══", "[a1b2c3]", "Войти сейчас, ждать уровня/срока или отменить?"):
@@ -158,7 +187,8 @@ def test_profit_think_blocks_and_schema():
     assert pm.PROFIT_SCHEMA in s and '"decision":"ДЕРЖАТЬ|ВЫЙТИ|ВЫЙТИ_И_ПЕРЕЗАЙТИ|СОВЕТ"' in pm.PROFIT_SCHEMA
     for field in ('"lock_price"', '"take"', '"reentry"', '"reentry_kind":"откат|прорыв"|null', '"note"'):
         assert field in pm.PROFIT_SCHEMA, field
-    assert "позиция в плюсе" in s and "пройдено 64 %" in s and "рывок может быть последним" in s and "перезайти" in s
+    assert "позиция в плюсе" in s and "пройдено 64 %" in s and "может продолжиться, а может выдохнуться" in s and "ВЫЙТИ_И_ПЕРЕЗАЙТИ" in s
+    assert "рывок может быть последним" not in s, "v5.4.2: без подталкивания и к выходу"
     for piece in (f"ВРЕМЯ: {TIME}", "ПРИБЫЛЬ: пройдено 64 % хода до тейка 291", "═══ СИТУАЦИЯ ═══", "═══ ХОД ЦЕНЫ", "279 → 285.4",
                   "═══ ЖИВОЙ РЫНОК ═══", "═══ ПЛАН И ПРОШЛЫЕ РЕШЕНИЯ ═══", "BUY тейк 291 стоп 276", "═══ ПРОШЛЫЕ МЫСЛИ О ПРИБЫЛИ ═══",
                   "14:00 ДЕРЖАТЬ", "═══ ПАМЯТЬ МИССИИ", "═══ СКАНЕР СТАКАНА ═══", "═══ ДАННЫЕ РАЗВЕДКИ ═══", "═══ СВЯЗАННЫЕ БУМАГИ",
@@ -178,9 +208,18 @@ def test_council_chair_has_voice(name):
         assert "json" in s.lower() and "строго один JSON-объект" in s, name
 
 
-def test_council_out_of_market_is_a_decision():
-    assert "вне рынка" in COUNCIL["verdict"][0] and "решение, не трусость" in COUNCIL["verdict"][0]
-    assert "picks пустой" in COUNCIL["summary"][0] and "список пуст" in COUNCIL["analysis_daily"][0]
+def test_council_is_not_a_funnel():
+    sv = COUNCIL["verdict"][0]
+    assert "ни одного, один или несколько" in sv and "трусост" not in sv and "только с перевесом" not in sv
+    assert "ближайшую торговую сессию" in sv and "входить сегодня" not in sv, "совет ночью и в выходной не пустеет"
+    ss = COUNCIL["summary"][0]
+    assert "picks пустой" in ss and "не выбрасывай" in ss and "без перевеса" not in ss, "итог переводит вердикт как есть"
+    assert "список пуст — скажи почему" in COUNCIL["analysis_daily"][0]
+    sc = COUNCIL["critique"][0]
+    assert "в обе стороны" in sc and "Упущенное" in sc and "по упущенному — добавить" in sc
+    assert "ПОЛНЫМ текущим списком входов" in COUNCIL["analysis_update"][0]
+    si = MECHANICS["impact"][0]
+    assert "новая возможность" in si and "шанс" in si, "дозор будит миссию и на шанс, не только на угрозу"
 
 
 @pytest.mark.parametrize("name", sorted(MECHANICS))
