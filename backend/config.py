@@ -803,6 +803,29 @@ def wipe_keys() -> None:
 # Значения (читаются модулями как config.X). _refresh() пересчитывает.
 # ──────────────────────────────────────────────────────────────────────
 
+# v5.4.2: умолчания «свободного пилота». Self-тесты, стенд и pytest закрепляют их (pin_free_pilot_defaults), чтобы
+# ручки владельца в data/config_user.json или в окружении не роняли обязательные проверки (находка ревью: при
+# PYTHIA_ENTRY_DRIFT_PCT=3 или PYTHIA_ENTRY_FRESH_SEC=0 падали self-тесты mission/ai_pilot и стенд).
+FREE_PILOT_DEFAULTS = {
+    "PYTHIA_ENTRY_TIMEOUT_SEC": 1200, "PYTHIA_PROFIT_TIMEOUT_SEC": 1200, "PYTHIA_SILENT_RETRY_SEC": 120,
+    "PYTHIA_ENTRY_SILENT_MAX": 2, "PYTHIA_ENTRY_FRESH_SEC": 1200, "PYTHIA_ENTRY_DRIFT_PCT": 1.0,
+    "PYTHIA_WAIT_REVIEW_SEC": 900, "PYTHIA_COUNCIL_MAX_SEC": 7200,
+}
+
+
+def pin_free_pilot_defaults(setter=None) -> dict:
+    """Поставить умолчания 5.4.2 в живые значения модуля (только для тестов и стенда). setter(name, value) —
+    например monkeypatch.setattr-обёртка; без него — прямое присваивание. Возвращает прежние значения."""
+    g = globals()
+    old = {k: g.get(k) for k in FREE_PILOT_DEFAULTS}
+    for k, v in FREE_PILOT_DEFAULTS.items():
+        if setter:
+            setter(k, v)
+        else:
+            g[k] = v
+    return old
+
+
 def _refresh() -> None:
     g = globals()
 
@@ -988,7 +1011,8 @@ def _refresh() -> None:
     #   PYTHIA_WAIT_REVIEW_SEC — приказ совета WAIT без позиции и плана: дежурный PRO смотрит заново не реже раза в N с
     #       (плюс уровни WAIT и проколы сканера будят его сразу), а не спит PYTHIA_REVIEW_SEC вслепую.
     #   PYTHIA_COUNCIL_MAX_SEC — совет по поводу (НОВЫЙ_АНАЛИЗ, передачи) дольше N с не держит пилот: вход и
-    #       перепроверки размораживаются.
+    #       перепроверки размораживаются. Умолчание 7200: три кресла стримом плюс две попытки шифровальщика по 1800 с
+    #       должны помещаться целиком (3600 обрывал повтор шифровальщика — находка ревью).
     g["PYTHIA_ENTRY_TIMEOUT_SEC"] = max(60, get_int("PYTHIA_ENTRY_TIMEOUT_SEC", 1200))
     g["PYTHIA_PROFIT_TIMEOUT_SEC"] = max(60, get_int("PYTHIA_PROFIT_TIMEOUT_SEC", 1200))
     g["PYTHIA_SILENT_RETRY_SEC"] = max(30, get_int("PYTHIA_SILENT_RETRY_SEC", 120))
@@ -996,7 +1020,7 @@ def _refresh() -> None:
     g["PYTHIA_ENTRY_FRESH_SEC"] = max(0, get_int("PYTHIA_ENTRY_FRESH_SEC", 1200))
     g["PYTHIA_ENTRY_DRIFT_PCT"] = max(0.1, min(get_float("PYTHIA_ENTRY_DRIFT_PCT", 1.0), 10.0))
     g["PYTHIA_WAIT_REVIEW_SEC"] = max(120, get_int("PYTHIA_WAIT_REVIEW_SEC", 900))
-    g["PYTHIA_COUNCIL_MAX_SEC"] = max(600, get_int("PYTHIA_COUNCIL_MAX_SEC", 3600))
+    g["PYTHIA_COUNCIL_MAX_SEC"] = max(600, get_int("PYTHIA_COUNCIL_MAX_SEC", 7200))
     # ── v5.3 W3: ПРОКОЛ СКАНЕРА КАК ПОВОД (воля владельца: «прокол с таким-то процентом срабатывает часто:
     #    хотим зайти или уже в позиции — ИИ даётся «вот так и так», и PRO думает, что делать») ──
     #   PYTHIA_PUNCTURE — 1: сканер стакана видит полосу устойчивого вакуума (прокол) со стойкостью

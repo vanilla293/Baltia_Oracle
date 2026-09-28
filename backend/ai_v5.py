@@ -196,13 +196,18 @@ async def money_json(system: str, user: str, *, route: str, max_tokens: int | No
 # пишет «ответ не разобран» и переспрашивает, а не выбирает за ИИ.
 DECISION_KEYS = ("decision", "choice", "do", "action", "решение", "выбор")
 _NEGATIONS = frozenset({"НЕ", "НЕТ", "NOT", "NO", "DONT", "DO_NOT", "НЕЛЬЗЯ"})
+# отрицание сразу ПОСЛЕ слова решения: «ВОЙТИ нельзя», «КУПИТЬ сейчас не стоит»
+_POST_NEG = ("НЕЛЬЗЯ", "НЕ_НАДО", "НЕ_СТОИТ", "НЕ_НУЖНО", "НЕ_БУДЕМ", "NOT")
 
 SYN_BUY = ("КУПИТЬ", "КУПИТЬ_СЕЙЧАС", "КУПИТЬ_НА_ОТКАТЕ", "КУПИТЬ_НА_ПРОБОЕ", "КУПИТЬ_НА_ПРОРЫВЕ", "ПОКУПКА", "ПОКУПАТЬ",
            "ПОКУПАЕМ", "ПОКУПАЮ", "ЛОНГ", "В_ЛОНГ", "BUY", "BUY_NOW", "LONG", "GO_LONG")
 SYN_SELL = ("ПРОДАТЬ", "ПРОДАТЬ_СЕЙЧАС", "ПРОДАТЬ_НА_ОТКАТЕ", "ПРОДАТЬ_НА_ПРОБОЕ", "ПРОДАТЬ_НА_ПРОРЫВЕ", "ПРОДАЖА",
             "ПРОДАВАТЬ", "ПРОДАЕМ", "ПРОДАЮ", "ШОРТ", "В_ШОРТ", "SELL", "SELL_NOW", "SHORT", "GO_SHORT")
-SYN_ENTER = ("ВОЙТИ", "ВОЙТИ_СЕЙЧАС", "ВХОД", "ВХОДИМ", "ВХОДИТЬ", "ВХОЖУ", "ЗАЙТИ", "ENTER", "ENTRY", "GO", "YES", "ДА")
-SYN_WAIT = ("ЖДАТЬ", "ЖДЕМ", "ЖДУ", "ПОДОЖДАТЬ", "ОЖИДАТЬ", "ВНЕ_РЫНКА", "WAIT", "STAY_OUT", "NO_TRADE", "NONE", "PASS")
+# «ДА/YES/GO» — не ответ на вопрос из трёх исходов (ВОЙТИ / ЖДАТЬ / ОТМЕНИТЬ): их здесь нет (находка ревью 5.4.2)
+SYN_ENTER = ("ВОЙТИ", "ВОЙТИ_СЕЙЧАС", "ВХОД", "ВХОДИМ", "ВХОДИТЬ", "ВХОЖУ", "ЗАЙТИ", "ENTER", "ENTRY")
+SYN_WAIT = ("ЖДАТЬ", "ЖДЕМ", "ЖДУ", "ПОДОЖДАТЬ", "ОЖИДАТЬ", "WAIT")
+# «вне рынка» зависит от позиции: без позиции — не входить (ожидание), в позиции — выйти; «NONE/PASS» — не ответ
+SYN_OUT = ("ВНЕ_РЫНКА", "STAY_OUT", "NO_TRADE", "OUT_OF_MARKET")
 SYN_HOLD = ("ДЕРЖАТЬ", "ДЕРЖИМ", "ДЕРЖУ", "ПОДЕРЖАТЬ", "ОСТАВИТЬ", "HOLD", "KEEP")
 SYN_CLOSE = ("ЗАКРЫТЬ", "ЗАКРЫВАЕМ", "ЗАКРЫВАТЬ", "ВЫЙТИ", "ВЫХОД", "ВЫХОДИМ", "СЛИТЬ", "СЛИВАЕМ", "ЗАФИКСИРОВАТЬ",
              "ФИКСИРОВАТЬ", "ФИКСИРУЕМ", "ЗАБРАТЬ", "ЗАБРАТЬ_ПРИБЫЛЬ", "ФИКСИРОВАТЬ_ПРИБЫЛЬ", "ЗАФИКСИРОВАТЬ_ПРИБЫЛЬ",
@@ -240,7 +245,9 @@ def decision_of(raw: Any, table: dict[str, tuple[str, ...]]) -> str | None:
     """Каноническое решение узла или None. table: {токен узла: синонимы} (токен сам себе синоним).
     Сначала весь ответ целиком, потом первые 3 / 2 / 1 слова; попадание в два разных решения → None;
     «НЕ …» в начале и «… или …» → None (не угадываем ни в сторону входа, ни в сторону ожидания)."""
-    words = _norm_word(raw).split()
+    import re
+    text = str(raw or "")
+    words = _norm_word(text).split()
     if not words:
         return None
     idx: dict[str, set[str]] = {}
@@ -250,13 +257,24 @@ def decision_of(raw: Any, table: dict[str, tuple[str, ...]]) -> str | None:
     whole = idx.get("_".join(words))       # точное слово словаря целиком («NO_TRADE») — раньше проверки отрицания
     if whole:
         return next(iter(whole)) if len(whole) == 1 else None
-    if words[0] in _NEGATIONS or "ИЛИ" in words or "OR" in words:
-        return None                        # «НЕ ВХОДИТЬ», «ВОЙТИ или ЖДАТЬ» — решения нет, переспросить
+    if "ИЛИ" in words or "OR" in words:
+        return None                        # «ВОЙТИ или ЖДАТЬ» — решения нет, переспросить
+    if words[0] in _NEGATIONS:
+        # «НЕ СЛИВАТЬ — держать», «НЕ ВХОДИТЬ, ЖДАТЬ»: решение — во второй части после знака; без неё — нет решения
+        parts = re.split(r"\s*[—–;:,]\s*|\s+-\s+", text.strip(), maxsplit=1)
+        if len(parts) == 2 and parts[1].strip() and _norm_word(parts[1]).split()[:1] != words[:1]:
+            rest = _norm_word(parts[1]).split()
+            if rest and rest[0] not in _NEGATIONS:
+                return decision_of(parts[1], table)
+        return None                        # «НЕ ВХОДИТЬ» — чего хочет ИИ, не сказано: переспросить
     for n in (len(words), 3, 2, 1):
         if n > len(words):
             continue
         hit = idx.get("_".join(words[:n]))
         if hit:
+            tail = words[n:n + 2]
+            if tail and (tail[0] in _POST_NEG or "_".join(tail) in _POST_NEG):
+                return None                # «ВОЙТИ нельзя» — не решение войти
             return next(iter(hit)) if len(hit) == 1 else None
     return None
 
@@ -269,12 +287,13 @@ def review_table(in_pos: bool, side: str | None = None) -> dict[str, tuple[str, 
     """Перепроверка дежурного PRO. «ВОЙТИ» без стороны сюда не входит — иначе скрытый крен в лонг (находка проверяющего).
     В позиции «SELL» у лонга — закрыть, «BUY» у лонга — добрать (зеркально для шорта)."""
     if in_pos:
-        return {"ЗАКРЫТЬ": SYN_CLOSE + _side_syn(side, SYN_SELL, SYN_BUY),
+        return {"ЗАКРЫТЬ": SYN_CLOSE + SYN_OUT + _side_syn(side, SYN_SELL, SYN_BUY),
                 "ЖДЁМ": SYN_WAIT + SYN_HOLD,
                 "ДОБРАТЬ": SYN_ADD + _side_syn(side, SYN_BUY, SYN_SELL),
                 "ПЕРЕВЕРНУТЬ": SYN_FLIP,
                 "НОВЫЙ_АНАЛИЗ": SYN_COUNCIL}
-    return {"КУПИТЬ_СЕЙЧАС": SYN_BUY, "ПРОДАТЬ_СЕЙЧАС": SYN_SELL, "ЖДЁМ": SYN_WAIT + SYN_HOLD, "НОВЫЙ_АНАЛИЗ": SYN_COUNCIL}
+    return {"КУПИТЬ_СЕЙЧАС": SYN_BUY, "ПРОДАТЬ_СЕЙЧАС": SYN_SELL, "ЖДЁМ": SYN_WAIT + SYN_OUT + SYN_HOLD,
+            "НОВЫЙ_АНАЛИЗ": SYN_COUNCIL}
 
 
 def door_table(side: str | None) -> dict[str, tuple[str, ...]]:
@@ -284,25 +303,29 @@ def door_table(side: str | None) -> dict[str, tuple[str, ...]]:
 
 def profit_table(side: str | None) -> dict[str, tuple[str, ...]]:
     """Мысль о прибыли: «SELL» у лонга (и «BUY» у шорта) — выйти."""
-    return {"ВЫЙТИ": SYN_CLOSE + _side_syn(side, SYN_SELL, SYN_BUY), "ВЫЙТИ_И_ПЕРЕЗАЙТИ": SYN_REENTER,
+    return {"ВЫЙТИ": SYN_CLOSE + SYN_OUT + _side_syn(side, SYN_SELL, SYN_BUY), "ВЫЙТИ_И_ПЕРЕЗАЙТИ": SYN_REENTER,
             "СОВЕТ": SYN_COUNCIL, "ДЕРЖАТЬ": SYN_HOLD + SYN_WAIT}
 
 
 def guard_table() -> dict[str, tuple[str, ...]]:
     """Мягкий стоп у троса: СЛИТЬ = выйти, ЖДАТЬ = держать и передать совету."""
-    return {"СЛИТЬ": SYN_CLOSE, "ЖДАТЬ": SYN_WAIT + SYN_HOLD}
+    return {"СЛИТЬ": SYN_CLOSE + SYN_OUT, "ЖДАТЬ": SYN_WAIT + SYN_HOLD}
 
 
 def take_table() -> dict[str, tuple[str, ...]]:
     """Мягкий тейк: ЗАФИКСИРОВАТЬ = выйти, ПОДЕРЖАТЬ = держать."""
-    return {"ЗАФИКСИРОВАТЬ": SYN_CLOSE, "ПОДЕРЖАТЬ": SYN_HOLD + SYN_WAIT}
+    return {"ЗАФИКСИРОВАТЬ": SYN_CLOSE + SYN_OUT, "ПОДЕРЖАТЬ": SYN_HOLD + SYN_WAIT}
 
 
 def exec_table(in_pos: bool) -> dict[str, tuple[str, ...]]:
-    """Приказ шифровальщика: FLAT при позиции — закрыть, без позиции — вне рынка (WAIT)."""
-    close = SYN_CLOSE if in_pos else tuple(x for x in SYN_CLOSE if x != "FLAT")
-    wait = SYN_WAIT + (("HOLD_FLAT",) if in_pos else ("FLAT", "HOLD_FLAT"))
-    return {"BUY": SYN_BUY, "SELL": SYN_SELL, "WAIT": wait, "CLOSE": close}
+    """Приказ шифровальщика: FLAT и «вне рынка» при позиции — закрыть, без позиции — WAIT. v5.4.2 (ревью): HOLD —
+    только при позиции: держать как есть с новыми уровнями, без добора («держать» больше не кодируется как BUY той же
+    стороны, после которого код добирал до максимума)."""
+    if in_pos:
+        return {"BUY": SYN_BUY, "SELL": SYN_SELL, "WAIT": SYN_WAIT + ("HOLD_FLAT",), "HOLD": SYN_HOLD,
+                "CLOSE": SYN_CLOSE + SYN_OUT}
+    close = tuple(x for x in SYN_CLOSE if x != "FLAT")
+    return {"BUY": SYN_BUY, "SELL": SYN_SELL, "WAIT": SYN_WAIT + SYN_OUT + ("FLAT", "HOLD_FLAT"), "CLOSE": close}
 
 
 async def pro_text(system: str, user: str, *, route: str = "pro",

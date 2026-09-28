@@ -124,12 +124,13 @@ def test_banned_catches_nudges_both_ways():
 
 def test_exec_order_allows_wait_as_decision():
     s, _ = MISSION["exec_order"]
-    assert '"do":"BUY|SELL|WAIT|CLOSE"' in pm.EXEC_SCHEMA and '"wait_for"' in pm.EXEC_SCHEMA
+    assert '"do":"BUY|SELL|WAIT|HOLD|CLOSE"' in pm.EXEC_SCHEMA and '"wait_for"' in pm.EXEC_SCHEMA
     assert '"invalidation":число|null' in pm.EXEC_SCHEMA, "при WAIT стопа нет"
     assert "wait_for" in pm.EXEC_RULE and "дежурный PRO вернётся" in pm.EXEC_RULE
     # v5.4.2: шифровальщик переводит вердикт как есть в обе стороны и сам решение не пересматривает
     assert "Переводи решение вердикта как есть" in pm.EXEC_RULE and "вердикт BUY/SELL" in pm.EXEC_RULE
     assert "трусост" not in pm.EXEC_RULE and "наугад" not in pm.EXEC_RULE
+    assert "«держать» — HOLD" in pm.EXEC_RULE and "без добора" in pm.EXEC_RULE, "держать ≠ добор до максимума"
     assert "при WAIT — null" in s and "после проверки у двери" in s and pm.EXEC_SCHEMA in s
     assert "флета нет" not in s.lower() and "немедленно и на максимум" not in s
 
@@ -168,8 +169,9 @@ def test_entry_check_blocks_and_schema():
     assert pm.ENTRY_SCHEMA in s and '"decision":"ВОЙТИ|ЖДАТЬ|ОТМЕНИТЬ"' in pm.ENTRY_SCHEMA
     for field in ('"entry"', '"entry_kind":"сейчас|откат|прорыв"|null', '"wait_minutes"', '"invalidation"', '"take"', '"council":true|false', '"note"'):
         assert field in pm.ENTRY_SCHEMA, field
-    assert "у самой двери" in s and "сверь приказ с живым рынком" in s and "три исхода равноправны" in s and "ОТМЕНИТЬ" in s
+    assert "у самой двери" in s and "сверь его с живым рынком" in s and "три исхода равноправны" in s and "ОТМЕНИТЬ" in s
     assert "анализ заново не пересобирай" in s and "не входить вслепую" not in s and "сомнение — ЖДАТЬ" not in s
+    assert "Совет уже решил войти" not in s and "приказ совета или дежурного PRO" in s, "решение могло прийти и от перепроверки"
     for piece in (f"ВРЕМЯ: {TIME}", "═══ СИТУАЦИЯ ═══", "Цена 285.4, позиция long 10 @279", "═══ ПРИКАЗ И ПЛАН", "BUY сейчас, стоп 281",
                   "═══ ХОД ЦЕНЫ", "285.0 → 285.4", "═══ ЖИВОЙ РЫНОК ═══", "плита на покупку", "═══ ПРОШЛЫЕ ОТВЕТЫ У ДВЕРИ", "14:20 ЖДАТЬ @285",
                   "не обязательство",

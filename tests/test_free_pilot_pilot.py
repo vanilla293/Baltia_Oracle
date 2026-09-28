@@ -147,7 +147,7 @@ async def settle_bg(p, n=200):
     ("   ", False, None, None),
     ("ВОЙТИ", False, None, None),
     ("бла-бла", False, None, None),
-    ("НЕ ПОКУПАТЬ, ЖДЁМ", False, None, None),
+    ("НЕ ПОКУПАТЬ, ЖДЁМ", False, None, "ЖДЁМ"),       # 5.4.2 ревью: «не X, Y» — решение во второй части
     ("НЕ ЗАКРЫВАТЬ", True, "long", None),
     ("КУПИТЬ или ЖДАТЬ", False, None, None),
     ("КУПИТЬ", True, None, None),

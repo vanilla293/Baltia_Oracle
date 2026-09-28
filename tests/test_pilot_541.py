@@ -290,9 +290,10 @@ def test_timeouts_entry_profit_from_config_guard_take_ten_triage_five(monkeypatc
     # v5.4.2: у двери и в мысли о прибыли срок — из конфига (PYTHIA_ENTRY_TIMEOUT_SEC / PYTHIA_PROFIT_TIMEOUT_SEC, живьём);
     # трос и тейк — 10 мин, триаж — 5 мин, как в 5.4.1
     assert ai_pilot.GUARD_TIMEOUT == 600.0 and ai_pilot.TAKE_TIMEOUT == 600.0
-    assert ai_pilot.ENTRY_TIMEOUT == float(config.PYTHIA_ENTRY_TIMEOUT_SEC) == ai_pilot.entry_timeout()
-    assert ai_pilot.PROFIT_TIMEOUT == float(config.PYTHIA_PROFIT_TIMEOUT_SEC) == ai_pilot.profit_timeout()
-    assert ai_pilot.DRIFT_FRAC == float(config.PYTHIA_ENTRY_DRIFT_PCT) / 100 == ai_pilot.drift_frac()
+    # живые значения (константы модуля — снимок конфига при импорте, их сверяет self-тест ai_pilot)
+    assert float(config.PYTHIA_ENTRY_TIMEOUT_SEC) == ai_pilot.entry_timeout()
+    assert float(config.PYTHIA_PROFIT_TIMEOUT_SEC) == ai_pilot.profit_timeout()
+    assert float(config.PYTHIA_ENTRY_DRIFT_PCT) / 100 == ai_pilot.drift_frac()
     monkeypatch.setattr(config, "PYTHIA_ENTRY_TIMEOUT_SEC", 1800)
     monkeypatch.setattr(config, "PYTHIA_PROFIT_TIMEOUT_SEC", 1500)
     assert ai_pilot.entry_timeout() == 1800.0 and ai_pilot.profit_timeout() == 1500.0

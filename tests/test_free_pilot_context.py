@@ -175,7 +175,7 @@ def test_memory_shows_what_waiting_gave_and_silence_is_not_wait():
     assert "(ответ модели не разобран — решения не было)" in acc
     assert "НЕТ_ОТВЕТА" not in acc and "PRO не ответил" not in acc and "таймаут" not in acc
     s, _ = explain.memory_prompt({"ticker": "SBER", "name": "Сбербанк"}, "тест", acc, "")
-    assert "что дали решения ждать — цена при ЖДАТЬ/WAIT/ЖДЁМ и куда она ушла после (в %), без оценки" in s
+    assert "что дали решения — вход, выход, отмена, ожидание, удержание: цена при решении и куда она ушла после" in s
     assert s.count("\n") < 12 and system_lines(s) <= 12
 
 
