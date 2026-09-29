@@ -2551,7 +2551,7 @@ async def s41_council_hold(sc: Scene) -> None:
     sc.p.deposit_override = None
     pos = await sc.open_position("long", inv=98.0, take=103.0)
     assert sc.p._sized_by_broker and pos["lots"] == 3, pos
-    pos["topup_left"] = 0                         # добор самого входа исчерпан
+    # ревью 5.4.2 (финал): остаток авто-добора самого входа (topup_left) не обнуляется руками — его снимает HOLD
     b.mx = {"buy": 4, "sell": 4}                  # биржа снова даёт лоты
     sc.p._mx = None
     sc.p._last_reanalyze_ts = time.time()         # тейк зовёт совет без очереди

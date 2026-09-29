@@ -142,6 +142,9 @@ PANIC_STOP_SWEEP_TICKS = 3     # ПАНИКА: отмена троса не по
                                # через список биржи и закрывать (виртуальный стоп/паника обязаны исполняться)
 ADOPT_STOP_PCT = 2.0           # принятая со счёта позиция без уровней: временный триггер N % от входа
 GUARDS_KEEP = 20               # сколько решений у троса помним
+# ревью 5.4.2 (финал): флаг «решения ИИ не было — страховка кода» в ответе троса/тейка — приватные ключи (ИИ свои поля
+# с такими именами не протаскивает: наследник вычищает их из ответа, strip_rule_keys); «rule» ИИ — его текст, не флаг
+RULE_KEY, RULE_DETAIL, RULE_RAW = "_rule", "_detail", "_raw"
 # ── РЫНОЧНЫЕ ЧАСЫ (воля владельца: «биржа закрыта — программа стопорится») ──
 OPEN_REVIEW_GRACE_SEC = 90.0   # перепроверка не раньше чем через N с после открытия (стакан наполнится)
 CLOSED_LONG_SEC = 1800.0       # закрыт дольше N с (ночь, выходной) → на открытии сразу перепроверка
@@ -215,6 +218,11 @@ FRAME = ("⚫ ИИ-пилот: реальные деньги на максиму
 BUY, SELL = trader_broker.BUY, trader_broker.SELL
 
 
+def strip_rule_keys(obj: dict) -> dict:
+    """Ответ ИИ у троса/тейка без приватных ключей флага кода (RULE_KEY/RULE_DETAIL/RULE_RAW): флаг ставит только код."""
+    return {k: v for k, v in obj.items() if k not in (RULE_KEY, RULE_DETAIL, RULE_RAW)}
+
+
 def _f(x, d=0.0):
     try:
         if isinstance(x, str):
@@ -281,6 +289,8 @@ class AIPilot:
         self._sized_by_broker = False          # размер последнего входа считала биржа
         self._close_pending: str | None = None # приказ CLOSE: закрыть ближайшим тиком
         self._prepared = False                 # prepare() отработал (позиция со счёта принята)
+        self._pending_hold: dict | None = None # ревью 5.4.2: HOLD до prepare() — {take, inv, ts}: уровни совета к позиции
+                                               # со счёта (_absorb_account); снимается в конце prepare() и любым приказом
         self._closed_ts = 0.0                  # когда сами закрыли/ужали позицию (лаг портфеля)
         self._adopt_seen: tuple | None = None  # что видели на прошлой сверке после закрытия
         self._guard_task = None                # мягкий стоп: ИИ у троса/тейка думает
@@ -623,6 +633,16 @@ class AIPilot:
             self.foreign_lots = qty0
             log.info("ИИ-пилот: ИЗОЛЯЦИЯ ручных лотов владельца %+d (%s)",
                      self.foreign_lots, self.base)
+        hold = self._pending_hold
+        self._pending_hold = None              # ревью 5.4.2: HOLD до подготовки живёт только до её конца
+        if hold and self.position:
+            # позиция не принята со счёта, а подхвачена из state-файла (рестарт): HOLD к ней — как обычно
+            self._adopt_hold({"invalidation": hold.get("inv"), "take": hold.get("take")})
+        elif hold:
+            # держать нечего (счёт пуст): дежурный PRO решит скоро, а не через плановые полчаса
+            self.review_ts = min(self.review_ts, time.time() + 300)
+            self.last_action = "приказ HOLD, а позиции на счёте нет — держать нечего; дежурный PRO решит через 5 мин"
+            log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
         if self._state_note and self.last_action != self._state_note:
             self.last_action = f"{self.last_action} · {self._state_note}"
         self.session_risk = trader_risk.SessionRisk(max(1.0, self.deposit))
@@ -680,6 +700,7 @@ class AIPilot:
             old_stop = pos.get("stop_id")      # её трос на бирже снимет restop новой позиции
                                                # (сирота-стоп иначе удвоил бы новую сторону)
             self.position = None
+            self._drop_topup_plan()            # ревью 5.4.2: план ДОБОРА к старой стороне — не вердикт переворота
         if self.position:                      # та же сторона, другой объём
             pos = self.position
             new = abs(real)
@@ -707,23 +728,68 @@ class AIPilot:
                "invalidation": None, "opened_ts": time.time(), "stop_id": old_stop, "floating": 0.0,
                "adopted": True}
         plan = self.plan
+        hold, self._pending_hold = self._pending_hold, None
+        hold_bad, hold_ok = "", ""
         if plan and plan.get("side") == side:  # приказ той же стороны: его уровни — уровни позиции
             self._set_levels(pos, plan.get("take"), plan.get("invalidation"))
+        elif hold:                             # ревью 5.4.2: HOLD пришёл до подготовки — уровни совета к этой позиции
+            hold_bad, hold_ok = self._hold_levels(pos, hold)
         if not _f(pos.get("invalidation")) and entry and entry > 0:
             # временный триггер, пока ИИ не назвал свои уровни; PRO позовём скоро
             inv = entry * (1 - ADOPT_STOP_PCT / 100 if side == "long" else 1 + ADOPT_STOP_PCT / 100)
             self._set_levels(pos, None, round(inv, 6))
             pos["levels_placeholder"] = True
             self.review_ts = min(self.review_ts, time.time() + 90)
+        if hold_bad:
+            # уровень HOLD не подошёл к стороне позиции — временный вместо него; причина — дежурному PRO в повод
+            self.review_ts = min(self.review_ts, time.time() + 90)
+            rr = f"уровни приказа HOLD к позиции со счёта {side} не приняты ({hold_bad}) — назови свои"
+            if hasattr(self, "_review_reason"):          # наследник (MissionPilot) копит поводы перепроверки
+                prev = getattr(self, "_review_reason", None)
+                self._review_reason = f"{prev}; {rr}" if prev and rr not in prev else (prev or rr)
         pos["restop"] = True
         self.position = pos
         self.state = "В_ПОЗИЦИИ"
         self._save_state()
         self._mx = None
         self.last_action = (f"ПРИНЯЛ позицию со счёта: {side} {abs(real)} лот @{pos['entry']:g} ({why})"
-                            + (", уровни временные — ждёт PRO" if pos.get("levels_placeholder") else ""))
+                            + (f", уровни приказа HOLD: {hold_ok}" if hold_ok else "")
+                            + (", уровни временные — ждёт PRO" if pos.get("levels_placeholder") else "")
+                            + (f" (HOLD не принят: {hold_bad})" if hold_bad else ""))
         log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
         return True
+
+    def _hold_levels(self, pos: dict, hold: dict) -> tuple[str, str]:
+        """Ревью 5.4.2: приказ HOLD пришёл до prepare() — его стоп/тейк к позиции, принятой со счёта. Сторону совет знал
+        по счёту, но цену при подготовке пилот ещё не видел: проверка — согласованность уровней для стороны позиции
+        (_plan_valid, как у HOLD в позиции), без вето по живой цене (пройденный стоп — триггер, вопрос у троса).
+        Не подошёл уровень — на его месте временный (стоп ADOPT_STOP_PCT от входа / тейка нет).
+        Возврат: (причина отказа или '', что принято или '')."""
+        side = pos["side"]
+        inv = _f(hold.get("inv")) if hold.get("inv") is not None else 0.0
+        take = _f(hold.get("take")) if hold.get("take") is not None else 0.0
+        inv = inv if inv > 0 else None
+        take = take if take > 0 else None
+        entry = _f(pos.get("entry"))
+        bad: list[str] = []
+        if inv is not None:
+            why = self._plan_valid(side, None, take, inv)
+            if why:
+                bad.append(f"стоп {inv:g} / тейк {take:g}: {why}" if take is not None else f"стоп {inv:g}: {why}")
+                inv = take = None
+        if inv is None and take is not None:
+            ph = entry * (1 - ADOPT_STOP_PCT / 100 if side == "long" else 1 + ADOPT_STOP_PCT / 100) if entry > 0 else 0.0
+            why = self._plan_valid(side, None, take, ph) if ph > 0 else "нет цены входа для временного стопа"
+            if why:
+                bad.append(f"тейк {take:g}: {why}")
+                take = None
+        ok = ", ".join(x for x in (f"стоп {inv:g}" if inv is not None else "",
+                                    f"тейк {take:g}" if take is not None else "") if x)
+        if ok:
+            self._set_levels(pos, take, inv)
+        if bad:
+            log.warning("ИИ-пилот %s: уровни HOLD к позиции со счёта не приняты: %s", self.base, "; ".join(bad))
+        return "; ".join(bad), ok
 
     def _soft_stop_on(self) -> bool:
         return bool(self.SOFT_STOP) and bool(_setting("PYTHIA_SOFT_STOP", True))
@@ -947,6 +1013,7 @@ class AIPilot:
     def adopt_forecast(self, forecast: dict | None) -> bool:
         """Свежий прогноз конвейера → боевой план. Возврат: план принят?"""
         self._reanalyzing = False
+        self._pending_hold = None              # ревью 5.4.2: HOLD до подготовки — только пока не пришёл новый приказ
         if self.session_risk and self.session_risk.locked:
             self.last_action = ("killswitch заблокирован — свежий приказ НЕ "
                                 "принят; сброс — новым торговым днём")
@@ -1070,15 +1137,33 @@ class AIPilot:
 
     def _adopt_hold(self, ex: dict) -> bool:
         """v5.4.2 (ревью): приказ HOLD — совет сказал «держать». Позиция как есть, БЕЗ добора: обновляются только
-        стоп/тейк (null — прежний уровень), стороны проверяются по позиции и цене (не с той стороны — приказ
-        отклонён, позиция не тронута); счётчики и сбросы — как у свежего вердикта той же стороны, но topup_left
-        HOLD не ставит (добор до максимума — только явный BUY/SELL той же стороны). Позиции нет — держать нечего."""
+        стоп/тейк (null — прежний уровень); счётчики и сбросы — как у свежего вердикта той же стороны, но topup_left
+        HOLD обнуляет (остаток авто-добора прошлого входа снят, заявка добора в полёте снимается ближайшим тиком):
+        добор до максимума — только явный BUY/SELL той же стороны. Позиции нет — держать нечего.
+        Ревью 5.4.2 (финал): проверка уровней — только согласованность стопа и тейка для стороны позиции (_plan_valid,
+        как у BUY/SELL той же стороны); живая цена приказ не отклоняет: стоп, который цена уже прошла, становится
+        триггером (ближайший тик спросит у троса), пройденный тейк — вопрос мягкого тейка. Стоп прежний (null или то же
+        число), а цена уже за ним — счётчик «ждать» у троса не сбрасывается (PYTHIA_SOFT_STOP_MAX_HOLDS ограничивает круг
+        «трос ждёт → совет HOLD → трос ждёт»). До prepare() уровни запоминаются (_pending_hold) и ложатся на позицию,
+        принятую со счёта (_absorb_account → _hold_levels)."""
         pos = self.position
         now = time.time()
+        inv = _f(ex.get("invalidation")) if ex.get("invalidation") not in (None, "", "null") else 0.0
+        take = _f(ex.get("take")) if ex.get("take") not in (None, "", "null") else 0.0
+        inv = inv if inv > 0 else None
+        take = take if take > 0 else None
         if not pos:
             if self.adopt_account and not self._prepared:
-                # приказ пришёл до prepare(): позицию со счёта приму при подготовке (уровни — временные, до PRO)
-                self.last_action = "приказ HOLD принят — позицию со счёта приму при подготовке, уровни назовёт дежурный PRO"
+                # приказ пришёл до prepare(): позицию со счёта приму при подготовке — с уровнями совета (стороны
+                # проверю по ней); не подошли — временные до дежурного PRO
+                self._pending_hold = {"take": take, "inv": inv, "ts": now}
+                self.plan = None
+                self._close_pending = None     # свежий приказ «держать» важнее старого CLOSE
+                lv = ", ".join(x for x in (f"стоп {inv:g}" if inv is not None else "",
+                                           f"тейк {take:g}" if take is not None else "") if x)
+                self.last_action = ("приказ HOLD принят — позицию со счёта приму при подготовке"
+                                    + (f", уровни совета ({lv}) — к ней после проверки сторон" if lv else
+                                       ", уровни назовёт дежурный PRO"))
                 log.info("ИИ-пилот %s: %s", self.base, self.last_action)
                 return True
             if not self.plan and not self.pending:
@@ -1088,26 +1173,19 @@ class AIPilot:
             log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
             return False
         side = pos["side"]
-        inv = _f(ex.get("invalidation")) if ex.get("invalidation") not in (None, "", "null") else 0.0
-        take = _f(ex.get("take")) if ex.get("take") not in (None, "", "null") else 0.0
-        inv = inv if inv > 0 else None
-        take = take if take > 0 else None
-        cur = self.prices[-1] if self.prices else 0.0
-        bad = None
-        if cur > 0 and inv is not None and ((side == "long" and inv >= cur) or (side == "short" and inv <= cur)):
-            bad = f"HOLD: стоп {inv:g} не с той стороны цены {cur:g} для {side}"
-        elif cur > 0 and take is not None and ((side == "long" and take <= cur) or (side == "short" and take >= cur)):
-            bad = f"HOLD: тейк {take:g} не с той стороны цены {cur:g} для {side}"
-        else:
-            inv_eff = inv if inv is not None else pos.get("invalidation")
-            take_eff = take if take is not None else pos.get("take")
-            if _f(inv_eff) > 0:
-                bad = self._plan_valid(side, None, take_eff, inv_eff)
+        inv_eff = inv if inv is not None else pos.get("invalidation")
+        take_eff = take if take is not None else pos.get("take")
+        bad = self._plan_valid(side, None, take_eff, inv_eff) if _f(inv_eff) > 0 else None
         if bad:
             self.last_action = f"приказ HOLD отклонён ({bad}) — позиция как есть, уровни прежние"
             self.review_ts = min(self.review_ts, now + 300)
             log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
             return False
+        cur = self.prices[-1] if self.prices else 0.0
+        old_inv = _f(pos.get("invalidation"))
+        # стоп прежний (null или то же число), а цена уже за ним: трос спрашивает (или спросит) — счётчик «ждать» живёт
+        past_stop = ((inv is None or abs(inv - old_inv) <= 1e-9) and cur > 0 and old_inv > 0
+                     and ((side == "long" and cur <= old_inv) or (side == "short" and cur >= old_inv)))
         self._close_pending = None             # свежий приказ «держать» важнее старого CLOSE
         locked = int(pos.get("take_holds") or 0) > 0 or bool(pos.get("profit_lock"))
         self._set_levels(pos, take, inv)       # None — прежний уровень
@@ -1117,15 +1195,26 @@ class AIPilot:
             pos.pop("profit_lock", None)       # стоп совета главнее запертой прибыли (как у вердикта той же стороны)
         elif locked:
             pos["profit_lock"] = True          # стоп прежний = запертая прибыль: трос не уходит за вход
-        pos["holds"] = 0
+        if not past_stop:
+            pos["holds"] = 0
         pos["take_holds"] = 0                  # новый приказ — счётчик «подержать» у тейка заново
         pos.pop("take_next", None)
+        pos["topup_left"] = 0                  # «держать» — не добор: остаток авто-добора прошлого входа снят
+        if self.pending and self.pending.get("topup"):
+            self._cancel_entry = True          # заявка добора в полёте — снять ближайшим тиком (частичка — в позицию)
         pos["hard_stop"] = self._hard_of(pos)
         self.plan = None                       # план добора / переворота снят: совет сказал держать как есть
         self._save_state()
+        crossed = ""
+        if cur > 0:
+            n_inv, n_take = _f(pos.get("invalidation")), _f(pos.get("take"))
+            if n_inv > 0 and ((side == "long" and cur <= n_inv) or (side == "short" and cur >= n_inv)):
+                crossed = f" — цена {cur:g} уже за стопом: ближайший тик спросит у троса"
+            elif n_take > 0 and ((side == "long" and cur >= n_take) or (side == "short" and cur <= n_take)):
+                crossed = f" — цена {cur:g} уже у тейка: ближайший тик спросит у тейка"
         self.last_action = (f"приказ HOLD: держу {side} {pos['lots']} лот как есть, без добора — стоп "
                             f"{pos['invalidation']}{'' if inv is not None else ' (прежний)'} / тейк "
-                            f"{pos['take']}{'' if take is not None else ' (прежний)'}")
+                            f"{pos['take']}{'' if take is not None else ' (прежний)'}" + crossed)
         log.info("ИИ-пилот %s: %s", self.base, self.last_action)
         return True
 
@@ -1483,11 +1572,17 @@ class AIPilot:
                                         "сейчас или подержать и передать Совету")
                     log.info("ИИ-пилот %s: %s", self.base, self.last_action)
                     self._guard_task = self._spawn_background(self._take_bg(price, pos))
-            # флип: свежий план в другую сторону → сначала закрыть
+            # флип: свежий план в другую сторону → сначала закрыть. Ревью 5.4.2: план ДОБОРА (src topup) к позиции
+            # другой стороны (владелец перевернул руками, пока план ждал) — не вердикт переворота: снимается
             if self.plan and self.plan["side"] != pos["side"]:
-                await self._close_all(price, "флип по новому вердикту",
-                                      reanalyze=False)
-                return
+                if self.plan.get("src") == "topup":
+                    log.info("ИИ-пилот %s: план добора %s к позиции %s — не переворот, снят",
+                             self.base, self.plan["side"], pos["side"])
+                    self.plan = None
+                else:
+                    await self._close_all(price, "флип по новому вердикту",
+                                          reanalyze=False)
+                    return
             if not pos.get("guard_busy") and not crossed:
                 self.state = "В_ПОЗИЦИИ"
                 self.last_action = (f"в позиции {pos['side']} {pos['lots']} лот "
@@ -2982,7 +3077,7 @@ class AIPilot:
             raise
         except Exception as e:                               # noqa: BLE001
             # v5.4.2 (ревью): молчание — не решение ИИ; выход по правилу остаётся страховкой, но пишется как действие кода
-            r = {"decision": "СЛИТЬ", "rule": "НЕТ_ОТВЕТА", "detail": str(e)[:80] or type(e).__name__}
+            r = {"decision": "СЛИТЬ", RULE_KEY: "НЕТ_ОТВЕТА", RULE_DETAIL: str(e)[:80] or type(e).__name__}
         finally:
             pos["guard_busy"] = False
         try:
@@ -2991,14 +3086,16 @@ class AIPilot:
             log.warning("ИИ-пилот %s: решение у троса не применилось: %s", self.base, str(e)[:120])
 
     def _rule_rec(self, rec: dict, r: dict, action: str) -> str:
-        """v5.4.2 (ревью): у троса/тейка решения ИИ не было (r["rule"]: НЕТ_ОТВЕТА — таймаут/сбой, НЕ_РАЗОБРАН — слово
+        """v5.4.2 (ревью): у троса/тейка решения ИИ не было (r[RULE_KEY]: НЕТ_ОТВЕТА — таймаут/сбой, НЕ_РАЗОБРАН — слово
         не разобрано) — страховка кода (action: СЛИТЬ / ЗАФИКСИРОВАТЬ) пишется как действие кода: decision = rule,
-        silent, source «код», сырой ответ; слова ИИ при непонятном ответе — в note. Возврат: «что случилось» для причины."""
+        silent, source «код», сырой ответ; слова ИИ при непонятном ответе — в note. Возврат: «что случилось» для причины.
+        Ревью 5.4.2 (финал): флаг кода — приватные ключи (RULE_KEY/RULE_DETAIL/RULE_RAW), а не «rule»/«detail»/«raw»:
+        поле «rule» в ответе ИИ («ЖДАТЬ» + своё правило) не превращает его решение в выход по правилу."""
         mm = self._money_name()
-        rule = str(r.get("rule") or "НЕТ_ОТВЕТА")
-        det = str(r.get("detail") or "")[:80]
+        rule = str(r.get(RULE_KEY) or "НЕТ_ОТВЕТА")
+        det = str(r.get(RULE_DETAIL) or "")[:80]
         what = (f"{mm} не ответил" if rule == "НЕТ_ОТВЕТА" else "ответ не разобран") + (f" ({det})" if det else "")
-        rec.update(decision=rule, silent=True, source="код", raw=(str(r.get("raw") or "")[:80] or None),
+        rec.update(decision=rule, silent=True, source="код", raw=(str(r.get(RULE_RAW) or "")[:80] or None),
                    why=f"{what} — ответа не было, выход по правилу", applied=f"по правилу: {action}",
                    note=str(r.get("why") or "")[:300])
         return what
@@ -3007,7 +3104,7 @@ class AIPilot:
         if self.position is not pos or not self.position:
             return                             # позиция уже закрыта/сменилась
         raw = str(r.get("decision") or "").upper().replace("Ё", "Е")
-        rule = bool(r.get("rule"))             # v5.4.2: решения ИИ не было — выход по правилу (запись кода)
+        rule = bool(r.get(RULE_KEY))           # v5.4.2: решения ИИ не было — выход по правилу (запись кода)
         hold = ("ЖД" in raw or "ДЕРЖ" in raw or "HOLD" in raw or "WAIT" in raw) and "СЛИ" not in raw and not rule
         why = str(r.get("why") or "")[:300]
         cur = self.prices[-1] if self.prices else price
@@ -3078,7 +3175,7 @@ class AIPilot:
             raise
         except Exception as e:                               # noqa: BLE001
             # v5.4.2 (ревью): молчание — не решение ИИ; фиксация по правилу — страховка кода, так и пишется
-            r = {"decision": "ЗАФИКСИРОВАТЬ", "rule": "НЕТ_ОТВЕТА", "detail": str(e)[:80] or type(e).__name__}
+            r = {"decision": "ЗАФИКСИРОВАТЬ", RULE_KEY: "НЕТ_ОТВЕТА", RULE_DETAIL: str(e)[:80] or type(e).__name__}
         finally:
             pos["guard_busy"] = False
             pos.pop("guard_side", None)
@@ -3094,7 +3191,7 @@ class AIPilot:
         if self.position is not pos or not self.position:
             return                             # позиция уже закрыта/сменилась
         raw = str(r.get("decision") or "").upper().replace("Ё", "Е")
-        rule = bool(r.get("rule"))             # v5.4.2: решения ИИ не было — фиксация по правилу (запись кода)
+        rule = bool(r.get(RULE_KEY))           # v5.4.2: решения ИИ не было — фиксация по правилу (запись кода)
         hold = (("ДЕРЖ" in raw or "ЖД" in raw or "HOLD" in raw or "WAIT" in raw)
                 and "ФИКС" not in raw and "ЗАКР" not in raw and "СЛИ" not in raw and not rule)
         why = str(r.get("why") or "")[:300]
@@ -3216,22 +3313,28 @@ class AIPilot:
                 "state_note": self._state_note,
                 "killswitch": sr, "frame": FRAME}
 
+    def _plan_gates(self, plan: dict | None) -> list[dict]:
+        """Проверки у двери по ЭТОМУ плану (plan_ts — план, о котором спросили). Ревью 5.4.2 (финал): ответ «не
+        применено» (план сменился или обновлён свежим решением, пока дверь думала) — про прежний план, не в счёт."""
+        if not plan:
+            return []
+        ts = plan.get("ts")
+        return [g for g in self.gates
+                if g.get("plan_ts") == ts and "не применено" not in str(g.get("applied") or "")]
+
     def _entry_gate_status(self) -> dict | None:
         """v5.4.1: {busy, next_in_s, decision, why, ts, entry, entry_kind} по текущему плану; плана нет → None."""
         plan = self.plan
         if not plan:
             return None
-        last = None
-        for g in reversed(self.gates):
-            if g.get("plan_ts") == plan.get("ts"):
-                last = g
-                break
+        mine = self._plan_gates(plan)
+        last = mine[-1] if mine else None
         after = _f(plan.get("gate_after"))
         return {"busy": bool(plan.get("gate_busy")),
                 "next_in_s": max(0, int(after - time.time())) if after > time.time() else None,
                 "decision": (last or {}).get("decision"), "why": (last or {}).get("why"),
                 "ts": (last or {}).get("ts"), "entry": plan.get("entry"), "entry_kind": plan.get("kind"),
-                "checks": sum(1 for g in self.gates if g.get("plan_ts") == plan.get("ts"))}
+                "checks": len(mine)}
 
     def _profit_status(self) -> dict | None:
         """v5.4.1: {busy, next_in_s, threshold_pct, progress_pct, gain_pct} по открытой позиции; нет → None."""
@@ -3844,11 +3947,46 @@ if __name__ == "__main__":
         assert len(pm.broker.placed) == n_pl and pm.pending is None and pm.position["lots"] == 17, "HOLD — не добор"
         assert pm.adopt_forecast({"exec": {"do": "HOLD", "take": None, "invalidation": None}})
         assert pm.position["invalidation"] == 89500.0 and pm.position["take"] == 96000.0 and "(прежний)" in pm.last_action
-        assert not pm.adopt_forecast({"exec": {"do": "HOLD", "invalidation": 90500.0}}), "стоп выше цены у лонга"
+        assert not pm.adopt_forecast({"exec": {"do": "HOLD", "invalidation": 96500.0}}), "стоп выше тейка 96000 у лонга"
         assert pm.position["invalidation"] == 89500.0 and "HOLD отклонён" in pm.last_action, pm.last_action
+        #     ревью 5.4.2 (финал): остаток авто-добора прошлого входа HOLD снимает, заявку добора в полёте — снимает тиком
+        pm.position["topup_left"] = 2
+        pm.pending = {"side": "long", "lots": 4, "price": 90010.0, "ts": time.time(), "attempts": 0, "topup": True,
+                      "take": 96000.0, "invalidation": 89500.0, "why": "добор до максимума"}
+        pm._cancel_entry = False
+        assert pm.adopt_forecast({"exec": {"do": "HOLD", "take": None, "invalidation": None}})
+        assert pm.position["topup_left"] == 0 and pm._cancel_entry, "HOLD — не добор: остаток и заявка добора сняты"
+        pm.pending, pm._cancel_entry = None, False
+        #     живая цена HOLD не отклоняет: стоп, который цена уже прошла (совет думал по 90000, цена 89400), — триггер
+        pm.prices.append(89400.0)
+        assert pm.adopt_forecast({"exec": {"do": "HOLD", "take": None, "invalidation": 89450.0}}), pm.last_action
+        assert pm.position["invalidation"] == 89450.0 and "уже за стопом" in pm.last_action, pm.last_action
+        await pm.tick(89400.0, BOOK)                  # базовый пилот: стоп есть стоп — закрыл по триггеру
+        assert pm.position is None and "аварийный стоп @89450" in pm.last_action, pm.last_action
         p_nh = mk()
         p_nh._prepared = True                        # до prepare() HOLD ждёт позицию со счёта — здесь её уже нет
         assert not p_nh.adopt_forecast({"exec": {"do": "HOLD", "invalidation": 89000.0}}) and "позиции уже нет" in p_nh.last_action
+        #     HOLD до prepare(): уровни совета — к позиции со счёта после проверки сторон (не временные 2 %)
+        p_h = mk()
+        assert p_h.adopt_forecast({"exec": {"do": "HOLD", "take": 95000.0, "invalidation": 89000.0}}) and p_h._pending_hold
+        assert p_h._absorb_account(3, 90000.0, None, "на счёте при старте") and p_h._pending_hold is None
+        assert p_h.position["invalidation"] == 89000.0 and p_h.position["take"] == 95000.0, p_h.position
+        assert not p_h.position.get("levels_placeholder") and "уровни приказа HOLD: стоп 89000, тейк 95000" in p_h.last_action
+        #     …не та сторона (на счёте шорт, уровни лонга) — временный стоп и без тейка, причина в last_action
+        p_h2 = mk()
+        assert p_h2.adopt_forecast({"exec": {"do": "HOLD", "take": 95000.0, "invalidation": 89000.0}})
+        assert p_h2._absorb_account(-3, 90000.0, None, "на счёте при старте")
+        assert p_h2.position["levels_placeholder"] and p_h2.position["take"] is None, p_h2.position
+        assert abs(p_h2.position["invalidation"] - 90000 * (1 + ADOPT_STOP_PCT / 100)) < 1e-6 and "HOLD не принят" in p_h2.last_action
+        #     …только тейк: временный стоп, тейк совета
+        p_h3 = mk()
+        assert p_h3.adopt_forecast({"exec": {"do": "HOLD", "take": 95000.0, "invalidation": None}})
+        assert p_h3._absorb_account(3, 90000.0, None, "на счёте при старте")
+        assert p_h3.position["take"] == 95000.0 and p_h3.position["levels_placeholder"], p_h3.position
+        #     …новый приказ до подготовки снимает HOLD: уровни — его
+        p_h4 = mk()
+        assert p_h4.adopt_forecast({"exec": {"do": "HOLD", "take": 95000.0, "invalidation": 89000.0}})
+        assert p_h4.adopt_forecast({"exec": {"do": "CLOSE"}}) and p_h4._pending_hold is None
         #     ограничение владельца (deposit при запуске) режет сверху даже число биржи
         pcap = mk(); pcap.broker = MaxBroker(); pcap.deposit_override = 30000.0
         pcap.adopt_forecast(ex("BUY", inv=89000.0))
@@ -4010,6 +4148,30 @@ if __name__ == "__main__":
         pos = ps.position; pos["holds"] = 3
         await ps.tick(88900.0, BOOK)
         assert ps.position is None and "предел" in ps.last_action
+        #     ревью 5.4.2 (финал): круг «трос ждёт → совет HOLD со стопом прежним → трос ждёт» не обходит предел: цена
+        #     уже за стопом — HOLD без нового стопа счётчик «ждать» не сбрасывает
+        fresh(ps)
+        ps.adopt_forecast(ex("BUY", take=95000.0, inv=89000.0)); await ps.tick(90000.0, BOOK); await ps.tick(90000.0, BOOK)
+        pos = ps.position
+        SoftPilot.answers[:] = [{"decision": "ЖДАТЬ", "why": "терпим"}]
+        await ps.tick(88900.0, BOOK); await settle_guard(ps)
+        assert ps.position is pos and pos["holds"] == 1, pos
+        assert ps.adopt_forecast({"exec": {"do": "HOLD", "take": None, "invalidation": None}}) and pos["holds"] == 1, pos
+        pos["holds"] = 3
+        assert ps.adopt_forecast({"exec": {"do": "HOLD", "take": None, "invalidation": None}}) and pos["holds"] == 3
+        await ps.tick(88900.0, BOOK)
+        assert ps.position is None and "предел" in ps.last_action, ps.last_action
+        #     ревью 5.4.2 (финал): поле «rule» в ответе ИИ — его текст, не флаг кода: «ЖДАТЬ» + своё правило — ждать
+        fresh(ps)
+        ps.adopt_forecast(ex("BUY", take=95000.0, inv=89000.0)); await ps.tick(90000.0, BOOK); await ps.tick(90000.0, BOOK)
+        pos = ps.position
+        SoftPilot.answers[:] = [{"decision": "ЖДАТЬ", "why": "вынос стопов", "rule": "держу, пока 88500 не пробит",
+                                 "detail": "лента", "raw": "ЖДАТЬ"}]
+        await ps.tick(88900.0, BOOK); await settle_guard(ps)
+        assert ps.position is pos and pos["holds"] == 1 and ps.guards[-1]["decision"] == "ЖДАТЬ" \
+            and ps.guards[-1]["source"] == "ИИ", (ps.last_action, ps.guards[-1])
+        await ps.tick(hard - 5.0, BOOK)             # за аварийным тросом — закрыть (сцена чистая для следующего блока)
+        assert ps.position is None
         #     мягкий стоп выключен конфигом → жёсткий стоп, трос на самом стопе
         _saved = _setting("PYTHIA_SOFT_STOP", True)
         try:
@@ -4442,9 +4604,12 @@ if __name__ == "__main__":
         assert abs(pw.review_ts - time.time() - w_sec) < 5, pw.review_ts - time.time()
         assert pw.adopt_forecast(ex("BUY", inv=89000.0)) and pw._review_gap() == REVIEW_SEC, "не WAIT — шаг прежний"
         #     v5.4.2: сроки у двери / в мысли о прибыли и допуск дрейфа — из конфига живьём; подмена константы главнее
-        assert entry_timeout() == float(_setting("PYTHIA_ENTRY_TIMEOUT_SEC", 1200)) == ENTRY_TIMEOUT
-        assert profit_timeout() == float(_setting("PYTHIA_PROFIT_TIMEOUT_SEC", 1200)) == PROFIT_TIMEOUT
-        assert abs(drift_frac() - float(_setting("PYTHIA_ENTRY_DRIFT_PCT", 1.0)) / 100) < 1e-12
+        #     (сравнение — с закреплёнными умолчаниями конфига, не со снимком модуля: окружение владельца, например
+        #     PYTHIA_ENTRY_TIMEOUT_SEC=1800, попало в снимок при импорте, а живое значение — закреплённое, ревью 5.4.2)
+        _pin = _cfg0.FREE_PILOT_DEFAULTS
+        assert entry_timeout() == float(_setting("PYTHIA_ENTRY_TIMEOUT_SEC", 0)) == float(_pin["PYTHIA_ENTRY_TIMEOUT_SEC"])
+        assert profit_timeout() == float(_setting("PYTHIA_PROFIT_TIMEOUT_SEC", 0)) == float(_pin["PYTHIA_PROFIT_TIMEOUT_SEC"])
+        assert abs(drift_frac() - float(_pin["PYTHIA_ENTRY_DRIFT_PCT"]) / 100) < 1e-12
         _saved_et = globals()["ENTRY_TIMEOUT"]
         globals()["ENTRY_TIMEOUT"] = 0.3
         try:
