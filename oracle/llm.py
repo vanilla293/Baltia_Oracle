@@ -157,13 +157,29 @@ class LLM:
         self._client = client
         self._own_client = client is None
         self.usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
+        self._key_idx = 0           # какой из cfg.api_keys сейчас в работе
+
+    @property
+    def api_key(self) -> str:
+        keys = self.cfg.api_keys
+        return keys[self._key_idx % len(keys)] if keys else ""
+
+    def _next_key(self, e: "LLMError", tried: int) -> bool:
+        """Ключ не принят или на нём кончились деньги — перейти на запасной (если он есть и ещё не пробовали)."""
+        keys = self.cfg.api_keys
+        if e.status not in (401, 402) or len(keys) < 2 or tried >= len(keys) - 1:
+            return False
+        was = self._key_idx % len(keys)
+        self._key_idx = (was + 1) % len(keys)
+        log.warning("ключ модели №%d не работает (%s) — перехожу на запасной №%d",
+                    was + 1, e.status, self._key_idx + 1)
+        return True
 
     async def _http(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
                 base_url=self.cfg.llm_base_url,
-                headers={"Authorization": f"Bearer {self.cfg.llm_api_key}",
-                         "Content-Type": "application/json"},
+                headers={"Content-Type": "application/json"},
                 # read — между байтами; DeepSeek шлёт keep-alive, общий срок держит wait_for
                 timeout=httpx.Timeout(connect=20.0, read=max(self.cfg.llm_deep_timeout, 120.0),
                                       write=60.0, pool=60.0))
@@ -223,11 +239,15 @@ class LLM:
         limit = timeout or (self.cfg.llm_deep_timeout if deep else self.cfg.llm_fast_timeout)
         last: LLMError | None = None
         fell_back = False
+        keys_tried = 0
         for attempt in range(1, self.RETRIES + 1):
             try:
                 resp = await asyncio.wait_for(self._post(payload), timeout=limit)
             except LLMError as e:
                 last = e
+                if self._next_key(e, keys_tried):     # запасной ключ — сразу, без паузы
+                    keys_tried += 1
+                    continue
                 # глубокая модель недоступна (сняли с API) — один раз уходим на быструю
                 if e.kind == "model" and deep and not fell_back \
                         and payload["model"] != self.cfg.llm_model:
@@ -283,7 +303,8 @@ class LLM:
     async def _post(self, payload: dict) -> LLMResponse:
         http = await self._http()
         try:
-            r = await http.post("/chat/completions", json=payload)
+            r = await http.post("/chat/completions", json=payload,
+                                headers={"Authorization": f"Bearer {self.api_key}"})
         except httpx.TimeoutException:
             raise
         except httpx.TransportError:

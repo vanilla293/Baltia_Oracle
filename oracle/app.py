@@ -50,7 +50,9 @@ class RedactingFormatter(logging.Formatter):
 
 def _secrets(cfg: Any) -> tuple[str, ...]:
     names = ("bot_token", "llm_api_key", "groq_api_key", "openai_api_key", "tg_api_hash")
-    return tuple(str(getattr(cfg, n, "") or "") for n in names if getattr(cfg, n, ""))
+    out = [str(getattr(cfg, n, "") or "") for n in names if getattr(cfg, n, "")]
+    out += [k for k in getattr(cfg, "api_keys", ()) if k and k not in out]     # запасные ключи — тоже
+    return tuple(out)
 
 
 def setup_logging(level: str, secrets: tuple[str, ...] = ()) -> None:

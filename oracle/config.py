@@ -183,6 +183,7 @@ class Settings:
 
     # LLM (OpenAI-совместимый API; по умолчанию DeepSeek)
     llm_api_key: str = ""
+    llm_api_keys: tuple[str, ...] = ()        # запасные ключи: DEEPSEEK_API_KEY=ключ1,ключ2
     llm_base_url: str = "https://api.deepseek.com"
     llm_model: str = "deepseek-flash"          # быстрый режим: обычный диалог и инструменты
     llm_model_deep: str = "deepseek-flash"     # глубокий режим: с размышлением
@@ -270,6 +271,11 @@ class Settings:
         return float(budget if budget and budget > 0 else 1.5 * limit)
 
     @property
+    def api_keys(self) -> tuple[str, ...]:
+        """Все ключи модели по порядку: основной первым, дальше запасные."""
+        return self.llm_api_keys or ((self.llm_api_key,) if self.llm_api_key else ())
+
+    @property
     def is_deepseek(self) -> bool:
         return "deepseek" in self.llm_base_url.lower()
 
@@ -315,6 +321,9 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
     base_url = _get("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/")
     ds_key, other_key = _get("DEEPSEEK_API_KEY"), _get("LLM_API_KEY")
     api_key = (ds_key or other_key) if "deepseek" in base_url.lower() else (other_key or ds_key)
+    # несколько ключей через запятую: основной + запасные (кончились деньги / отозван — берём следующий)
+    api_keys = tuple(dict.fromkeys(k.strip() for k in re.split(r"[,;\s]+", api_key) if k.strip()))
+    api_key = api_keys[0] if api_keys else ""
 
     warnings: list[str] = []
     raw_fast = _get("LLM_FAST_THINKING", "off")
@@ -338,6 +347,7 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
         owner_name=_get("OWNER_NAME", ""),
         owner_gender=_gender(_get("OWNER_GENDER", "m")),
         llm_api_key=api_key,
+        llm_api_keys=api_keys,
         llm_base_url=base_url,
         llm_model=_get("LLM_MODEL", "deepseek-flash"),
         llm_model_deep=_get("LLM_MODEL_DEEP", _get("LLM_MODEL", "deepseek-flash")),

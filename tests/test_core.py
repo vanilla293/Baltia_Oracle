@@ -248,3 +248,46 @@ def test_config_telegram_api_url_and_env_file(tmp_path, monkeypatch):
     assert c.bot_name == "Тестовый" and c.telegram_api_url == "http://127.0.0.1:8081"
     for k in ("BOT_NAME", "TELEGRAM_API_URL"):
         monkeypatch.delenv(k, raising=False)
+
+
+def test_config_several_deepseek_keys(tmp_path, monkeypatch):
+    from oracle import config
+    env = tmp_path / "k.env"
+    env.write_text("DEEPSEEK_API_KEY=sk-one, sk-two\n", encoding="utf-8")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    c = config.load(env)
+    assert c.llm_api_key == "sk-one" and c.api_keys == ("sk-one", "sk-two")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+
+async def test_llm_switches_to_spare_key_on_402(cfg):
+    from dataclasses import replace
+    c = replace(cfg, llm_api_key="sk-one", llm_api_keys=("sk-one", "sk-two"))
+    seen = []
+
+    def h(req):
+        key = req.headers["Authorization"].split()[-1]
+        seen.append(key)
+        if key == "sk-one":
+            return httpx.Response(402, json={"error": {"message": "Insufficient Balance"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+    llm = _mock_llm(c, h)
+    r = await llm.complete([{"role": "user", "content": "x"}])
+    assert r.content == "ok" and seen == ["sk-one", "sk-two"]
+    await llm.complete([{"role": "user", "content": "y"}])       # дальше — сразу запасной
+    assert seen[-1] == "sk-two" and len(seen) == 3
+
+
+async def test_llm_all_keys_dead_is_fatal(cfg):
+    from dataclasses import replace
+    c = replace(cfg, llm_api_key="sk-one", llm_api_keys=("sk-one", "sk-two"))
+    seen = []
+
+    def h(req):
+        seen.append(req.headers["Authorization"].split()[-1])
+        return httpx.Response(401, json={"error": {"message": "bad key"}})
+    with pytest.raises(LLMError) as ei:
+        await _mock_llm(c, h).complete([{"role": "user", "content": "x"}])
+    assert ei.value.fatal and seen == ["sk-one", "sk-two"]
