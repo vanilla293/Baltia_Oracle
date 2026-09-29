@@ -206,9 +206,9 @@ def wait_review_sec() -> float:
     """Приказ совета WAIT без позиции и плана: через сколько секунд дежурный PRO смотрит заново
     (PYTHIA_WAIT_REVIEW_SEC, живьём; не дольше плановой REVIEW_SEC)."""
     try:
-        sec = float(_setting("PYTHIA_WAIT_REVIEW_SEC", 900))
+        sec = float(_setting("PYTHIA_WAIT_REVIEW_SEC", 1800))
     except (TypeError, ValueError):
-        sec = 900.0
+        sec = 1800.0
     return max(1.0, min(sec, REVIEW_SEC))
 
 FRAME = ("⚫ ИИ-пилот: реальные деньги на максимум по решению ИИ — личный тест "
@@ -1033,8 +1033,9 @@ class AIPilot:
             now = time.time()
             if not self.position:
                 self.state = "ЖДУ_ПЛАН"
-                # v5.4.2: вне рынка по WAIT дежурный PRO смотрит заново через PYTHIA_WAIT_REVIEW_SEC (15 мин), а не спит
-                # PYTHIA_REVIEW_SEC вслепую; перепроверку, которую уже подтянули раньше (повод, событие), не отодвигаем
+                # v5.4.2: вне рынка по WAIT дежурный PRO смотрит заново через PYTHIA_WAIT_REVIEW_SEC (умолчание 30 мин —
+                # базовый ритм; раньше будят триггеры: уровни WAIT, прокол, поводы, события); перепроверку, которую уже
+                # подтянули раньше (повод, событие), не отодвигаем
                 wait_sec = wait_review_sec()
                 self.review_ts = min(self.review_ts, now + wait_sec) if self.review_ts > now else now + wait_sec
                 self._wait_order = True
@@ -1707,7 +1708,7 @@ class AIPilot:
 
     def _review_gap(self) -> float:
         """Шаг плановой перепроверки: REVIEW_SEC; v5.4.2 — последний приказ совета WAIT, а позиции, плана и заявки
-        нет: не реже PYTHIA_WAIT_REVIEW_SEC (вне рынка PRO смотрит заново, а не спит полчаса вслепую)."""
+        нет: не реже PYTHIA_WAIT_REVIEW_SEC (умолчание = REVIEW_SEC, 30 мин; вне рынка PRO будят и триггеры)."""
         if getattr(self, "_wait_order", False) and not (self.position or self.plan or self.pending):
             return wait_review_sec()
         return REVIEW_SEC

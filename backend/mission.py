@@ -1332,7 +1332,7 @@ class MissionPilot(ai_pilot.AIPilot):
             st = self._wait_st = {"exec_ts": m.exec_ts, "ref": float(price), "fired": {}}
         if self.state == "СТОП" or self._reanalyzing or not self._market_alive() or self._market_closed():
             return
-        per = float(getattr(config, "PYTHIA_WAIT_REVIEW_SEC", 900))
+        per = float(getattr(config, "PYTHIA_WAIT_REVIEW_SEC", 1800))
         if per > 0 and not self._review_busy:
             due = max(self._last_review_ts, self._review_started_ts, _f(m.exec_ts, 0.0),
                       _f(getattr(self, "started_ts", 0.0), 0.0)) + per

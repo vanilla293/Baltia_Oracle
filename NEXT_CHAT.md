@@ -32,10 +32,11 @@ Tinkoff не было.
 шансы; приказ `HOLD` (держать без добора). `ai_v5`: `decision_raw/decision_of` + словари узлов, `money_json(
 attempt_timeout)`. `config` 5.4.2: `PYTHIA_ENTRY_TIMEOUT_SEC` 1200, `PYTHIA_PROFIT_TIMEOUT_SEC` 1200,
 `PYTHIA_SILENT_RETRY_SEC` 120, `PYTHIA_ENTRY_SILENT_MAX` 2 (только предупреждение), `PYTHIA_ENTRY_FRESH_SEC` 1200,
-`PYTHIA_ENTRY_DRIFT_PCT` 1.0, `PYTHIA_WAIT_REVIEW_SEC` 900, `PYTHIA_COUNCIL_MAX_SEC` 7200, `pin_free_pilot_defaults`.
+`PYTHIA_ENTRY_DRIFT_PCT` 1.0, `PYTHIA_WAIT_REVIEW_SEC` 1800, `PYTHIA_COUNCIL_MAX_SEC` 7200, `pin_free_pilot_defaults`.
 `mission`/`ai_pilot`: «НЕТ_ОТВЕТА»/«НЕ_РАЗОБРАН»/«ВНЕ_РЕЖИМА» вместо чужих решений, скорый повтор; план с `src`/снимком —
 свежее решение не от совета без двери; дрейф — новый вопрос; одобрение ВОЙТИ помнится; лотов 0 — честная причина;
-WAIT-наблюдатель уровней и ритм 15 мин; прокол «вне рынка»; поводы без плана → PRO через `EVENT_MIN_GAP_SEC`; первый
+WAIT-наблюдатель уровней, базовый ритм 30 мин (29.09 владелец: «в базе каждые 30 мин, но будут триггеры, которые его
+будят» — `PYTHIA_WAIT_REVIEW_SEC` 900 → 1800); прокол «вне рынка»; поводы без плана → PRO через `EVENT_MIN_GAP_SEC`; первый
 совет без приказа → пилот без плана; совет по поводу с потолком; НОВЫЙ_АНАЛИЗ в окне — отложен; переворот в тишине —
 выход; killswitch по сделке; пробой не мёртв до касания уровня. Совет/толмач/чат: возраст совета в промптах, стороны
 пиков терпимо, память — итог всех решений, чат рендерит WAIT и молчание честно. Панель: молчание серым «решения не было».
