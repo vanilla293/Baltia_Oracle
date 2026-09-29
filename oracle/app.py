@@ -32,6 +32,7 @@ TELEGRAM_RETRY_MAX = 60.0         # пауза между попытками д�
 USERBOT_RETRY_FIRST = 30.0        # userbot без связи: первая повторная попытка
 USERBOT_RETRY_MAX = 900.0         # …и дальше не реже раза в 15 минут
 INFLIGHT_WAIT = 12.0              # остановка: сколько ждать ответы в работе (весь бюджет — 30 с)
+RESTART_NOTE_WAIT = 5.0           # …и сколько — отправку «повтори сообщение» (Telegram может лежать)
 RESTART_NOTE = ("⚠️ Перезапускаюсь — не успел закончить ответ на последнее сообщение. "
                 "Повтори его, пожалуйста.")
 
@@ -126,8 +127,10 @@ async def whoami(bot: Any, *, first_delay: float = 2.0, max_delay: float = TELEG
 
 async def keep_userbot(userbot: Any, *, first_delay: float = USERBOT_RETRY_FIRST,
                        max_delay: float = USERBOT_RETRY_MAX) -> None:
-    """Подключать userbot в фоне, пока не выйдет. Нет связи — повтор с растущей паузой; нет входа или
-    ключей — повтор не поможет, выходим (причина — в userbot.last_error, её показывает /status)."""
+    """Подключать userbot в фоне и держать подключённым. Нет связи — повтор с растущей паузой; нет входа
+    или ключей — повтор не поможет, выходим (причина — в userbot.last_error, её показывает /status).
+    Подключился — ждём, не потеряет ли Telethon связь насовсем (сам он переподключается лишь несколько
+    раз и сдаётся): потерял — ready=False, «network: …» в /status и снова подключаемся."""
     delay = first_delay
     while True:
         try:
@@ -138,7 +141,23 @@ async def keep_userbot(userbot: Any, *, first_delay: float = USERBOT_RETRY_FIRST
             log.exception("userbot не стартовал")
             userbot.last_error = f"error: {type(e).__name__}"
             return
-        if userbot.ready or not str(getattr(userbot, "last_error", "") or "").startswith("network"):
+        if userbot.ready:
+            watch = getattr(userbot, "wait_disconnected", None)
+            if watch is None:
+                return
+            delay = first_delay
+            try:
+                await watch()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("userbot: ожидание обрыва связи", exc_info=True)
+            if getattr(userbot, "stopped", False):
+                return
+            log.warning("userbot: Telethon потерял связь с Telegram — переподключусь через %.0f с", delay)
+            await asyncio.sleep(delay)
+            continue
+        if not str(getattr(userbot, "last_error", "") or "").startswith("network"):
             return
         log.info("userbot: нет связи с Telegram — попробую снова через %.0f с", delay)
         await asyncio.sleep(delay)
@@ -160,8 +179,13 @@ async def finish_inflight(tasks: list, notifier: Any, timeout: float = INFLIGHT_
         t.cancel()
     await asyncio.wait(still, timeout=2.0)
     log.warning("остановка: %d ответов не успели — прерваны", len(still))
-    if notifier is not None:
-        await notifier.send(RESTART_NOTE)
+    if notifier is not None:            # не дольше RESTART_NOTE_WAIT: весь бюджет остановки — 30 с
+        try:
+            await asyncio.wait_for(notifier.send(RESTART_NOTE), RESTART_NOTE_WAIT)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("остановка: не сказал владельцу повторить сообщение: %r", e)
 
 
 async def _quietly(what: str, aw: Awaitable[Any] | None) -> None:

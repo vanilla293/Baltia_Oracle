@@ -30,7 +30,8 @@ log = logging.getLogger("oracle.tools.birthdays")
 MAX_REMIND_DAYS = 60
 GRACE_DAYS = 1                  # не поздравили в сам день — догоняем столько дней спустя
 NAG_EVERY_MIN = 60              # «Поздравить…» долбит раз в час…
-NAG_UNTIL = time(22, 0)         # …но не позже 22:00
+NAG_FROM = time(9, 0)           # …не раньше 9 утра (проверка в полночь не будит)…
+NAG_UNTIL = time(22, 0)         # …и не позже 22:00 — последний нажим и «сдаюсь» тоже
 NAG_MAX = 12
 
 # ── разбор даты ──────────────────────────────────────────────────────────────
@@ -536,7 +537,8 @@ async def _greeting_for(ctx: ToolContext, b: dict, bd: date, *, belated: bool) -
 
 async def start_nag(ctx: ToolContext, b: dict) -> int | None:
     """«Поздравить с днём рождения: …» — напоминание с долбёжкой раз в час, с первым срабатыванием через
-    час и до 22:00, пока не отметит «Готово» (или не отправит поздравление кнопкой). Уже стоит — не дублируем.
+    час (но не раньше NAG_FROM), пока не отметит «Готово» (или не отправит поздравление кнопкой); всё,
+    включая «сдаюсь» после последнего нажима, — не позже NAG_UNTIL. Уже стоит — не дублируем.
     Не вышло — не беда (поздравление уже ушло): пишем в лог. → id напоминания или None."""
     try:
         if await ctx.db.scalar("SELECT 1 FROM reminders WHERE ref_type='birthday' AND ref_id=? "
@@ -544,12 +546,14 @@ async def start_nag(ctx: ToolContext, b: dict) -> int | None:
             return None
         from . import reminders as rem
         now = ctx.now_local().replace(second=0, microsecond=0)
+        step = timedelta(minutes=NAG_EVERY_MIN)
         until = datetime.combine(now.date(), NAG_UNTIL, tzinfo=ctx.tz)
-        first = now + timedelta(minutes=NAG_EVERY_MIN)
-        late = first > until
+        first = max(now + step, datetime.combine(now.date(), NAG_FROM, tzinfo=ctx.tz))
+        # срабатывание в first, нажимы — first + k·step (k = 1…n), «сдаюсь» — first + (n+1)·step ≤ until
+        n = min(NAG_MAX, int((until - first) / step) - 1)
+        late = n < 1
         if late:                    # поздно вечером — один раз, скоро, и без долбёжки на ночь глядя
-            first = now + timedelta(minutes=15)
-        n = max(1, min(NAG_MAX, int((until - first) / timedelta(minutes=NAG_EVERY_MIN))))
+            first, n = now + timedelta(minutes=15), 1
         row = await rem.create_reminder(ctx, text=f"Поздравить с днём рождения: {_who(b)}", when=first,
                                         kind="reminder", nag=not late, nag_interval_min=NAG_EVERY_MIN, nag_max=n,
                                         ref_type="birthday", ref_id=int(b["id"]))
@@ -622,7 +626,11 @@ async def _mark_known(ctx: ToolContext, bid: int, today: date, *, date_told: boo
 
 
 def _add_note(bid: int, left: int) -> str:
-    """Что модели сделать после сохранения: поздравление — только если ДР сегодня/завтра."""
+    """Что модели сделать после сохранения: поздравление — только если ДР сегодня/завтра или был вчера
+    (left — дни до ДР, о котором сейчас речь: current_birthday, как и в _mark_known)."""
+    if left < 0:        # отдельного «вчера был ДР» не будет (_mark_known) — поздравление нужно сейчас
+        return (f"ДР был вчера — вызови birthday_greeting(id={bid}, style=\"запоздалое: ДР был вчера\") "
+                "и отдай текст поздравления как есть: лучше поздно.")
     if left <= 1:
         tail = " До вечера буду долбить его «поздравить», пока не отметит." if left == 0 else ""
         return (f"ДР {'сегодня' if left == 0 else 'завтра'} — вызови birthday_greeting(id={bid}) "
@@ -636,7 +644,7 @@ def _add_note(bid: int, left: int) -> str:
       "год — если известен (тогда посчитаю, сколько исполнится). Тот же человек с той же датой — запись "
       "обновится, а не задвоится. Накануне (remind_days_before) предупрежу, в сам день пришлю поздравление "
       "с кнопками «Другой вариант»/«Отправить» и буду долбить «поздравить», пока не отметит. Сейчас "
-      "поздравление не пиши, если он не просит и ДР не сегодня/завтра — тогда вызови birthday_greeting(id).",
+      "поздравление не пиши, если он не просит и ДР не сегодня/завтра/вчера — тогда вызови birthday_greeting(id).",
       {"name": {"type": "string", "description": "как владелец зовёт человека: «Маша», «мама», «Иван Петров»"},
        "date": {"type": "string", "description": "дата рождения: «14.03», «14.03.1990», «1990-03-14», «14 марта»"},
        "relation": {"type": "string", "description": "кем приходится: друг, мама, коллега, сестра…"},
@@ -677,7 +685,8 @@ async def t_add_birthday(ctx: ToolContext, *, name: str, date: str, relation: st
     await _mark_known(ctx, bid, today)
     b = await get_birthday(db, bid)
     pub = _public(b, today)
-    out = {"ok": True, **pub, "updated": updated, "note": _add_note(bid, pub["days_left"])}
+    left = (current_birthday(month, day, today) - today).days      # вчерашний ДР — ещё «текущий»
+    out = {"ok": True, **pub, "updated": updated, "note": _add_note(bid, left)}
     others = [r for r in await db.fetchall("SELECT id, name, month, day FROM birthdays WHERE id!=?", (bid,))
               if normalize_text(r["name"]) == normalize_text(nm)]
     if others:

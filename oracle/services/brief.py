@@ -117,28 +117,39 @@ async def _events(ctx: ToolContext, s: datetime, e: datetime) -> list[dict]:
     return out
 
 
-def _first_in(r: dict, s: datetime, e: datetime, fallback: ZoneInfo) -> datetime | None:
-    """Первое срабатывание напоминания в окне [s, e) (UTC) или None. У повторяющегося next_at —
-    только ближайшее срабатывание, а окно может быть и послезавтра — там раскрываем правило."""
-    cands = []
+REMINDER_TIMES_MAX = 62          # срабатываний одного напоминания в повестке (два раза в день на месяц)
+REMINDERS_MAX = 200             # и всех вместе
+
+
+def _times_in(r: dict, s: datetime, e: datetime, fallback: ZoneInfo) -> list[datetime]:
+    """Все срабатывания напоминания в окне [s, e) (UTC), по порядку. У повторяющегося next_at — только
+    ближайшее срабатывание, а окно может быть и на неделю — дальше раскрываем правило. Раньше next_at
+    не показываем: там мог быть пропуск (only_next)."""
+    out: set[datetime] = set()
     snz = timeutil.from_iso(r.get("snooze_at"))
     if snz is not None and s <= snz < e:
-        cands.append(snz)
+        out.add(snz)
     nxt = timeutil.from_iso(r.get("next_at"))
+    cursor: datetime | None = None
     if nxt is not None:
         if s <= nxt < e:
-            cands.append(nxt)
-        elif r.get("rrule") and nxt < s:     # раньше next_at не сработает (мог быть пропуск only_next)
-            from .scheduler import next_after
-            try:
-                occ = next_after(r["rrule"], r["local_start"], _zone(r.get("tz") or fallback),
-                                 s - timedelta(seconds=1))
-            except Exception as ex:     # кривое правило в базе — просто не показываем
-                log.debug("повестка: правило #%s не раскрылось: %s", r.get("id"), ex)
-                occ = None
-            if occ is not None and occ < e:
-                cands.append(occ)
-    return min(cands) if cands else None
+            out.add(nxt)
+            cursor = nxt
+        elif r.get("rrule") and nxt < s:
+            cursor = s - timedelta(seconds=1)
+    if cursor is not None and r.get("rrule"):
+        from .scheduler import next_after
+        tz = _zone(r.get("tz") or fallback)
+        try:
+            for _ in range(REMINDER_TIMES_MAX):
+                occ = next_after(r["rrule"], r["local_start"], tz, cursor)
+                if occ is None or occ >= e:
+                    break
+                out.add(occ)
+                cursor = occ
+        except Exception as ex:     # кривое правило в базе — показываем, что успели
+            log.debug("повестка: правило #%s не раскрылось: %s", r.get("id"), ex)
+    return sorted(out)[:REMINDER_TIMES_MAX]
 
 
 async def _reminders(ctx: ToolContext, s: datetime, e: datetime) -> list[dict]:
@@ -146,19 +157,18 @@ async def _reminders(ctx: ToolContext, s: datetime, e: datetime) -> list[dict]:
     tz = ctx.tz
     out = []
     for r in await reminders.list_active(ctx.db, 300):
-        # follow-up'ы — внутренняя повестка бота; напоминания о событиях дублировали бы сами события
-        if r.get("kind") in ("followup", "event"):
+        # follow-up'ы — внутренняя повестка бота; напоминания о событиях и задачах дублировали бы
+        # сами события и задачи (срок задачи — в её же день)
+        if r.get("kind") in ("followup", "event", "task"):
             continue
-        at = _first_in(r, s, e, tz)
-        if at is None:
-            continue
-        loc = at.astimezone(tz)
-        out.append({"time": loc.strftime("%H:%M"), "date": _day(loc.date()), "at": timeutil.iso(at),
-                    "text": _cut(r.get("text")), "kind": r.get("kind") or "reminder",
-                    "repeat": timeutil.describe_rrule(r["rrule"]) if r.get("rrule") else "",
-                    "nag": bool(r.get("nag"))})
+        for at in _times_in(r, s, e, tz):
+            loc = at.astimezone(tz)
+            out.append({"time": loc.strftime("%H:%M"), "date": _day(loc.date()), "at": timeutil.iso(at),
+                        "text": _cut(r.get("text")), "kind": r.get("kind") or "reminder",
+                        "repeat": timeutil.describe_rrule(r["rrule"]) if r.get("rrule") else "",
+                        "nag": bool(r.get("nag"))})
     out.sort(key=lambda x: x["at"])
-    return out
+    return out[:REMINDERS_MAX]
 
 
 async def _birthdays(ctx: ToolContext, s: datetime | None = None, e: datetime | None = None) -> list[dict]:

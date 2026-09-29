@@ -11,9 +11,13 @@ OWNER_ID ещё не задан — на /start бот присылает чел
   • `TurnOrder` — реплики владельца доходят до агента в том порядке, в каком пришли. aiogram
     обрабатывает каждое обновление отдельной задачей, и текст, отправленный сразу после
     голосового, иначе обгонял бы его (голос сначала скачивается и распознаётся). Билет берётся
-    при входе, до первого await; скачивание и распознавание идут параллельно, а ход агента
-    (`wait_turn`) ждёт, пока закончатся все более ранние сообщения. Команды, которым агент не
-    нужен, свой билет сразу отпускают (`release_turn`) — /news не задерживает следующий вопрос.
+    при входе, до первого await, и помнит время прихода (`turn_arrived`: «через 3 минуты» считается
+    от него, а не от момента, когда до сообщения дошла очередь); скачивание и распознавание идут
+    параллельно, а ход агента (`wait_turn`) ждёт, пока закончатся все более ранние сообщения, —
+    и, если ждать приходится дольше пары секунд, говорит об этом (`on_wait`: «⏳ …в очереди»).
+    Ответ ушёл текстом — очередь свободна (`finish_turn`), озвучка ответа следующих не держит.
+    Команды, которым агент не нужен, свой билет сразу отпускают (`release_turn`) — /news не
+    задерживает следующий вопрос.
   • `Inflight` — какие обновления сейчас в работе: при остановке их дожидаются, прежде чем
     закрывать базу и модель.
 """
@@ -24,11 +28,14 @@ import contextvars
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message, TelegramObject
+
+from .. import timeutil
 
 log = logging.getLogger("oracle.bot.middleware")
 
@@ -150,11 +157,16 @@ class OwnerOnly(BaseMiddleware):
 
 
 # ── порядок реплик ───────────────────────────────────────────────────────────
+QUEUE_NOTICE_SEC = 3.0            # ждёт прошлые сообщения дольше — сказать владельцу, что оно в очереди
+
+
 @dataclass
 class _Ticket:
     prev: asyncio.Future | None           # билет сообщения, пришедшего перед этим
     mine: asyncio.Future                  # готов, когда это сообщение обработано (и все до него)
     waited: bool = False
+    noticed: bool = False                 # владельцу сказали «в очереди»
+    arrived: datetime = field(default_factory=timeutil.now_utc)    # когда сообщение пришло
 
 
 _ticket: contextvars.ContextVar[_Ticket | None] = contextvars.ContextVar("oracle_turn_ticket", default=None)
@@ -193,14 +205,59 @@ class TurnOrder(BaseMiddleware):
             _finish_after(prev, mine)       # и при ошибке, и при отмене — очередь не встанет
 
 
-async def wait_turn() -> None:
-    """Дождаться, пока обработаются все сообщения, пришедшие раньше этого (вне TurnOrder — сразу)."""
+def turn_pending() -> bool:
+    """Этому сообщению ещё предстоит ждать более ранние (wait_turn не вернётся сразу)?"""
     t = _ticket.get()
-    if t is None or t.waited:
-        return
+    return t is not None and not t.waited and t.prev is not None and not t.prev.done()
+
+
+def turn_arrived() -> datetime | None:
+    """Когда пришло сообщение, которое сейчас обрабатывается (вне TurnOrder — None)."""
+    t = _ticket.get()
+    return t.arrived if t is not None else None
+
+
+async def wait_turn(on_wait: Callable[[], Awaitable[Any]] | None = None,
+                    after: float = QUEUE_NOTICE_SEC) -> bool:
+    """Дождаться, пока обработаются все сообщения, пришедшие раньше этого (вне TurnOrder — сразу).
+    Ждать пришлось дольше `after` секунд — один раз зовётся `on_wait` (сказать владельцу, что сообщение
+    в очереди). → сказали ли ему об этом (и при повторном вызове для того же сообщения)."""
+    t = _ticket.get()
+    if t is None:
+        return False
+    if t.waited:
+        return t.noticed
     t.waited = True
-    if t.prev is not None and not t.prev.done():
+    if t.prev is None or t.prev.done():
+        return False
+    task: asyncio.Task | None = None
+    if on_wait is not None:
+        async def later() -> None:
+            await asyncio.sleep(max(0.0, float(after or 0)))
+            t.noticed = True
+            try:
+                await on_wait()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:           # уведомление — не повод ломать ответ
+                log.warning("не сказал, что сообщение в очереди: %r", e)
+        task = asyncio.ensure_future(later())
+    try:
         await asyncio.shield(t.prev)
+    finally:
+        if task is not None:
+            if not t.noticed:                # ещё не начали говорить — не надо
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)    # начали — договорить до ответа
+    return t.noticed
+
+
+def finish_turn() -> None:
+    """Агенту это сообщение больше не нужно (ответ ушёл текстом, дальше — озвучка): следующие
+    реплики его не ждут. Порядок между ними сохраняется."""
+    t = _ticket.get()
+    if t is not None:
+        _finish_after(t.prev, t.mine)
 
 
 def release_turn() -> None:

@@ -422,6 +422,12 @@ async def t_update_reminder(ctx: ToolContext, *, id: Any, text: str | None = Non
         if repeat is not None:
             raise ValueError("only_next — только про ближайшее срабатывание; правило повтора меняй отдельным вызовом")
         return await _only_next(ctx, row, text=new_text, when=when if when_given else None, nag=new_nag)
+    if as_bool(only_next, False) and not when_given:
+        # «завтра не буди» про разовое: пропустить у него нечего — молча вернуть ok значило бы соврать
+        raise ValueError(f"#{row['id']} — разовое, пропускать у него нечего: чтобы не сработало, отмени его "
+                         f"(cancel_reminder), чтобы перенести — передай when")
+    if not text_given and nag is None and not when_given and repeat is None:
+        raise ValueError("нечего менять — передай text, when, repeat или nag (или only_next у повторяющегося)")
     if ringing_challenge(row) and (when_given or repeat is not None or (row.get("nag") and not new_nag)):
         raise ValueError(CHALLENGE_BUSY)
     if not when_given and repeat is None:           # только текст/nag — расписание не трогаем
@@ -521,11 +527,17 @@ async def t_ack_reminder(ctx: ToolContext, *, id: Any) -> dict:
             "next": timeutil.fmt_local(new["next_at"], ctx.tz) if new.get("next_at") else None}
 
 
+WAKE_SNOOZE_MAX = 30                 # будильник с задачкой голосом откладывается не дальше (кнопкой — 5 мин)
+SNOOZE_FRESH = timedelta(hours=2)    # «напомни об этом ещё раз» — про то, что сработало не раньше
+
+
 @tool("snooze_reminder",
       "Отложить то, что сейчас сработало или долбит, на minutes минут — как кнопка «💤»: «отложи на 10 минут», "
       "«дай ещё полчаса поспать», «напомни об этом через час ещё раз». Долбёжка останавливается и через minutes "
       "начнётся снова; расписание повторяющегося не меняется (перенести само время — update_reminder). "
-      "Будильник с задачкой и после этого снимается только задачкой. id — из «СЕЙЧАС ДОЛБЯТ» или list_reminders.",
+      f"Ещё не срабатывавшее не откладывается — это перенос (update_reminder). Будильник с задачкой — не больше "
+      f"чем на {WAKE_SNOOZE_MAX} минут, и снимается он всё равно только задачкой. "
+      "id — из «СЕЙЧАС ДОЛБЯТ» или list_reminders.",
       {"id": {"type": "integer"},
        "minutes": {"type": "integer", "description": "на сколько минут отложить, 1–1440 (по умолчанию 10)"}},
       required=["id"])
@@ -540,6 +552,20 @@ async def t_snooze_reminder(ctx: ToolContext, *, id: Any, minutes: Any = 10) -> 
         raise ValueError("minutes — число минут, 1–1440") from None
     if not 1 <= m <= 1440:
         raise ValueError("отложить можно на 1–1440 минут")
+    now = timeutil.now_utc()
+    fired = timeutil.from_iso(row.get("last_fired_at"))
+    if not (row.get("nag_active") or row.get("snooze_at") or (fired is not None and now - fired <= SNOOZE_FRESH)):
+        # «💤» у того, что ещё не звонило, — лишний звонок сверх расписания (у будильника — ещё и с задачкой)
+        raise ValueError(f"#{rid} сейчас не звонит и недавно не срабатывал — откладывать нечего; перенести "
+                         f"время — update_reminder(id, when[, only_next=true])")
+    if row.get("challenge") and m > WAKE_SNOOZE_MAX:
+        raise ValueError(f"будильник с задачкой откладывается максимум на {WAKE_SNOOZE_MAX} мин; выключить его — "
+                         f"только задачкой")
+    nxt = timeutil.from_iso(row.get("next_at"))
+    if row.get("rrule") and nxt is not None and now + timedelta(minutes=m) >= nxt:
+        # следующее срабатывание по расписанию сотрёт такой «💤» — это пропуск, а не «отложить»
+        raise ValueError(f"до следующего срабатывания ({timeutil.fmt_local(nxt, ctx.tz)}) ближе, чем {m} мин: "
+                         f"пропустить его — update_reminder(id, only_next=true)")
     new = await snooze_reminder(ctx.db, rid, m) or row
     out = {"ok": True, "id": new["id"], "text": new["text"],
            "until": timeutil.fmt_local(new["snooze_at"], ctx.tz) if new.get("snooze_at") else None}

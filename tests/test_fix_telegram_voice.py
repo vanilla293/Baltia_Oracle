@@ -44,7 +44,7 @@ async def test_voice_then_text_reach_agent_in_arrival_order(live, monkeypatch):
     events: list[str] = []
     agent = live.deps.agent
 
-    async def handle(text: str, *, via: str = "text", deep: Any = None) -> Reply:
+    async def handle(text: str, *, via: str = "text", deep: Any = None, **_kw: Any) -> Reply:
         agent.calls.append((text, via, deep))
         events.append(text)
         return Reply("ок")
@@ -400,7 +400,7 @@ async def test_inflight_tracks_update_tasks(live):
     gate = asyncio.Event()
     agent = live.deps.agent
 
-    async def handle(text: str, *, via: str = "text", deep: Any = None) -> Reply:
+    async def handle(text: str, *, via: str = "text", deep: Any = None, **_kw: Any) -> Reply:
         await gate.wait()
         return Reply("ок")
 
@@ -619,7 +619,8 @@ async def test_userbot_notice_is_recorded_once(cfg, db, notifier, clock):
     await ub._on_new_message(event(VASYA, "ты где?"))
     await ub._on_new_message(event(VASYA, "алло"))                   # в течение 5 минут — без уведомления
     rows = [r["content"] for r in await db.recent_messages(10)]
-    assert len(rows) == 1 and "chat_id 101" in rows[0] and "«ты где?»" in rows[0] and "не команда" in rows[0]
+    # кто и где — да; сам чужой текст — нет: он попал бы в ход владельца без защиты от чужого текста
+    assert len(rows) == 1 and "chat_id 101" in rows[0] and "ты где" not in rows[0] and "tg_read_chat" in rows[0]
 
 
 async def test_draft_button_is_recorded(h, deps, ctx, db, bot, fake_llm):

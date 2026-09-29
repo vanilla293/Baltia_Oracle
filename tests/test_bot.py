@@ -121,7 +121,7 @@ class FakeAgent:
         self.calls: list[tuple[str, str, Any]] = []
         self.failed_modules: list[str] = []
 
-    async def handle(self, text: str, *, via: str = "text", deep: bool | None = None) -> Reply:
+    async def handle(self, text: str, *, via: str = "text", deep: bool | None = None, **_kw: Any) -> Reply:
         self.calls.append((text, via, deep))
         return self.reply
 
@@ -1167,7 +1167,7 @@ async def test_draft_regen_falls_back_to_new_message_when_edit_fails(h, deps, ct
 
 async def test_typing_indicator_repeats_while_waiting(h, deps, bot):
     class SlowAgent(FakeAgent):
-        async def handle(self, text: str, *, via: str = "text", deep: bool | None = None) -> Reply:
+        async def handle(self, text: str, *, via: str = "text", deep: bool | None = None, **_kw: Any) -> Reply:
             await asyncio.sleep(0.05)
             return Reply("ок")
 

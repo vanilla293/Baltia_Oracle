@@ -328,7 +328,8 @@ async def test_birthday_day_sets_relentless_congrats_reminder(ctx, clock, fake_l
     assert len(rows) == 1
     r = rows[0]
     assert r["ref_id"] == bid and r["nag"] == 1 and r["nag_interval_min"] == 60 and r["status"] == "active"
-    assert r["next_at"] == timeutil.iso(utc(2026, 9, 28, 10, 0)) and r["nag_max"] == 12
+    # 10:00 + нажимы 11:00…21:00 + «сдаюсь» в 22:00 — всё не позже NAG_UNTIL
+    assert r["next_at"] == timeutil.iso(utc(2026, 9, 28, 10, 0)) and r["nag_max"] == 11
     n = ctx.services.notifier
     set_local(clock, 2026, 9, 28, 10, 0)
     await s.tick()
@@ -336,12 +337,12 @@ async def test_birthday_day_sets_relentless_congrats_reminder(ctx, clock, fake_l
     assert n.sent[-1]["buttons"][0][0] == ("✅ Готово", f"rem:done:{r['id']}")
     set_local(clock, 2026, 9, 28, 11, 0)
     await s.tick()
-    assert n.texts()[-1].endswith(f"(#{r['id']}, 1/12)")
+    assert n.texts()[-1].endswith(f"(#{r['id']}, 1/11)")
     await rem.ack_reminder(ctx.db, r["id"])
     for h in (12, 13, 14):
         set_local(clock, 2026, 9, 28, h, 0)
         await s.tick()
-    assert n.texts()[-1].endswith(f"(#{r['id']}, 1/12)")
+    assert n.texts()[-1].endswith(f"(#{r['id']}, 1/11)")
 
 
 async def test_delete_birthday_cancels_congrats_reminder(ctx, clock):

@@ -294,6 +294,11 @@ async def news_digest(ctx: ToolContext, topic: str = "", *, deep: bool = True) -
     items = await _collect(ctx, topic, 24, 80)
     if not items:
         return EMPTY_DIGEST
+    try:        # ссылки из лент — не сочинённые: «открой ссылку из пятого сюжета» потом откроется
+        from ..agent import remember_urls
+        await remember_urls(ctx.db, [it.get("url") for it in items])
+    except Exception as e:
+        log.debug("ссылки дайджеста не запомнил: %s", e)
     interests: list[str] = []
     try:
         interests = [f"- {c}" for c in await _interests(ctx.db, topic)]

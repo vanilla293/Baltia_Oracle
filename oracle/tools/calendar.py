@@ -259,8 +259,10 @@ def _reminder_text(ev: dict, rb: int, start_l: datetime) -> str:
     return s + (f" — в {start_l:%H:%M}" if rb >= 60 else "")
 
 
-async def _make_reminder(ctx: ToolContext, ev: dict, rb: int | None) -> tuple[dict | None, str | None]:
-    """Поставить напоминание о событии. → (строка reminders | None, пояснение, почему не поставил)."""
+async def _make_reminder(ctx: ToolContext, ev: dict, rb: int | None, *,
+                         at_start: bool = True) -> tuple[dict | None, str | None]:
+    """Поставить напоминание о событии. → (строка reminders | None, пояснение, почему не поставил).
+    at_start=False — заранее не успеть, так и не ставить «в момент начала» (о событии уже напомнили)."""
     if rb is None:
         return None, None
     tz = zone(ev.get("tz"), ctx.tz.key)
@@ -281,7 +283,7 @@ async def _make_reminder(ctx: ToolContext, ev: dict, rb: int | None) -> tuple[di
         was = timeutil.fmt_local(rem_l, ctx.tz)
         start_at = start_l if not ev.get("all_day") else \
             datetime.combine(start_l.date(), time(9, 0)).replace(tzinfo=tz)
-        if rb == 0 or start_at <= timeutil.now_utc():
+        if rb == 0 or start_at <= timeutil.now_utc() or not at_start:
             return None, f"напоминание не ставил: его время ({was}) уже прошло"
         # «созвон в 19:00», а сейчас 18:45: за 30 минут уже не успеть — напомню в сам момент начала
         rb, rem_l = 0, start_at
@@ -402,10 +404,16 @@ async def update_event(ctx: ToolContext, eid: Any, *, title: str | None = None, 
         "notes=?, rrule=? WHERE id=?",
         (new_title, local_start, tz.key, timeutil.iso(new_start), timeutil.iso(new_end), int(new_all_day),
          new_loc, new_notes, rule, eid))
+    # напоминание «за 30 минут» уже пришло, а он правит место или заметки — второго «Сейчас: …» в момент
+    # начала не надо; начало сдвинули — другое дело
+    fired = await ctx.db.scalar(
+        "SELECT 1 FROM reminders WHERE ref_type='event' AND ref_id=? AND last_fired_at IS NOT NULL "
+        "AND status!='cancelled'", (eid,))
+    moved = timeutil.iso(new_start) != ev["starts_at"] or new_all_day != old_all_day
     await ctx.db.kv_set(KV_REMIND.format(eid), rb)
     await cancel_by_ref(ctx.db, "event", eid)
     ev = await get_event(ctx.db, eid) or {}
-    rem, note = await _make_reminder(ctx, ev, rb)
+    rem, note = await _make_reminder(ctx, ev, rb, at_start=moved or not fired)
     return _summary(ev, ctx.tz, rem, note)
 
 
@@ -774,6 +782,8 @@ async def t_get_agenda(ctx: ToolContext, **kw: Any) -> dict:
         out["note"] = "часть данных не получил: " + ", ".join(d["failed"]) + " — не выдумывай их"
     elif not any(out[k] for k in ("events", "reminders", "birthdays", "tasks")):
         out["note"] = "в этот период ничего нет — свободен"
+    elif len(d["reminders"]) >= brief.REMINDERS_MAX:
+        out["note"] = f"напоминаний в периоде больше {brief.REMINDERS_MAX} — показаны первые; сузь период"
     return out
 
 

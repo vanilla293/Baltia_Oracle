@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from oracle import persona
+from oracle import persona, timeutil
 from oracle.agent import GATED_TOOLS, Agent, TurnGuard
 from oracle.bot import handlers as H
 from oracle.db import DB
@@ -127,7 +127,8 @@ async def test_snooze_by_voice(ctx, db, clock):
     assert row["nag_active"] == 0 and row["snooze_at"] and row["status"] == "active"
     # сработавшее разовое без долбёжки — «напомни через час ещё раз» тоже работает, как кнопка
     once = await rem.create_reminder(ctx, text="Кофе", when="2026-09-28 09:05")
-    await db.execute("UPDATE reminders SET status='done', next_at=NULL WHERE id=?", (once["id"],))
+    await db.execute("UPDATE reminders SET status='done', next_at=NULL, last_fired_at=? WHERE id=?",
+                     (timeutil.iso(timeutil.now_utc()), once["id"]))
     assert (await call(ctx, "snooze_reminder", id=once["id"], minutes=60))["ok"]
     assert (await rem.get_reminder(db, once["id"]))["status"] == "active"
     await rem.cancel_reminder(db, once["id"])

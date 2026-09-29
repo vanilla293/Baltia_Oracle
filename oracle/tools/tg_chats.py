@@ -165,6 +165,9 @@ async def _compose(ctx: ToolContext, ub: Any, chat_id: int, title: str, instruct
     incoming = next((m.get("text", "") for m in reversed(hist) if not m.get("out")), "")
     owner = (getattr(ctx.cfg, "owner_name", "") or "").strip()
     system = DRAFT_SYSTEM.format(owner=f" ({owner})" if owner else "", samples=_samples_block(samples))
+    from ..persona import is_female
+    if is_female(getattr(ctx.cfg, "owner_gender", "m")):     # «я пришла», а не «я пришёл»
+        system += "\n\nВладелец — женщина: о себе пиши в женском роде («пришла», «рада», «видела»)."
     parts = [f"Чат: «{title}»", f"Сейчас: {timeutil.fmt_now_for_prompt(ctx.tz)}",
              "Переписка (старые сверху, «я» — это владелец):\n" + _render_history(hist)]
     if hist and hist[-1].get("out") and not instruction:

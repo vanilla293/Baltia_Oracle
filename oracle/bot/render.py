@@ -449,6 +449,19 @@ def utf16_len(s: str) -> int:
 
 
 def _has_content(chunk: str) -> bool:
-    """Есть ли в куске что-то кроме пробелов и строк-ограждений кода (пустой блок слать незачем)."""
-    return any(line.strip() and not (_fence_open(line) or _FENCE_CLOSE.match(line))
-               for line in chunk.split("\n"))
+    """Есть ли в куске что-то кроме пробелов и строк-ограждений кода (пустой блок слать незачем).
+    Внутри открытого блока «~~~ текст» или «```что-то» — не ограждение, а содержимое: иначе хвост
+    черновика из таких строк выпал бы из превью, а кнопка отправила бы его целиком."""
+    state: tuple[str, str] | None = None
+    for line in chunk.split("\n"):
+        if state is None:
+            op = _fence_open(line)
+            if op is not None:
+                state = op
+                continue
+        elif _fence_closes(line, state[0]):
+            state = None
+            continue
+        if line.strip():
+            return True
+    return False

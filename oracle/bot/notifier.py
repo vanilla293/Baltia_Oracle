@@ -39,6 +39,8 @@ def html_to_text(html: str) -> str:
 class BotNotifier:
     """Всё, что бот пишет сам (ответы, напоминания, итоги фоновых задач), — в один чат."""
 
+    resumable = True             # send(progress=…): повтор длинного текста — с первого недошедшего куска
+
     def __init__(self, bot: Any, chat_id: int):
         self.bot = bot
         self.chat_id = chat_id
@@ -76,8 +78,11 @@ class BotNotifier:
                                     link_preview_options=NO_PREVIEW, **base)
 
     # ── протокол Notifier ──
-    async def send(self, text: str, buttons: Buttons | None = None, *, silent: bool = False) -> int | None:
-        """Текст (markdown) → одно или несколько сообщений. → message_id последнего; пусто → None."""
+    async def send(self, text: str, buttons: Buttons | None = None, *, silent: bool = False,
+                   progress: list[int] | None = None) -> int | None:
+        """Текст (markdown) → одно или несколько сообщений. → message_id последнего; пусто → None.
+        progress — [сколько кусков уже дошло]: эти пропускаются, счётчик растёт после каждого дошедшего
+        (оборвалось на третьем — повтор с тем же progress начнёт с третьего, первые два не задвоятся)."""
         chunks: list[str] = []
         for c in split_message(text or ""):
             if utf16_len(c) > UTF16_SAFE:          # эмодзи-простыня: в UTF-16 вдвое длиннее
@@ -89,10 +94,17 @@ class BotNotifier:
             return None
         markup = build(buttons)
         last = None
+        if progress is not None and not progress:
+            progress.append(0)
+        start = max(0, int(progress[0])) if progress else 0
         async with self._lock:
             for i, chunk in enumerate(chunks):
+                if i < start:
+                    continue
                 msg = await self._send_chunk(chunk, markup if i == len(chunks) - 1 else None, silent)
                 last = getattr(msg, "message_id", None)
+                if progress is not None:
+                    progress[0] = i + 1
         return last
 
     async def send_html(self, html: str, buttons: Buttons | None = None, *, silent: bool = False) -> int | None:

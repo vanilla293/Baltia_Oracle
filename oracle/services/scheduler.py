@@ -4,8 +4,10 @@
   1) сработавшие напоминания (next_at ≤ сейчас): сообщение с кнопками, запись в диалог,
      следующий next_at по повтору (пропущенные за время простоя — одним сообщением);
      follow-up'ы бота — не сырым текстом, а через agent.proactive в фоне;
-  2) отложенные («💤») — повтор без изменения расписания;
-  3) «долбилки» — каждые nag_interval_min, фразы с эскалацией, после nag_max — «сдаюсь»;
+  2) отложенные («💤») — повтор без изменения расписания (проспанное вместе с ботом — одно «пропустил»,
+     без новой долбёжки);
+  3) «долбилки» — каждые nag_interval_min, фразы с эскалацией, после nag_max — «сдаюсь»
+     («Поздравить…» с ДР — только до 22:00, и после «💤» тоже);
   4) ежедневные задачи по местному времени (сводка, дни рождения, дайджест, рефлексия) —
      раз в сутки, в фоне. kv `job:<имя>` ставится только после того, как задача сделана: не дошло
      (сеть, перезапуск) — повтор через JOB_RETRY, пока не выйдет окно догона CATCH_UP (3 ч; дни
@@ -31,7 +33,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dateutil.rrule import rrulestr
 
-from .. import timeutil
+from .. import persona, timeutil
 from ..tools.base import Buttons, ToolContext
 
 log = logging.getLogger("oracle.scheduler")
@@ -58,8 +60,10 @@ JOBS = (("morning", "morning_brief_time"), ("birthdays", "birthday_time"),
 FOLLOWUP_TRIGGER = "Ты сам поставил себе вернуться к теме: {text}"
 GIVE_UP = "Всё, сдаюсь. «{text}» — отметь, когда сделаешь."
 STALE_GIVE_UP = "Пока я был выключен, долбить было некому. «{text}» — отметь, когда сделаешь."
+STALE_GIVE_UP_NET = "Пока не было связи с Telegram, долбить не получалось. «{text}» — отметь, когда сделаешь."
 WAKE_GIVE_UP = "Всё, сдаюсь — похоже, проспал."
 STALE_WAKE_GIVE_UP = "Пока я был выключен, будить было некому — надеюсь, встал сам."
+STALE_WAKE_GIVE_UP_NET = "Пока не было связи с Telegram, разбудить не получалось — надеюсь, встал сам."
 GAVE_UP = "gave_up"     # _deliver: так и не доставили — состояние двигаем, но в диалог пишем «не смог»
 
 # эскалация: от вежливого к настырному; последние — с перчиком, но без наездов на него самого
@@ -110,11 +114,28 @@ WAKE_LINES = (
 )
 
 
+# OWNER_GENDER=f: те же фразы в женском роде
+_FEMININE = {
+    "Вчерашний ты поставил этот будильник. Не подводи его.": "Вчерашняя ты поставила этот будильник. Не подводи её.",
+    "Вставай, чёрт возьми. Ты же сам просил разбудить.": "Вставай, чёрт возьми. Ты же сама просила разбудить.",
+    "Я на тебя рассчитываю. И вчерашний ты — тоже.": "Я на тебя рассчитываю. И вчерашняя ты — тоже.",
+    WAKE_GIVE_UP: "Всё, сдаюсь — похоже, проспала.",
+    STALE_WAKE_GIVE_UP: "Пока я был выключен, будить было некому — надеюсь, встала сама.",
+    STALE_WAKE_GIVE_UP_NET: "Пока не было связи с Telegram, разбудить не получалось — надеюсь, встала сама.",
+}
+WAKE_LINES_F = tuple(_FEMININE.get(x, x) for x in WAKE_LINES)
+
+
+def gendered(text: str, female: bool) -> str:
+    """Фраза о владельце в его роде (OWNER_GENDER)."""
+    return _FEMININE.get(text, text) if female else text
+
+
 # ── тексты и кнопки ──────────────────────────────────────────────────────────
-def nag_line(count: int, nag_max: int, wake: bool = False) -> str:
+def nag_line(count: int, nag_max: int, wake: bool = False, female: bool = False) -> str:
     """Фраза для count-й долбёжки из nag_max: эскалация растянута на весь диапазон —
     первая всегда самая вежливая, последняя — самая настырная."""
-    lines = WAKE_LINES if wake else NAG_LINES
+    lines = (WAKE_LINES_F if female else WAKE_LINES) if wake else NAG_LINES
     n = len(lines)
     count, nag_max = max(1, int(count)), max(1, int(nag_max))
     if nag_max <= 1:
@@ -282,6 +303,7 @@ class Scheduler:
         self._job_retry_at: dict[str, datetime] = {}
         self._job_fails: dict[str, int] = {}
         self._job_text: dict[tuple[str, date], str] = {}   # готовый текст сводки/дайджеста — для повтора
+        self._job_sent: dict[tuple[str, date], list[int]] = {}   # …и сколько его кусков уже дошло
         self._last_summary: datetime | None = None
         self._summary_task: asyncio.Task | None = None
         self.ticks = 0
@@ -384,12 +406,14 @@ class Scheduler:
         await self._flush_undelivered(notifier)
         return True
 
+    def _offline_at(self, occurred: datetime) -> bool:
+        """Момент попал в обрыв связи с Telegram (бот при этом работал)?"""
+        o = self._outage
+        return o is not None and o[0] - timedelta(minutes=1) <= occurred and (o[1] is None or occurred <= o[1])
+
     def _missed_why(self, occurred: datetime) -> str:
         """Почему опоздали: бот лежал или не было связи с Telegram (вхождение попало в обрыв)."""
-        o = self._outage
-        if o is not None and o[0] - timedelta(minutes=1) <= occurred and (o[1] is None or occurred <= o[1]):
-            return "пока не было связи"
-        return "пока был выключен"
+        return "пока не было связи" if self._offline_at(occurred) else "пока был выключен"
 
     async def _note_undelivered(self, text: str) -> None:
         try:
@@ -415,28 +439,35 @@ class Scheduler:
         except Exception as e:
             log.warning("не сообщил о недоставленном: %s", _err(e))
 
-    async def _send_once(self, text: str, buttons: Buttons | None = None) -> bool:
-        """Отправка из фоновой задачи, одна попытка → ушло ли (нет notifier — «ушло», делать нечего)."""
+    async def _send_once(self, text: str, buttons: Buttons | None = None,
+                         progress: list[int] | None = None) -> bool:
+        """Отправка из фоновой задачи, одна попытка → ушло ли (нет notifier — «ушло», делать нечего).
+        progress — [сколько кусков длинного текста уже дошло]: повтор шлёт только недошедшие, а не весь
+        дайджест заново (если notifier так умеет — BotNotifier.resumable)."""
         notifier = self.ctx.services.notifier
         if notifier is None:
             log.info("нет notifier — сообщение не отправлено: %.80s", text)
             return True
+        kw: dict[str, Any] = {"progress": progress} \
+            if progress is not None and getattr(notifier, "resumable", False) else {}
         try:
-            await asyncio.wait_for(notifier.send(text, buttons=buttons), SEND_TIMEOUT)
+            await asyncio.wait_for(notifier.send(text, buttons=buttons, **kw), SEND_TIMEOUT)
             return True
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log.warning("не смог отправить сообщение: %s", _err(e))
+            done = f" (дошло кусков: {progress[0]})" if kw and progress and progress[0] else ""
+            log.warning("не смог отправить сообщение%s: %s", done, _err(e))
             return False
 
     async def _send_bg(self, text: str, buttons: Buttons | None = None) -> bool:
         """Отправка из фоновой задачи с повторами (FOLLOWUP_RETRY, ≈ SEND_GIVE_UP) → ушло ли."""
-        if await self._send_once(text, buttons):
+        progress = [0]
+        if await self._send_once(text, buttons, progress):
             return True
         for pause in FOLLOWUP_RETRY:
             await asyncio.sleep(pause)
-            if await self._send_once(text, buttons):
+            if await self._send_once(text, buttons, progress):
                 return True
         log.error("так и не отправил сообщение: %.80s", text)
         return False
@@ -581,27 +612,56 @@ class Scheduler:
                 except Exception:
                     log.exception("напоминание #%s: не снял snooze_at", row.get("id"))
 
+    def _nag_until(self, row: dict) -> datetime | None:
+        """Долбёжке «Поздравить…» (ref_type='birthday') — до NAG_UNTIL того дня; остальным — без срока."""
+        if row.get("ref_type") != "birthday":
+            return None
+        try:
+            from ..tools import birthdays
+            tz = _zone(row.get("tz"), self.ctx.tz)
+            return datetime.combine(_start_naive(row["local_start"]).date(), birthdays.NAG_UNTIL, tzinfo=tz)
+        except Exception as e:
+            log.debug("напоминание #%s: срок долбёжки не посчитан: %s", row.get("id"), e)
+            return None
+
     async def _refire(self, row: dict, now: datetime) -> bool:
-        """Повтор отложенного: как срабатывание, но расписание (next_at/rrule) не трогаем."""
+        """Повтор отложенного: как срабатывание, но расписание (next_at/rrule) не трогаем.
+        Проспали отложенное вместе с ботом (или без связи) — как и в fire(): одно сообщение «пропустил»,
+        без новой долбёжки."""
         rid = int(row["id"])
         kind = row.get("kind") or "reminder"
+        tz = _zone(row.get("tz"), self.ctx.tz)
         text = str(row.get("text") or "").strip() or "(без текста)"
         nag = bool(row.get("nag")) and kind != "followup"
-        interval, _ = self._nag_params(row)
+        interval, nag_max = self._nag_params(row)
         seen = row.get("snooze_at")
+        planned = timeutil.from_iso(seen) or now
+        stale = STALE_WAKE if kind == "wake" else max(STALE_NAG, timedelta(minutes=3 * interval))
+        if nag and now - planned > stale:
+            nag = False
+        until = self._nag_until(row) if nag else None
+        if until is not None:
+            # «Поздравить…» после «💤» — снова только до вечера: последний нажим и «сдаюсь» не позже until
+            nag_max = int((until - now) / timedelta(minutes=interval)) - 1
+            if nag_max < 1:
+                nag = False
         # разовое без долбёжки после повтора закрывается — иначе висело бы «активным» без срабатываний
         status = "done" if not nag and not row.get("next_at") else (row.get("status") or "active")
         update = ("UPDATE reminders SET snooze_at=NULL, last_fired_at=?, nag_active=?, nag_count=0, "
-                  "nag_next_at=?, status=? WHERE id=? AND status='active' AND snooze_at IS ?")
+                  "nag_next_at=?, nag_max=COALESCE(?, nag_max), status=? "
+                  "WHERE id=? AND status='active' AND snooze_at IS ?")
         params = (timeutil.iso(now), int(nag), timeutil.iso(now + timedelta(minutes=interval)) if nag else None,
-                  status, rid, seen)
+                  nag_max if until is not None and nag else None, status, rid, seen)
         if not await self._unchanged(rid, "snooze_at", seen):
             return True
         if kind == "followup" and self.ctx.services.agent is not None:
             if await self.ctx.db.execute(update, params):
                 self.ctx.services.spawn(self._followup(rid, text), name=f"followup:{rid}")
             return True
-        sent = await self._deliver(("snooze", rid), "💤→ " + fire_text(row), reminder_buttons(row), now)
+        msg = "💤→ " + fire_text(row)
+        if now - planned > LATE_AFTER:
+            msg = f"(пропустил, {self._missed_why(planned)} — было на {timeutil.fmt_local(planned, tz)}) {msg}"
+        sent = await self._deliver(("snooze", rid), msg, reminder_buttons(row), now)
         if not sent:
             return False
         if not await self.ctx.db.execute(update, params):
@@ -636,17 +696,32 @@ class Scheduler:
         rid = int(row["id"])
         text = str(row.get("text") or "").strip() or "(без текста)"
         wake = row.get("kind") == "wake"
+        female = persona.is_female(getattr(self.ctx.cfg, "owner_gender", "m"))
         interval, nag_max = self._nag_params(row)
         count = _int(row.get("nag_count"), 0) + 1
         planned = timeutil.from_iso(row.get("nag_next_at")) or now
         stale = now - planned > max(STALE_NAG, timedelta(minutes=3 * interval))
+        until = self._nag_until(row)
+        if until is not None and (planned > until or now > until + LATE_AFTER):
+            # «Поздравить…» — только до вечера: на ночь глядя не долбим и не «сдаёмся», просто тихо заканчиваем
+            await self.ctx.db.execute(
+                "UPDATE reminders SET nag_active=0, nag_next_at=NULL, "
+                "status=CASE WHEN next_at IS NULL THEN 'done' ELSE status END "
+                "WHERE id=? AND status='active' AND nag_active=1", (rid,))
+            return True
         if count > nag_max or stale:
+            offline = self._offline_at(planned)
             if wake:
-                msg = STALE_WAKE_GIVE_UP if stale and count <= nag_max else WAKE_GIVE_UP
+                if stale and count <= nag_max:
+                    msg = STALE_WAKE_GIVE_UP_NET if offline else STALE_WAKE_GIVE_UP
+                else:
+                    msg = WAKE_GIVE_UP
+                msg = gendered(msg, female)
                 if row.get("next_at"):
                     msg += f" Следующий будильник — {timeutil.fmt_local(row['next_at'], self.ctx.tz)}."
             else:
-                msg = (STALE_GIVE_UP if stale and count <= nag_max else GIVE_UP).format(text=text)
+                stale_msg = STALE_GIVE_UP_NET if offline else STALE_GIVE_UP
+                msg = (stale_msg if stale and count <= nag_max else GIVE_UP).format(text=text)
             if not await self._deliver(("nag", rid), msg, None, now):
                 return False
             await self.ctx.db.execute(
@@ -655,7 +730,7 @@ class Scheduler:
                 "WHERE id=? AND status='active' AND nag_active=1",
                 (min(count, nag_max), rid))
             return True
-        line = nag_line(count, nag_max, wake=wake)
+        line = nag_line(count, nag_max, wake=wake, female=female)
         msg = f"{line}\n⏰ {text}  (#{rid}, {count}/{nag_max})"
         if not await self._deliver(("nag", rid), msg, reminder_buttons(row), now):
             return False
@@ -736,8 +811,14 @@ class Scheduler:
         if text is None:
             text = str(await make() or "").strip()
             self._job_text = {k: v for k, v in self._job_text.items() if k[1] == day}
+            self._job_sent = {k: v for k, v in self._job_sent.items() if k[1] == day}
             self._job_text[(name, day)] = text
+            self._job_sent[(name, day)] = [0]
         return text
+
+    def _job_done(self, name: str, day: date) -> None:
+        self._job_text.pop((name, day), None)
+        self._job_sent.pop((name, day), None)
 
     async def _job(self, name: str, day: date | None = None) -> bool:
         """Ежедневная задача. → True — сделана (или делать нечего, или собрать не вышло — об этом
@@ -749,10 +830,10 @@ class Scheduler:
                 from . import brief
                 text = await self._text_for(name, day, lambda: brief.morning_brief(ctx))
                 if text:
-                    if not await self._send_once(text):
+                    if not await self._send_once(text, progress=self._job_sent.setdefault((name, day), [0])):
                         return False
                     await self._record(f"Утренняя сводка владельцу:\n{_clip(text, RECORD_MAX)}")
-                self._job_text.pop((name, day), None)
+                self._job_done(name, day)
             elif name == "birthdays":
                 from ..tools import birthdays
                 failed: list[int] = []
@@ -763,11 +844,12 @@ class Scheduler:
                 from ..tools import news
                 text = await self._text_for(name, day, lambda: news.news_digest(ctx))
                 if text:
-                    if not await self._send_once("🗞 " + text):
+                    # не дошёл второй кусок — повтор шлёт со второго, а не весь дайджест заново
+                    if not await self._send_once("🗞 " + text, progress=self._job_sent.setdefault((name, day), [0])):
                         return False
                     # целиком (до RECORD_MAX): «подробнее про пятый сюжет» — агент должен видеть пятый
                     await self._record(f"Дайджест новостей владельцу:\n{_clip(text, RECORD_MAX)}")
-                self._job_text.pop((name, day), None)
+                self._job_done(name, day)
             elif name == "reflection":
                 agent = ctx.services.agent
                 if agent is None:
