@@ -235,3 +235,16 @@ async def test_registry_dispatch(ctx):
         assert any(s["function"]["name"] == "t_echo" for s in tb.schemas(ctx.cfg))
     finally:
         tb.REGISTRY.pop("t_echo", None)
+
+
+def test_config_telegram_api_url_and_env_file(tmp_path, monkeypatch):
+    from oracle import config
+    env = tmp_path / "alt.env"
+    env.write_text("BOT_NAME=Тестовый\nTELEGRAM_API_URL=http://127.0.0.1:8081/\n", encoding="utf-8")
+    for k in ("BOT_NAME", "TELEGRAM_API_URL"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("ENV_FILE", str(env))
+    c = config.load()
+    assert c.bot_name == "Тестовый" and c.telegram_api_url == "http://127.0.0.1:8081"
+    for k in ("BOT_NAME", "TELEGRAM_API_URL"):
+        monkeypatch.delenv(k, raising=False)

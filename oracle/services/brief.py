@@ -1,5 +1,6 @@
 """Утренняя сводка: что сегодня (события, напоминания, дни рождения, сроки), погода и одно дело,
-на которое стоит надавить.
+на которое стоит надавить. Та же сводка «на остаток дня» — для /today в любое время (`today_brief`),
+и повестка на любой период — для инструмента get_agenda (`gather(ctx, start, end)`).
 
 Данные собираются из модулей инструментов (лениво — модуль может отсутствовать или упасть:
 тогда просто нет этой части). Текст пишет модель голосом бота; не ответила — детерминированный
@@ -25,13 +26,25 @@ JOURNAL_FRESH = timedelta(days=7)   # дневник старше — уже н�
 JOURNAL_MAX = 1500
 TEXT_MAX = 200
 
+# сводка утром (первое сообщение за день) и по /today в любое время — «на остаток дня»
+_MODES = {
+    "morning": dict(situation="Сейчас утро, ты пишешь ему утреннюю сводку — первое сообщение за день.",
+                    opening="Начни с приветствия, привязанного к дню недели или погоде, — одна живая фраза, "
+                            "не открытка.",
+                    scope="сегодня", empty="день"),
+    "now": dict(situation="Сейчас {now} — он сам попросил сводку на остаток дня.",
+                opening="Без приветствий по времени суток («доброе утро» и т.п.) — сразу к делу, "
+                        "можно одной фразой про погоду.",
+                scope="осталось на сегодня (прошедшее не перечисляй)", empty="остаток дня"),
+}
+
 SYSTEM = """\
-Ты — {name}, личный ИИ {owner}: напарник со своим умом и мнением, а не услужливый ассистент. Сейчас утро, ты пишешь ему утреннюю сводку — первое сообщение за день.
+Ты — {name}, личный ИИ {owner}: напарник со своим умом и мнением, а не услужливый ассистент. {situation}
 
 КАК ПИСАТЬ
 - Коротко и по-человечески, на «ты», живым русским. Без канцелярита, без воды, без «желаю продуктивного дня».
-- Начни с приветствия, привязанного к дню недели или погоде, — одна живая фраза, не открытка.
-- Дальше — что сегодня: события со временем, напоминания, дни рождения. Пустой день так и назови — это тоже новость.
+- {opening}
+- Дальше — что {scope}: события со временем, напоминания, дни рождения. Пустой {empty} так и назови — это тоже новость.
 - В конце — одно дело, на которое стоит надавить: из твоего дневника или из просроченных задач. Конкретно: что сделать и почему именно сегодня. Одно, а не пять.
 - Без списков ради списков: пара пунктов — обычным текстом; список — только когда дел правда много.
 - Только то, что есть в данных ниже. Ничего не выдумывай — ни встреч, ни людей, ни погоды. Чего нет в данных — не упоминай.
@@ -97,48 +110,94 @@ async def _events(ctx: ToolContext, s: datetime, e: datetime) -> list[dict]:
     tz = ctx.tz
     out = []
     for ev in await calendar.events_between(ctx.db, tz, s, e):
+        at = timeutil.from_iso(ev.get("occurs_at"))
         out.append({"time": _event_time(ev, tz, s, e), "title": _cut(ev.get("title")),
-                    "location": _cut(ev.get("location"), 100), "at": ev.get("occurs_at") or ""})
+                    "location": _cut(ev.get("location"), 100), "at": ev.get("occurs_at") or "",
+                    "date": _day(at.astimezone(tz).date()) if at else ""})
     return out
+
+
+def _first_in(r: dict, s: datetime, e: datetime, fallback: ZoneInfo) -> datetime | None:
+    """Первое срабатывание напоминания в окне [s, e) (UTC) или None. У повторяющегося next_at —
+    только ближайшее срабатывание, а окно может быть и послезавтра — там раскрываем правило."""
+    cands = []
+    snz = timeutil.from_iso(r.get("snooze_at"))
+    if snz is not None and s <= snz < e:
+        cands.append(snz)
+    nxt = timeutil.from_iso(r.get("next_at"))
+    if nxt is not None:
+        if s <= nxt < e:
+            cands.append(nxt)
+        elif r.get("rrule") and nxt < s:     # раньше next_at не сработает (мог быть пропуск only_next)
+            from .scheduler import next_after
+            try:
+                occ = next_after(r["rrule"], r["local_start"], _zone(r.get("tz") or fallback),
+                                 s - timedelta(seconds=1))
+            except Exception as ex:     # кривое правило в базе — просто не показываем
+                log.debug("повестка: правило #%s не раскрылось: %s", r.get("id"), ex)
+                occ = None
+            if occ is not None and occ < e:
+                cands.append(occ)
+    return min(cands) if cands else None
 
 
 async def _reminders(ctx: ToolContext, s: datetime, e: datetime) -> list[dict]:
     from ..tools import reminders
     tz = ctx.tz
-    lo, hi = timeutil.iso(s), timeutil.iso(e)
     out = []
     for r in await reminders.list_active(ctx.db, 300):
         # follow-up'ы — внутренняя повестка бота; напоминания о событиях дублировали бы сами события
         if r.get("kind") in ("followup", "event"):
             continue
-        at = r.get("next_at")
-        if not at or not (lo <= at < hi):
+        at = _first_in(r, s, e, tz)
+        if at is None:
             continue
-        out.append({"time": timeutil.from_iso(at).astimezone(tz).strftime("%H:%M"),
+        loc = at.astimezone(tz)
+        out.append({"time": loc.strftime("%H:%M"), "date": _day(loc.date()), "at": timeutil.iso(at),
                     "text": _cut(r.get("text")), "kind": r.get("kind") or "reminder",
                     "repeat": timeutil.describe_rrule(r["rrule"]) if r.get("rrule") else "",
                     "nag": bool(r.get("nag"))})
+    out.sort(key=lambda x: x["at"])
     return out
 
 
-async def _birthdays(ctx: ToolContext) -> list[dict]:
+async def _birthdays(ctx: ToolContext, s: datetime | None = None, e: datetime | None = None) -> list[dict]:
+    """ДР в ближайшие BIRTHDAY_DAYS дня (сводка) или те, что попадают в окно [s, e) (повестка)."""
     from ..tools import birthdays
+    tz = ctx.tz
+    days, d0, d1 = BIRTHDAY_DAYS, None, None
+    if s is not None and e is not None:
+        d0, d1 = s.astimezone(tz).date(), (e - timedelta(seconds=1)).astimezone(tz).date()
+        days = (d1 - ctx.now_local().date()).days
+        if days < 0:
+            return []
     out = []
-    for b in await birthdays.upcoming(ctx.db, ctx.tz, BIRTHDAY_DAYS):
+    for b in await birthdays.upcoming(ctx.db, tz, days):
         try:
             nd = date.fromisoformat(str(b.get("next_date")))
         except ValueError:
             nd = None
+        if d0 is not None and (nd is None or not d0 <= nd <= d1):
+            continue
         out.append({"name": _cut(b.get("name"), 100), "relation": _cut(b.get("relation"), 60),
                     "days_left": int(b.get("days_left") or 0), "turns": b.get("turns"),
                     "date": _day(nd) if nd else "", "notes": _cut(b.get("notes"), 150)})
     return out
 
 
-async def _tasks(ctx: ToolContext) -> list[dict]:
+async def _tasks(ctx: ToolContext, s: datetime | None = None, e: datetime | None = None) -> list[dict]:
+    """Задачи со сроком: просроченные + на ближайшие сутки (сводка) или со сроком в окне [s, e)
+    (повестка; просроченные — только если окно включает «сейчас»)."""
     from ..tools import projects
+    now = timeutil.now_utc()
+    days = TASK_DAYS if e is None else max(0.0, (e - now) / timedelta(days=1))
     out = []
-    for t in await projects.due_tasks(ctx.db, ctx.tz, TASK_DAYS):
+    for t in await projects.due_tasks(ctx.db, ctx.tz, days):
+        if s is not None and e is not None:
+            due = timeutil.from_iso(t.get("due_at"))
+            in_window = due is not None and s <= due < e
+            if not in_window and not (t.get("overdue") and s <= now < e):
+                continue
         out.append({"text": _cut(t.get("text")), "project": _cut(t.get("project"), 80) or None,
                     "overdue": bool(t.get("overdue")), "due": t.get("due_local") or "",
                     "priority": int(t.get("priority") or 2)})
@@ -168,14 +227,26 @@ async def _journal(ctx: ToolContext) -> dict | None:
     return {"content": content, "date": day}
 
 
-async def gather(ctx: ToolContext) -> dict:
-    """Все данные для сводки. Каждый источник необязателен: ошибка → пустая часть и запись в лог."""
-    s, e = day_bounds(ctx)
+async def gather(ctx: ToolContext, start: datetime | None = None, end: datetime | None = None, *,
+                 extras: bool | None = None) -> dict:
+    """Все данные для сводки. Каждый источник необязателен: ошибка → пустая часть и запись в лог.
+
+    Без start/end — сегодняшние сутки (утренняя сводка). С окном [start, end) — повестка на период:
+    события, напоминания (повторы раскрыты), ДР и задачи со сроком именно в этом окне.
+    extras — погода, дневник, ДР на 3 дня вперёд и задачи на сутки, как в сводке (по умолчанию —
+    только без окна)."""
+    windowed = start is not None or end is not None
+    s0, e0 = day_bounds(ctx)
+    s, e = start or s0, end or e0
+    extras = (not windowed) if extras is None else extras
     data: dict[str, Any] = {"today": ctx.now_local().date(), "weather": None, "events": [],
                             "reminders": [], "birthdays": [], "tasks": [], "journal": None, "failed": []}
-    sources = (("events", lambda: _events(ctx, s, e)), ("reminders", lambda: _reminders(ctx, s, e)),
-               ("birthdays", lambda: _birthdays(ctx)), ("tasks", lambda: _tasks(ctx)),
-               ("weather", lambda: _weather(ctx)), ("journal", lambda: _journal(ctx)))
+    sources: tuple = (("events", lambda: _events(ctx, s, e)), ("reminders", lambda: _reminders(ctx, s, e)))
+    if extras:
+        sources += (("birthdays", lambda: _birthdays(ctx)), ("tasks", lambda: _tasks(ctx)),
+                    ("weather", lambda: _weather(ctx)), ("journal", lambda: _journal(ctx)))
+    else:
+        sources += (("birthdays", lambda: _birthdays(ctx, s, e)), ("tasks", lambda: _tasks(ctx, s, e)))
     for key, make in sources:
         try:
             data[key] = await make()
@@ -231,8 +302,11 @@ def format_data(ctx: ToolContext, d: dict) -> str:
     if owner:
         parts.append(f"Владелец: {owner}")
     parts.append(f"Погода: {d.get('weather') or 'нет данных'}")
-    parts.append(_section("События сегодня", [_event_str(x) for x in d.get("events") or []]))
-    parts.append(_section("Напоминания на сегодня", [_reminder_str(x) for x in d.get("reminders") or []]))
+    rest = d.get("mode") == "now"
+    parts.append(_section("События до конца дня" if rest else "События сегодня",
+                          [_event_str(x) for x in d.get("events") or []]))
+    parts.append(_section("Напоминания до конца дня" if rest else "Напоминания на сегодня",
+                          [_reminder_str(x) for x in d.get("reminders") or []]))
     parts.append(_section(f"Дни рождения в ближайшие {BIRTHDAY_DAYS} дня",
                           [_bday_str(x) for x in d.get("birthdays") or []]))
     parts.append(_section("Задачи со сроком (просроченные и на ближайшие сутки)",
@@ -271,7 +345,9 @@ def _push_line(d: dict) -> str:
 def fallback_text(d: dict) -> str:
     """Сводка без модели — по тем же данным."""
     today: date = d.get("today") or timeutil.now_utc().date()
-    lines = [f"Доброе утро. Сегодня {timeutil.weekday_name(today)}, {today.day} {timeutil.month_gen(today.month)}."]
+    rest = d.get("mode") == "now"
+    day = f"{timeutil.weekday_name(today)}, {today.day} {timeutil.month_gen(today.month)}"
+    lines = [f"Что осталось на сегодня ({day})." if rest else f"Доброе утро. Сегодня {day}."]
     if d.get("weather"):
         lines.append(d["weather"])
     blocks: list[str] = []
@@ -286,7 +362,8 @@ def fallback_text(d: dict) -> str:
             f"• {'просрочено' if t['overdue'] else 'до ' + t['due']}: {t['text']}"
             + (f" [{t['project']}]" if t.get("project") else "") for t in d["tasks"]))
     if not d.get("events") and not d.get("reminders"):
-        blocks.insert(0, "Встреч и напоминаний на сегодня нет — день свободный.")
+        blocks.insert(0, "До конца дня встреч и напоминаний нет." if rest
+                      else "Встреч и напоминаний на сегодня нет — день свободный.")
     push = _push_line(d)
     if push:
         blocks.append(push)
@@ -294,18 +371,26 @@ def fallback_text(d: dict) -> str:
 
 
 # ── главное ──────────────────────────────────────────────────────────────────
-async def morning_brief(ctx: ToolContext) -> str:
-    """Утренняя сводка владельцу. Модель не ответила (LLMError или что угодно) — шаблон."""
+async def morning_brief(ctx: ToolContext, *, mode: str = "morning") -> str:
+    """Утренняя сводка владельцу. mode="now" — сводка на остаток дня (для /today в любое время):
+    без «доброго утра» и без того, что уже прошло. Модель не ответила (LLMError или что угодно) — шаблон."""
+    mode = mode if mode in _MODES else "morning"
     try:
-        d = await gather(ctx)
+        if mode == "now":
+            _, day_end = day_bounds(ctx)
+            d = await gather(ctx, timeutil.now_utc(), day_end, extras=True)
+        else:
+            d = await gather(ctx)
     except Exception:   # gather сам не падает, но сводка не должна зависеть ни от чего
         log.exception("сводка: сбор данных")
         d = {"today": ctx.now_local().date()}
+    d["mode"] = mode
     try:
         cfg = ctx.cfg
         owner = (cfg.owner_name or "").strip()
+        parts = {k: v.format(now=ctx.now_local().strftime("%H:%M")) for k, v in _MODES[mode].items()}
         system = SYSTEM.format(name=cfg.bot_name, owner=f"владельца ({owner})" if owner else "владельца",
-                               limit=BRIEF_MAX)
+                               limit=BRIEF_MAX, **parts)
         text = await ctx.llm.ask(system, format_data(ctx, d), deep=False, temperature=0.9)
         text = str(text or "").strip()
         if text:
@@ -314,3 +399,8 @@ async def morning_brief(ctx: ToolContext) -> str:
     except Exception as e:
         log.warning("сводка: модель не ответила (%s) — шлю шаблон", e)
     return fallback_text(d)
+
+
+async def today_brief(ctx: ToolContext) -> str:
+    """Сводка на остаток сегодняшнего дня — для /today (утренняя начинается с «доброго утра»)."""
+    return await morning_brief(ctx, mode="now")

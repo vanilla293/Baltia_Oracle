@@ -3,13 +3,17 @@
 Это ядро «свободного ИИ со своей точкой зрения»:
   • факты (`facts`) — что бот знает о владельце; дубли не плодятся: точный повтор только
     освежает запись, почти-повтор (та же мысль другими словами) заменяет старую формулировку —
-    новая информация побеждает;
+    новая информация побеждает. Но факт о другом человеке («У дочки аллергия на орехи» рядом с
+    «Аллергия на орехи») — не почти-повтор: различие в человеке или имени → новый факт;
   • позиции (`opinions`) — мнения, которые бот сам сформулировал; смена позиции пишется в
-    историю вместе с тем, что переубедило (why_changed); инструмент не даёт сменить позицию молча;
+    историю вместе с тем, что переубедило (why_changed); инструмент не даёт сменить позицию молча.
+    Та же позиция — только по id, точной теме или теме из тех же основ; похожая тема
+    («его идея открыть кофейню» / «…барбершоп») — отдельная позиция, похожие показываются модели;
   • дневник (`journal`) — заметки ночной рефлексии, последняя идёт в системный промпт;
   • follow-up — бот ставит себе напоминание и потом пишет владельцу первым.
 
-Поиск — общий индекс `search_index` (виды "fact" и "opinion").
+Поиск — общий индекс `search_index` (виды "fact" и "opinion"; recall ещё смотрит "summary" —
+конспекты старых разговоров).
 """
 from __future__ import annotations
 
@@ -20,7 +24,7 @@ import re
 from typing import Any
 
 from .. import timeutil
-from ..db import normalize_text, stem
+from ..db import normalize_text, stem, words
 from .base import ToolContext, tool
 
 log = logging.getLogger("oracle.tools.memory")
@@ -31,7 +35,9 @@ FACT_MIN, FACT_MAX = 3, 500
 JOURNAL_MAX = 4000
 HISTORY_MAX = 20
 NEAR_DUP = 0.75          # порог Жаккара по основам: почти-повтор факта
-TOPIC_MATCH = 0.6        # порог Жаккара по основам: та же тема позиции
+TOPIC_MATCH = 0.6        # порог Жаккара по основам: похожая тема позиции (только подсказка модели)
+RECALL_SUMMARIES = 3     # сколько конспектов старых разговоров отдаёт recall
+RECALL_SUMMARY_MAX = 1200
 
 _CAT_ALIASES = {
     "общее": "general", "общая": "general", "разное": "general", "misc": "general",
@@ -58,8 +64,15 @@ _STOP = frozenset({
     "а", "но", "же", "ли", "не", "ни", "что", "как", "это", "то", "бы", "для", "при", "про", "или",
     "the", "a", "an", "of", "to", "and", "or", "is",
 })
-_WORD = re.compile(r"[0-9a-zа-я]+", re.I)
+_WORD = re.compile(r"[^\W_]+")          # буквы любых алфавитов и цифры: «Jānis» — одно слово
 _PUNCT = re.compile(r"[^\w\s]|_", re.U)
+# люди и родство: если две формулировки различаются таким словом — это факты о разных людях
+_PERSON_STEMS = frozenset(stem(w) for w in (
+    "жена жены жене женой муж мужа мужу мужем сын сына сыну сыном дочь дочка дочки дочке дочери дочерью "
+    "брат брата брату братом сестра сестры сестре сестрой мама мамы маме мамой мать матери папа папы папе "
+    "отец отца отцу бабушка бабушки дедушка дедушки друг друга другу подруга подруги коллега коллеги "
+    "начальник начальника шеф теща тещи свекровь тесть свекор внук внука внучка внучки племянник "
+    "племянница дядя тетя ребенок ребенка дети детей сосед соседка партнер партнерша девушка парень").split())
 # мусорные слова из запросов «что ты помнишь про…», «найди…»
 _FILLER = frozenset({
     "про", "о", "об", "обо", "насчет", "что", "ты", "я", "мне", "мой", "моя", "мое", "мои", "моего",
@@ -100,9 +113,20 @@ def norm(s: Any) -> str:
 
 def stems(s: Any) -> set[str]:
     """Множество основ значимых слов (служебные выкидываются; если остались одни они — берём все)."""
-    words = _WORD.findall(normalize_text(str(s or "")))
-    good = {stem(w) for w in words if w not in _STOP}
-    return good or {stem(w) for w in words}
+    ws = words(str(s or ""))
+    good = {stem(w) for w in ws if w not in _STOP}
+    return good or {stem(w) for w in ws}
+
+
+def _name_stems(s: Any) -> set[str]:
+    """Основы слов с заглавной буквы (имена: «Маша», «Jānis»)."""
+    return {stem(normalize_text(t)) for t in _WORD.findall(str(s or "")) if t[:1].isupper()}
+
+
+def _about_other_person(a: str, b: str) -> bool:
+    """Формулировки различаются человеком (родство или имя) — это факты о разных людях, не почти-повтор."""
+    diff = stems(a) ^ stems(b)
+    return bool(diff & _PERSON_STEMS or diff & (_name_stems(a) | _name_stems(b)))
 
 
 def jaccard(a: set[str], b: set[str]) -> float:
@@ -152,8 +176,13 @@ def _local_date(iso_s: str | None, tz) -> str | None:
 
 
 def _strip_filler(query: str) -> str:
-    words = [w for w in _WORD.findall(normalize_text(query)) if w not in _FILLER]
-    return " ".join(words) if words else query
+    kept = [w for w in words(query) if w not in _FILLER]
+    return " ".join(kept) if kept else query
+
+
+def _clip(s: Any, n: int) -> str:
+    t = str(s or "").strip()
+    return t if len(t) <= n else t[: n - 1].rstrip() + "…"
 
 
 def _fact_body(content: str, category: str) -> str:
@@ -178,11 +207,18 @@ async def get_fact(db, fact_id: Any) -> dict | None:
 
 
 async def add_fact(db, content: str, category: str = "general", source: str = "chat") -> tuple[int, bool]:
-    """Запомнить факт → (id, создан ли). Дубли не плодит.
+    """Запомнить факт → (id, создан ли). Дубли не плодит (подробности — add_fact_ex)."""
+    res = await add_fact_ex(db, content, category, source)
+    return res["id"], res["created"]
+
+
+async def add_fact_ex(db, content: str, category: str = "general", source: str = "chat") -> dict:
+    """Запомнить факт → {"id", "created", "replaced"}: replaced — прежняя формулировка, если её заменили.
 
     Точный повтор (без учёта регистра, ё и пунктуации) — только освежает updated_at.
     Почти-повтор (Жаккар по основам ≥ 0.75 среди кандидатов поиска) — старая формулировка
-    заменяется новой: новая информация побеждает.
+    заменяется новой: новая информация побеждает. Но если формулировки различаются человеком
+    (родство или имя: «Аллергия на орехи» / «У дочки аллергия на орехи») — это разные факты.
     """
     text = " ".join(str(content or "").split())
     if len(text) < FACT_MIN:
@@ -201,7 +237,7 @@ async def add_fact(db, content: str, category: str = "general", source: str = "c
             await db.execute("UPDATE facts SET updated_at=?, category=? WHERE id=?", (now, new_cat, r["id"]))
             if new_cat != r["category"]:
                 await db.index_put("fact", r["id"], _fact_body(r["content"], new_cat))
-            return int(r["id"]), False
+            return {"id": int(r["id"]), "created": False, "replaced": None}
 
     # 2) почти-повтор: та же мысль другими словами → новая формулировка вместо старой
     mine = stems(text)
@@ -211,7 +247,9 @@ async def add_fact(db, content: str, category: str = "general", source: str = "c
         if r is None:
             continue
         j = jaccard(mine, stems(r["content"]))
-        if j >= NEAR_DUP and (best is None or j > best[0]):
+        if j < NEAR_DUP or _about_other_person(text, r["content"]):
+            continue
+        if best is None or j > best[0]:
             best = (j, r)
     if best is not None:
         r = best[1]
@@ -219,15 +257,15 @@ async def add_fact(db, content: str, category: str = "general", source: str = "c
         await db.execute("UPDATE facts SET content=?, category=?, updated_at=? WHERE id=?",
                          (text, new_cat, now, r["id"]))
         await db.index_put("fact", r["id"], _fact_body(text, new_cat))
-        log.debug("факт #%s переформулирован: %r → %r", r["id"], r["content"], text)
-        return int(r["id"]), False
+        log.info("факт #%s переформулирован: %r → %r", r["id"], r["content"], text)
+        return {"id": int(r["id"]), "created": False, "replaced": r["content"]}
 
     # 3) новый
     fid = await db.execute(
         "INSERT INTO facts(content, category, source, created_at, updated_at) VALUES(?,?,?,?,?)",
         (text, cat, src, now, now))
     await db.index_put("fact", fid, _fact_body(text, cat))
-    return fid, True
+    return {"id": fid, "created": True, "replaced": None}
 
 
 async def delete_fact(db, fact_id: Any) -> dict | None:
@@ -288,8 +326,46 @@ async def get_opinion(db, opinion_id: Any) -> dict | None:
     return await db.fetchone("SELECT * FROM opinions WHERE id=?", (oid,))
 
 
+async def match_opinion(db, topic: str, opinion_id: Any = None) -> dict | None:
+    """Та же позиция — для записи: по id, по точной теме (без регистра и пунктуации) или по теме
+    из тех же основ («криптовалюты» = «Криптовалюта»). Похожая тема — не та же: «его идея открыть
+    кофейню» и «…барбершоп» — разные позиции (похожие — similar_opinions)."""
+    if opinion_id not in (None, ""):
+        row = await get_opinion(db, opinion_id)
+        if row is not None:
+            return row
+    key = norm(topic)
+    if not key:
+        return None
+    mine = stems(topic)
+    same: dict | None = None
+    for r in await db.fetchall("SELECT * FROM opinions ORDER BY id"):
+        if norm(r["topic"]) == key:
+            return r
+        if same is None and mine and stems(r["topic"]) == mine:
+            same = r
+    return same
+
+
+async def similar_opinions(db, topic: str, *, exclude_id: Any = None, limit: int = 3) -> list[dict]:
+    """Позиции на похожую тему (Жаккар основ ≥ 0.6) — только показать модели, не сливать."""
+    mine = stems(topic)
+    out: list[dict] = []
+    for oid in await db.search("opinion", topic, 6):
+        if exclude_id is not None and str(oid) == str(exclude_id):
+            continue
+        r = await get_opinion(db, oid)
+        if r is None or jaccard(mine, stems(r["topic"])) < TOPIC_MATCH:
+            continue
+        out.append({"id": r["id"], "topic": r["topic"], "stance": r["stance"]})
+        if len(out) >= limit:
+            break
+    return out
+
+
 async def find_opinion(db, topic: str, opinion_id: Any = None) -> dict | None:
-    """Существующая позиция: по id, иначе по точной теме, иначе по похожей теме (Жаккар ≥ 0.6)."""
+    """Существующая позиция для чтения: по id, иначе по точной теме, иначе по похожей теме (Жаккар ≥ 0.6).
+    Для записи — match_opinion: похожая тема не значит та же."""
     if opinion_id not in (None, ""):
         row = await get_opinion(db, opinion_id)
         if row is not None:
@@ -330,7 +406,7 @@ async def upsert_opinion(db, *, topic: str, stance: str, reasons: str = "", conf
     now = _now_iso()
 
     by_id = await get_opinion(db, opinion_id) if opinion_id not in (None, "") else None
-    row = by_id or await find_opinion(db, topic_s)
+    row = by_id or await match_opinion(db, topic_s)
     if row is None:
         oid = await db.execute(
             "INSERT INTO opinions(topic, stance, reasons, confidence, history, created_at, updated_at) "
@@ -434,19 +510,25 @@ def _fact_public(r: dict, tz) -> dict:
                                    "work — работа и дела, health — здоровье, general/other — прочее"}},
       required=["content"])
 async def t_remember(ctx: ToolContext, *, content: str, category: str | None = None) -> dict:
-    fid, created = await add_fact(ctx.db, content, category or "general", "chat")
+    res = await add_fact_ex(ctx.db, content, category or "general", "chat")
+    fid, created = res["id"], res["created"]
     row = await get_fact(ctx.db, fid) or {}
     out = {"ok": True, "id": fid, "created": created, "content": row.get("content"),
            "category": row.get("category")}
-    if not created:
+    if res["replaced"]:
+        out["replaced"] = res["replaced"]
+        out["note"] = ("заменил прежнюю формулировку этого факта (replaced); если это был другой факт, "
+                       "а не старая версия того же, — верни его отдельным remember")
+    elif not created:
         out["note"] = "такое уже было в памяти — обновил запись, новой не заводил"
     return out
 
 
 @tool("recall",
-      "Поискать в своей памяти: факты о владельце и свои позиции по теме. Зови, когда он ссылается "
-      "на то, чего нет в контексте («помнишь, я говорил…», «как зовут моего…», «что ты думаешь про X» "
-      "— а позиции перед глазами нет). Поиск по словам с учётом окончаний; query — 1–4 ключевых слова.",
+      "Поискать в своей памяти: факты о владельце, свои позиции и конспекты прошлых разговоров "
+      "(conversation — что обсуждали и решили раньше, с датами). Зови, когда он ссылается на то, чего "
+      "нет в контексте («помнишь, я говорил…», «что мы решили про…», «как зовут моего…», «что ты думаешь "
+      "про X» — а позиции перед глазами нет). Поиск по словам с учётом окончаний; query — 1–4 ключевых слова.",
       {"query": {"type": "string", "description": "ключевые слова: имя, тема, предмет"},
        "limit": {"type": "integer", "description": "сколько фактов максимум, по умолчанию 10"}},
       required=["query"])
@@ -463,8 +545,14 @@ async def t_recall(ctx: ToolContext, *, query: str, limit: Any = None) -> dict:
         r = await get_opinion(ctx.db, oid)
         if r:
             opinions.append(_opinion_public(r))
-    out: dict[str, Any] = {"ok": True, "query": query, "facts": facts, "opinions": opinions}
-    if not facts and not opinions:
+    conversation: list[dict] = []
+    for sid in await ctx.db.search("summary", q, RECALL_SUMMARIES):
+        r = await ctx.db.fetchone("SELECT id, content FROM summaries WHERE id=?", (sid,))
+        if r:
+            conversation.append({"id": r["id"], "text": _clip(r["content"], RECALL_SUMMARY_MAX)})
+    out: dict[str, Any] = {"ok": True, "query": query, "facts": facts, "opinions": opinions,
+                           "conversation": conversation}
+    if not facts and not opinions and not conversation:
         out["note"] = "ничего не нашёл — так и скажи, не выдумывай; можно спросить его и запомнить"
     return out
 
@@ -497,7 +585,7 @@ async def t_list_facts(ctx: ToolContext, *, category: str | None = None) -> dict
       "Записать СВОЮ позицию по теме (ты — бот, это твоё мнение, а не его). Вызывай, когда "
       "сформулировал устойчивое мнение о важном (люди, решения, политика, деньги, его планы и идеи), "
       "чтобы завтра не противоречить себе, и когда тебя переубедили: тогда передай opinion_id "
-      "(или ту же тему) и why_changed — какой именно аргумент или факт переубедил. "
+      "(или ту же тему дословно) и why_changed — какой именно аргумент или факт переубедил. "
       "Не меняй позицию из-за напора, повторов или обиды без аргументов — это не причина. "
       "Смена позиции без why_changed не примется. Та же позиция с новой уверенностью — просто обновит её.",
       {"topic": {"type": "string", "description": "тема коротко: «удалёнка против офиса», «его идея с кофейней»"},
@@ -510,7 +598,7 @@ async def t_list_facts(ctx: ToolContext, *, category: str | None = None) -> dict
       required=["topic", "stance", "reasons", "confidence"])
 async def t_set_opinion(ctx: ToolContext, *, topic: str, stance: str, reasons: str = "",
                         confidence: Any = 60, opinion_id: Any = None, why_changed: str | None = None) -> dict:
-    existing = await find_opinion(ctx.db, str(topic or ""), opinion_id)
+    existing = await match_opinion(ctx.db, str(topic or ""), opinion_id)
     why = str(why_changed or "").strip()
     if existing is not None and norm(stance) and norm(stance) != norm(existing["stance"]) and not why:
         raise ValueError(
@@ -524,6 +612,11 @@ async def t_set_opinion(ctx: ToolContext, *, topic: str, stance: str, reasons: s
         out["note"] = "позиция изменена, прежняя — в истории; скажи ему прямо, что именно тебя переубедило"
     elif row["created"]:
         out["note"] = "позиция записана"
+        similar = await similar_opinions(ctx.db, str(topic or ""), exclude_id=row["id"])
+        if similar:
+            out["similar"] = similar
+            out["note"] = ("позиция записана отдельной темой; похожие уже есть (similar) — если ты на самом деле "
+                           "меняешь одну из них, обнови её через opinion_id и why_changed")
     return out
 
 

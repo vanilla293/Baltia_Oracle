@@ -4,18 +4,21 @@
 `ref_type='task'`, `ref_id=<id задачи>`; модуль reminders импортируется лениво.
 Владелец явно отказался от напоминания (remind=false) — отметка в kv `task_noremind:<id>`,
 чтобы смена срока или текста не вернула его обратно.
+
+Срок одной датой («к пятнице», «сегодня») — это «до конца дня»: due_at = 23:59 местного, а
+напоминание — утром в 09:00 (или в ближайший час, если утро уже прошло).
 """
 from __future__ import annotations
 
 import importlib
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from .. import timeutil
-from ..db import normalize_text
+from ..db import normalize_text, search_stems, words
 from .base import ToolContext, tool
 
 log = logging.getLogger("oracle.tools.projects")
@@ -43,6 +46,8 @@ _PRIORITY_WORDS = {"высокий": 1, "high": 1, "срочно": 1, "обыч�
 _EMPTY = {"", "none", "null", "нет", "-", "—", "без срока"}
 _CLOSED_SHOWN = 15
 _LIST_LIMIT = 60
+END_OF_DAY = time(23, 59)          # срок одной датой — до конца дня
+DAY_REMIND = time(9, 0)            # …а напоминание о нём — утром
 
 
 # ── мелочи ───────────────────────────────────────────────────────────────────
@@ -109,13 +114,26 @@ def _clean_text(v: Any, what: str, limit: int = 500) -> str:
 
 
 def _parse_due(v: Any, tz: ZoneInfo) -> datetime | None:
-    """Срок от модели → aware UTC или None («снять срок»). Только дата → 09:00."""
+    """Срок от модели → aware UTC или None («снять срок»). Только дата → до конца дня (23:59)."""
     if v is None:
         return None
     s = str(v).strip()
     if normalize_text(s) in _EMPTY:
         return None
-    return timeutil.parse_local(s, tz).astimezone(timeutil.UTC)
+    return timeutil.parse_local(s, tz, default_time=END_OF_DAY).astimezone(timeutil.UTC)
+
+
+def _remind_at(due: datetime, tz: ZoneInfo) -> datetime | None:
+    """Когда напомнить о задаче со сроком `due` (aware UTC). Срок «до конца дня» (23:59) — утром
+    в 09:00, а если утро прошло — в ближайший час того же дня; иначе — в сам срок. None — уже поздно."""
+    now = timeutil.now_utc()
+    local = due.astimezone(tz)
+    if local.time().replace(second=0, microsecond=0) != END_OF_DAY:
+        return due if due > now else None
+    at = datetime.combine(local.date(), DAY_REMIND, tzinfo=tz)
+    if at <= now:
+        at = (now.astimezone(tz) + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    return at if at < due else None
 
 
 def _is_open(t: dict) -> bool:
@@ -175,13 +193,24 @@ async def resolve_project(db, ref: str | int | None) -> dict | None:
     if exact:
         return _prefer(exact)
     by_id = {r["id"]: r for r in rows}
-    for pid in await db.search("project", s, 3):
-        if pid in by_id:
-            return by_id[pid]
+    # поиск — OR по префиксам основ: одно общее слово («Ремонт машины» → «Ремонт кухни») или предлог
+    # («по» → «бег по утрам») дали бы чужой проект. Кандидат годится, только если в его имени, описании
+    # или цели есть КАЖДОЕ значимое слово запроса (≥ 3 букв)
+    terms = [search_stems(w) for w in words(bare) if len(w) >= 3]
+    if terms:
+        for pid in await db.search("project", bare, 3):
+            if pid in by_id and _covers(by_id[pid], terms):
+                return by_id[pid]
     part = [r for r in rows
             if bare in normalize_text(r["name"])
             or (len(r["name"].strip()) >= 3 and normalize_text(r["name"]).strip() in key)]
     return _prefer(part) if part else None
+
+
+def _covers(row: dict, terms: list[list[str]]) -> bool:
+    """Каждое слово запроса (его основы) — префикс какого-то слова проекта (имя, описание, цель)."""
+    ws = words(" ".join(str(row.get(k) or "") for k in ("name", "description", "goal")))
+    return all(any(w.startswith(t) for w in ws for t in variants) for variants in terms)
 
 
 async def _need_project(db, ref: Any) -> dict:
@@ -235,11 +264,14 @@ async def _create_task_reminder(ctx: ToolContext, task: dict, project_name: str 
         return None, ""
     if due <= timeutil.now_utc():
         return None, "срок уже прошёл — задачу записал, напоминание не ставил"
+    at = _remind_at(due, ctx.tz)
+    if at is None:
+        return None, "срок — сегодня до конца дня, напоминать уже поздно — задачу записал без напоминания"
     rem = _reminders_module()
     if rem is None:
         return None, "напоминания сейчас недоступны — задачу записал без напоминания"
     text = f"Задача: {task['text']}" + (f" [{project_name}]" if project_name else "")
-    when = due.astimezone(ctx.tz).strftime("%Y-%m-%d %H:%M")
+    when = at.astimezone(ctx.tz).strftime("%Y-%m-%d %H:%M")
     try:
         r = await rem.create_reminder(ctx, text=text, when=when, kind="task",
                                       ref_type="task", ref_id=int(task["id"]))
@@ -438,8 +470,9 @@ async def t_update_project(ctx: ToolContext, *, project: Any, name: str | None =
 # ── инструменты: задачи ──────────────────────────────────────────────────────
 @tool("add_task",
       "Добавить задачу — в проект или без него. due — срок, локальное «YYYY-MM-DD HH:MM» "
-      "(или «YYYY-MM-DD» — тогда 09:00). Со сроком по умолчанию ставится напоминание на это время "
-      "(remind=false — без него). priority: 1 — высокий, 2 — обычный (по умолчанию), 3 — низкий.",
+      "(или «YYYY-MM-DD» — тогда до конца дня, а напомню утром или в ближайший час). Со сроком по умолчанию "
+      "ставится напоминание на это время (remind=false — без него). "
+      "priority: 1 — высокий, 2 — обычный (по умолчанию), 3 — низкий.",
       {"text": {"type": "string", "description": "что сделать — конкретным действием"},
        "project": {"type": "string", "description": "id или название проекта (необязательно)"},
        "due": {"type": "string", "description": "срок: YYYY-MM-DD HH:MM, локальное"},

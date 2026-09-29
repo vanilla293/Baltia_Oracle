@@ -10,6 +10,10 @@
 
 Явно выбранный провайдер без того, что ему нужно (ключа, пакета), даёт `off` с причиной —
 бот не молчит, а объясняет, что поправить. Все ошибки — `STTError` с человеческим текстом.
+
+Локальная модель грузится (и в первый раз качается — сотни мегабайт) при первом голосовом:
+`cold()` говорит боту предупредить владельца, а ожидание ограничено LOAD_TIMEOUT — загрузка
+при этом продолжается в фоне, следующее голосовое её дождётся, а не начнёт заново.
 """
 from __future__ import annotations
 
@@ -29,6 +33,7 @@ GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 OPENAI_URL = "https://api.openai.com/v1/audio/transcriptions"
 MAX_BYTES = 25 * 1024 * 1024          # предел Whisper API
 TIMEOUT = 120.0
+LOAD_TIMEOUT = 900.0                  # локальная модель: столько ждём загрузку/скачивание за один раз
 PROVIDERS = ("groq", "openai", "local", "off")
 
 TOO_BIG = "файл больше 25 МБ — пришли короче"
@@ -97,6 +102,7 @@ class STT:
         self.provider, self.reason = resolve_provider(cfg)
         self._model: Any = None                 # faster_whisper.WhisperModel, грузится один раз
         self._model_lock = asyncio.Lock()
+        self._loading: asyncio.Future | None = None   # идущая загрузка (переживает таймаут ожидания)
         if self.provider == "off":
             log.info("STT выключен: %s", self.reason)
         else:
@@ -104,6 +110,10 @@ class STT:
 
     def available(self) -> bool:
         return self.provider != "off"
+
+    def cold(self) -> bool:
+        """Локальная модель ещё не загружена — первое голосовое будет долгим (загрузка, скачивание)."""
+        return self.provider == "local" and self._model is None
 
     def describe(self) -> str:
         """Одна строка для /status."""
@@ -115,7 +125,8 @@ class STT:
         if self.provider == "local":
             state = "загружена" if self._model is not None else "загрузится при первом голосовом"
             return f"локальный faster-whisper ({c.whisper_model}, {c.whisper_device}; {state})"
-        return f"выключено — {self.reason}"
+        why = self.reason.removeprefix("распознавание голоса ").rstrip(".")
+        return f"нет — {why}" if why else "нет"
 
     async def aclose(self) -> None:
         if self._http is not None and self._own_http:
@@ -211,14 +222,25 @@ class STT:
                 root.mkdir(parents=True, exist_ok=True)
             except OSError:
                 pass
-            log.info("гружу whisper «%s» (%s, %s)…", c.whisper_model, c.whisper_device, c.whisper_compute_type)
-            try:
-                self._model = await asyncio.to_thread(
+            if self._loading is None:
+                log.info("гружу whisper «%s» (%s, %s)…", c.whisper_model, c.whisper_device, c.whisper_compute_type)
+                self._loading = asyncio.ensure_future(asyncio.to_thread(
                     WhisperModel, c.whisper_model, device=c.whisper_device,
-                    compute_type=c.whisper_compute_type, download_root=str(root))
+                    compute_type=c.whisper_compute_type, download_root=str(root)))
+                # ошибку забираем всегда — даже если ждать её уже некому (таймаут)
+                self._loading.add_done_callback(lambda f: f.cancelled() or f.exception())
+            try:
+                self._model = await asyncio.wait_for(asyncio.shield(self._loading), LOAD_TIMEOUT)
+            except asyncio.TimeoutError as e:
+                log.warning("whisper «%s» грузится дольше %.0f с — жду дальше в фоне", c.whisper_model, LOAD_TIMEOUT)
+                raise STTError(f"модель распознавания «{c.whisper_model}» всё ещё загружается (медленно качается?) — "
+                               f"пришли голосовое чуть позже. Быстрее — облачное: бесплатный ключ Groq на "
+                               f"console.groq.com → GROQ_API_KEY в .env") from e
             except Exception as e:
+                self._loading = None
                 log.exception("whisper не загрузился")
                 raise STTError(f"не смог загрузить модель whisper «{c.whisper_model}»: {e}") from e
+            self._loading = None
             return self._model
 
     async def _local(self, data: bytes) -> str:

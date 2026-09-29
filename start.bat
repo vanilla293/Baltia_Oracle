@@ -24,16 +24,23 @@ goto fail
 
 :have_py
 rem ---- 2. Окружение .venv ----
+rem живое окружение - это python и pip: без pip (оборвалась установка) зависимости не поставить
 if not exist ".venv\Scripts\python.exe" goto make_venv
-".venv\Scripts\python.exe" -c "import sys" >nul 2>&1
+".venv\Scripts\python.exe" -m pip --version >nul 2>&1
 if not errorlevel 1 goto have_venv
 echo Окружение .venv сломано - пересоздаю.
 rmdir /s /q ".venv"
 
 :make_venv
+if exist ".venv" rmdir /s /q ".venv"
 echo Создаю окружение .venv...
 %PY% -m venv .venv
-if errorlevel 1 goto venv_fail
+if not errorlevel 1 goto venv_made
+rem недоделанное окружение не оставляем - иначе следующий запуск примет его за готовое
+if exist ".venv" rmdir /s /q ".venv"
+goto venv_fail
+
+:venv_made
 ".venv\Scripts\python.exe" -m pip install -q --disable-pip-version-check --upgrade pip >nul 2>&1
 
 :have_venv

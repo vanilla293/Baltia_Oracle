@@ -6,7 +6,7 @@ import importlib
 from .base import REGISTRY, OutItem, Services, ToolContext, dispatch, schemas, tool  # noqa: F401
 
 MODULES = (
-    "reminders", "calendar", "birthdays", "ideas", "projects", "memory", "news", "tg_chats",
+    "reminders", "calendar", "birthdays", "ideas", "projects", "memory", "news", "tg_chats", "settings",
 )
 
 

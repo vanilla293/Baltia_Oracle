@@ -513,7 +513,7 @@ async def test_draft_reply_saves_and_shows(uctx):
     assert row["draft"] == "в 6 норм, давай"
     assert await uctx.db.kv_get(f"draft_instr:{did}") == "соглашайся на 6"
     item = uctx.outbox[-1]
-    assert item.kind == "text" and item.text == "✍️ Черновик для «Вася Петров»:\n\nв 6 норм, давай"
+    assert item.kind == "text" and item.text == "✍️ Черновик для «Вася Петров»:\n\n```\nв 6 норм, давай\n```"
     assert item.buttons == [[("📨 Отправить", f"draft:send:{did}"), ("🔁 Переписать", f"draft:regen:{did}")],
                             [("✖️ Не надо", f"draft:drop:{did}")]]
     # что ушло модели
@@ -623,7 +623,7 @@ async def test_regen_draft(uctx):
     assert await uctx.db.kv_get(f"draft_instr:{res['draft_id']}") == "откажись"
     user_msg = uctx.llm.calls[1]["messages"][1]["content"]
     assert "откажись" in user_msg and "Прошлый вариант не подошёл" in user_msg and "в 6 норм" in user_msg
-    assert len(uctx.outbox) == 2 and uctx.outbox[-1].text.endswith("давай в 7")
+    assert len(uctx.outbox) == 2 and uctx.outbox[-1].text.endswith("давай в 7\n```")
     # старые кнопки больше не работают
     with pytest.raises(ValueError, match="заменён"):
         await tg.send_draft(uctx, first["draft_id"])

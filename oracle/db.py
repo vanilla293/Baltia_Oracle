@@ -3,17 +3,25 @@
 Одна база — `data/oracle.db`. Все моменты времени — UTC ISO (см. timeutil).
 Поиск: таблица FTS5 `search_index(kind, ref_id, body)`; модули кладут туда текст своих
 записей (`index_put`) и ищут (`search`). Русский без морфологии: запрос режется на основы
-(грубый стеммер) и ищется префиксами — «кофейню» найдёт «кофейня», «кофейни».
+(грубый стеммер) и ищется префиксами — «кофейню» найдёт «кофейня», «кофейни». Слова с
+диакритикой (латышские, украинские имена) не рвутся: «Jānis» ищется как «janis».
+
+Схема растёт миграциями: версия — в `PRAGMA user_version`, шаги — `MIGRATIONS`. База от более
+новой версии бота не открывается (иначе старый код тихо испортит её). Файлы базы — только для
+владельца процесса (0600): там вся память, дневник и чужая переписка.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import re
+import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable
 
 import aiosqlite
 
@@ -21,7 +29,7 @@ from .timeutil import iso, now_utc
 
 log = logging.getLogger("oracle.db")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS kv (
@@ -205,11 +213,17 @@ _ENDINGS = sorted({
     "о", "е", "у", "ю", "ь", "й",
 }, key=len, reverse=True)
 
-_WORD = re.compile(r"[0-9a-zа-я]+", re.I)
+# буквы любых алфавитов и цифры: «Jānis», «Києва», «Bērziņš» — одно слово, а не обрывки
+_WORD = re.compile(r"[^\W_]+")
 
 
 def normalize_text(s: str) -> str:
     return (s or "").lower().replace("ё", "е")
+
+
+def words(s: str) -> list[str]:
+    """Слова текста в нижнем регистре (ё → е) — как их режет поиск."""
+    return _WORD.findall(normalize_text(s))
 
 
 def stem(word: str) -> str:
@@ -227,18 +241,54 @@ def stem(word: str) -> str:
     return out
 
 
+def search_stems(word: str) -> list[str]:
+    """Префиксы для поиска слова: его основа, а у длинного русского слова — ещё и основа покороче:
+    «тренировками» → «тренировк», «трениро» — иначе не найдётся «тренировок» (беглая гласная)."""
+    s = stem(word)
+    out = [s]
+    if len(word) >= 8 and re.search(r"[а-я]", s):
+        short = s[: max(5, len(s) - 2)]
+        if short != s:
+            out.append(short)
+    return out
+
+
 def fts_query(text: str, max_terms: int = 12) -> str:
-    """Текст запроса → FTS5-выражение: основы с префиксом через OR. Пусто → ''."""
+    """Текст запроса → FTS5-выражение: основы с префиксом через OR (search_stems). Пусто → ''."""
     terms: list[str] = []
-    for w in _WORD.findall(normalize_text(text)):
+    for w in words(text):
         if len(w) < 2:
             continue
-        s = stem(w)
-        if s and s not in terms:
-            terms.append(s)
+        for t in search_stems(w):
+            if t and t not in terms and len(terms) < max_terms:
+                terms.append(t)
         if len(terms) >= max_terms:
             break
     return " OR ".join(f'"{t}"*' for t in terms)
+
+
+# ── миграции: версия → шаг (выполняется в одной транзакции при open) ─────────
+async def _m2_index_summaries(c: aiosqlite.Connection) -> None:
+    """v2: recall ищет и в конспектах старых разговоров — проиндексировать уже сохранённые."""
+    async with c.execute("SELECT id, content FROM summaries WHERE id NOT IN "
+                         "(SELECT ref_id FROM search_index WHERE kind='summary')") as cur:
+        rows = await cur.fetchall()
+    for r in rows:
+        await c.execute("INSERT INTO search_index(kind, ref_id, body) VALUES('summary',?,?)",
+                        (int(r[0]), normalize_text(str(r[1] or ""))))
+
+
+MIGRATIONS: dict[int, Callable[[aiosqlite.Connection], Awaitable[None]]] = {
+    2: _m2_index_summaries,
+}
+
+
+def _private(path: str | Path) -> None:
+    """Файл — только владельцу процесса (0600). Не вышло (Windows, чужой файл) — не страшно."""
+    if os.name != "posix":
+        return
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
 
 
 class DB:
@@ -251,24 +301,118 @@ class DB:
         self.fts = True
 
     async def open(self) -> "DB":
+        """Открыть (создать) базу, довести схему до SCHEMA_VERSION. Ошибка → связь закрыта, исключение
+        наружу: иначе поток aiosqlite остаётся жить, процесс виснет и systemd/docker его не перезапустят."""
         if self.path != ":memory:":
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            self._prepare_file()
+            # непустой -wal до открытия = прошлый процесс не закрыл базу (упал, выключили питание)
+            crashed = False
+            with contextlib.suppress(OSError):
+                crashed = os.path.getsize(self.path + "-wal") > 0
+            if crashed:
+                await self._check_integrity()
         self.conn = await aiosqlite.connect(self.path)
-        self.conn.row_factory = aiosqlite.Row
-        await self.conn.execute("PRAGMA journal_mode=WAL")
-        await self.conn.execute("PRAGMA foreign_keys=ON")
-        await self.conn.executescript(SCHEMA)
         try:
-            await self.conn.executescript(FTS_SCHEMA)
-        except Exception as e:  # sqlite без FTS5 — поиск деградирует до LIKE
-            log.warning("FTS5 недоступен (%s) — поиск будет простым", e)
-            self.fts = False
-            await self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS search_index (kind TEXT, ref_id INTEGER, body TEXT)")
-        await self.conn.commit()
-        if await self.kv_get("schema_version") is None:
-            await self.kv_set("schema_version", str(SCHEMA_VERSION))
+            self.conn.row_factory = aiosqlite.Row
+            fresh = await self._scalar_raw(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages'") == 0
+            await self.conn.execute("PRAGMA journal_mode=WAL")
+            await self.conn.execute("PRAGMA foreign_keys=ON")
+            await self.conn.executescript(SCHEMA)
+            try:
+                await self.conn.executescript(FTS_SCHEMA)
+            except Exception as e:  # sqlite без FTS5 — поиск деградирует до LIKE
+                log.warning("FTS5 недоступен (%s) — поиск будет простым", e)
+                self.fts = False
+                await self.conn.execute(
+                    "CREATE TABLE IF NOT EXISTS search_index (kind TEXT, ref_id INTEGER, body TEXT)")
+            await self.conn.commit()
+            await self._migrate(fresh)
+            if self.path != ":memory:":        # WAL и shm SQLite создаёт с правами самой базы
+                for suffix in ("", "-wal", "-shm"):
+                    if os.path.exists(self.path + suffix):
+                        _private(self.path + suffix)
+        except BaseException:
+            conn, self.conn = self.conn, None
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    await conn.close()
+            raise
         return self
+
+    async def _check_integrity(self) -> None:
+        """После аварийной остановки: база цела? Проверка — отдельной связью только для чтения: она
+        не сливает -wal в файл базы и не удаляет его при закрытии (там могут быть последние записи).
+        Повреждена — понятная ошибка; проверить не вышло (занята, нет прав) — открываем как обычно."""
+        rows = await asyncio.to_thread(_quick_check_ro, self.path)
+        if rows is None:
+            log.warning("база: прошлый запуск завершился аварийно, а проверить целостность не вышло")
+            return
+        if rows != ["ok"]:
+            name = Path(self.path).name
+            raise RuntimeError(
+                f"база {self.path} повреждена ({'; '.join(rows[:3])[:300]}). Останови бота, отложи {name}, "
+                f"{name}-wal и {name}-shm в сторону и верни копию из /backup (см. README, «Восстановление "
+                f"из копии»)")
+        log.info("база: прошлый запуск завершился аварийно — проверил, база цела")
+
+    def _prepare_file(self) -> None:
+        """Папка (если её нет — только владельцу) и пустой файл базы с правами 0600 до первой записи."""
+        path = Path(self.path)
+        if not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not path.exists():
+            with contextlib.suppress(OSError):
+                os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+
+    async def _scalar_raw(self, sql: str) -> Any:
+        assert self.conn is not None
+        async with self.conn.execute(sql) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def _migrate(self, fresh: bool) -> None:
+        """Довести схему до SCHEMA_VERSION шагами из MIGRATIONS. Новая база создаётся сразу в последней
+        версии; база без user_version (первые выпуски) — версия из kv schema_version (1)."""
+        ver = int(await self._scalar_raw("PRAGMA user_version") or 0)
+        if fresh:
+            ver = SCHEMA_VERSION
+        elif ver == 0:
+            try:
+                ver = int(await self.kv_get("schema_version", 1) or 1)
+            except (TypeError, ValueError):
+                ver = 1
+        if ver > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"база {self.path} от более новой версии бота (схема v{ver}, этот код знает до "
+                f"v{SCHEMA_VERSION}) — обнови код бота или верни базу из бэкапа")
+        if ver < SCHEMA_VERSION:
+            async with self.transaction() as c:
+                for v in range(ver + 1, SCHEMA_VERSION + 1):
+                    step = MIGRATIONS.get(v)
+                    if step is not None:
+                        await step(c)
+                        log.info("база: миграция до v%s", v)
+                await c.execute(f"PRAGMA user_version={int(SCHEMA_VERSION)}")
+        elif int(await self._scalar_raw("PRAGMA user_version") or 0) != SCHEMA_VERSION:
+            await self.conn.execute(f"PRAGMA user_version={int(SCHEMA_VERSION)}")
+            await self.conn.commit()
+        if str(await self.kv_get("schema_version")) != str(SCHEMA_VERSION):
+            await self.kv_set("schema_version", str(SCHEMA_VERSION))
+
+    async def backup(self, dest: str | Path) -> int:
+        """Резервная копия (VACUUM INTO) в dest с правами 0600 → размер в байтах. dest не должен
+        существовать (или должен быть пустым файлом)."""
+        assert self.conn is not None, "DB не открыта"
+        dest = Path(dest)
+        if not dest.exists():               # сразу 0600: в копии вся память и переписка
+            os.close(os.open(dest, os.O_CREAT | os.O_WRONLY, 0o600))
+        async with self._wlock:
+            if self.conn.in_transaction:    # хвост незакоммиченной записи — VACUUM внутри транзакции нельзя
+                await self.conn.commit()
+            await self.conn.execute("VACUUM INTO ?", (str(dest),))
+        _private(dest)
+        return dest.stat().st_size
 
     async def close(self) -> None:
         if self.conn is not None:
@@ -280,8 +424,15 @@ class DB:
         """INSERT/UPDATE/DELETE → lastrowid (для INSERT) или число затронутых строк."""
         assert self.conn is not None, "DB не открыта"
         async with self._wlock:
-            cur = await self.conn.execute(sql, tuple(params))
-            await self.conn.commit()
+            try:
+                cur = await self.conn.execute(sql, tuple(params))
+                await self.conn.commit()
+            except Exception:
+                # упавшая запись не должна оставить связь в открытой транзакции: иначе следующий
+                # чужой commit зафиксирует мусор, а VACUUM INTO (/backup) откажет
+                with contextlib.suppress(Exception):
+                    await self.conn.rollback()
+                raise
             if sql.lstrip().upper().startswith("INSERT"):
                 return int(cur.lastrowid or 0)
             return int(cur.rowcount or 0)
@@ -375,6 +526,27 @@ class DB:
             "SELECT id, role, content, via, created_at FROM messages WHERE summarized=0 "
             "ORDER BY id DESC LIMIT ?", (int(limit),))
         return list(reversed(rows))
+
+
+def _quick_check_ro(path: str) -> list[str] | None:
+    """PRAGMA quick_check связью только для чтения → строки результата (["ok"] — цела);
+    None — проверить не удалось (база занята, нет прав и т.п.)."""
+    try:
+        conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    except sqlite3.OperationalError as e:
+        log.debug("quick_check: не открыл %s: %s", path, e)
+        return None
+    except sqlite3.DatabaseError as e:
+        return [str(e)]
+    try:
+        return [str(r[0]) for r in conn.execute("PRAGMA quick_check").fetchall()]
+    except sqlite3.OperationalError as e:
+        log.debug("quick_check %s: %s", path, e)
+        return None
+    except sqlite3.DatabaseError as e:          # «database disk image is malformed», «file is not a database»
+        return [str(e)]
+    finally:
+        conn.close()
 
 
 async def open_db(path: str | Path) -> DB:

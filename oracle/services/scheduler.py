@@ -7,18 +7,25 @@
   2) отложенные («💤») — повтор без изменения расписания;
   3) «долбилки» — каждые nag_interval_min, фразы с эскалацией, после nag_max — «сдаюсь»;
   4) ежедневные задачи по местному времени (сводка, дни рождения, дайджест, рефлексия) —
-     раз в сутки (kv `job:<имя>`), с догоном в течение 3 ч; тяжёлое — в фоне;
+     раз в сутки, в фоне. kv `job:<имя>` ставится только после того, как задача сделана: не дошло
+     (сеть, перезапуск) — повтор через JOB_RETRY, пока не выйдет окно догона CATCH_UP (3 ч; дни
+     рождения догоняются весь день); сгенерированный текст при повторе не пишется заново;
   5) уборка: сворачивание старого диалога (agent.summarize_old), не чаще раза в 10 мин.
 
 Тик не падает: каждый шаг и каждая строка — в своём try/except. Не отправилось сообщение —
-состояние не двигаем и пробуем на следующем тике (но не дольше SEND_GIVE_UP, чтобы не застрять).
+состояние не двигаем и пробуем на следующем тике. Нет связи с Telegram (сеть, таймаут, 5xx) —
+ждём сколько угодно и отправляем с пометкой «пропустил», когда связь вернётся (остаток тика после
+первой такой ошибки не тратим). Telegram отказывает всерьёз (бот заблокирован, чат не найден, кривое
+сообщение) — пробуем SEND_GIVE_UP, потом двигаем состояние, пишем в диалог «не смог доставить» и
+сообщаем владельцу при первой удачной отправке.
+Состояние после отправки пишется, только если строку за это время не тронули (отмена, отметка, перенос).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import re
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -35,10 +42,15 @@ CATCH_UP = timedelta(hours=3)           # ежедневную задачу до
 STALE_NAG = timedelta(hours=1)          # долбёжка, просроченная на час (бот лежал), — уже не к месту
 STALE_WAKE = timedelta(hours=1)         # будильник, опоздавший на час, не долбит
 SEND_TIMEOUT = 60.0                     # секунд на одну отправку
-SEND_GIVE_UP = timedelta(minutes=30)    # столько пробуем переотправить, потом двигаем состояние
+SEND_GIVE_UP = timedelta(minutes=30)    # столько пробуем переотправить при отказе Telegram, потом двигаем
+JOB_RETRY = (timedelta(minutes=5), timedelta(minutes=10), timedelta(minutes=20), timedelta(minutes=30))
+FOLLOWUP_RETRY = (15, 60, 300, 300, 300, 300, 300, 300)   # паузы (с) между попытками follow-up'а, ≈ 30 мин
+UNDELIVERED_KEY = "undelivered"         # kv: что не смогли доставить — скажем при первой удачной отправке
+UNDELIVERED_MAX = 10
 SUMMARY_EVERY = timedelta(minutes=10)
 BATCH = 50                              # строк на шаг за тик (остальное — на следующем)
 ERR_MAX = 300
+RECORD_MAX = 5000                       # показанное владельцу — в разговор не длиннее (= handlers.RECORD_MAX)
 
 JOBS = (("morning", "morning_brief_time"), ("birthdays", "birthday_time"),
         ("news", "news_digest_time"), ("reflection", "reflection_time"))
@@ -46,6 +58,9 @@ JOBS = (("morning", "morning_brief_time"), ("birthdays", "birthday_time"),
 FOLLOWUP_TRIGGER = "Ты сам поставил себе вернуться к теме: {text}"
 GIVE_UP = "Всё, сдаюсь. «{text}» — отметь, когда сделаешь."
 STALE_GIVE_UP = "Пока я был выключен, долбить было некому. «{text}» — отметь, когда сделаешь."
+WAKE_GIVE_UP = "Всё, сдаюсь — похоже, проспал."
+STALE_WAKE_GIVE_UP = "Пока я был выключен, будить было некому — надеюсь, встал сам."
+GAVE_UP = "gave_up"     # _deliver: так и не доставили — состояние двигаем, но в диалог пишем «не смог»
 
 # эскалация: от вежливого к настырному; последние — с перчиком, но без наездов на него самого
 NAG_LINES = (
@@ -75,7 +90,7 @@ WAKE_LINES = (
     "Доброе утро. Пора вставать.",
     "Подъём, подъём.",
     "Ну давай, вставай.",
-    "Глаза открыл? Теперь ноги на пол.",
+    "Глаза открыты? Теперь ноги на пол.",
     "Будильник, который нельзя выключить, — это я.",
     "«Ещё пять минут» — самая популярная утренняя ложь.",
     "Я не отстану.",
@@ -155,6 +170,10 @@ def _zone(tz: Any, fallback: ZoneInfo) -> ZoneInfo:
         return fallback
 
 
+def _clip(s: str, n: int) -> str:
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
 def _int(v: Any, default: int) -> int:
     try:
         return int(v) if v is not None and not isinstance(v, bool) else default
@@ -165,6 +184,24 @@ def _int(v: Any, default: int) -> int:
 def _err(e: BaseException) -> str:
     s = str(e).strip() or type(e).__name__
     return s if len(s) <= ERR_MAX else s[: ERR_MAX - 1] + "…"
+
+
+# сеть/сервер Telegram недоступны — стоит повторить позже, а не сдаваться. Классы aiogram и aiohttp
+# узнаём по имени: services/ не импортирует aiogram. TelegramEntityTooLarge — потомок TelegramNetworkError,
+# но он навсегда.
+_TRANSIENT = {"TransientSendError", "TelegramNetworkError", "TelegramServerError", "TelegramRetryAfter",
+              "ClientError", "ServerDisconnectedError"}
+_PERMANENT = {"TelegramEntityTooLarge"}
+
+
+def is_transient(e: BaseException) -> bool:
+    """Временная ли ошибка отправки (нет сети, таймаут, 5xx, флуд-контроль)."""
+    names = {c.__name__ for c in type(e).__mro__}
+    if names & _PERMANENT:
+        return False
+    if names & _TRANSIENT or isinstance(e, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+        return True
+    return isinstance(e, OSError) and not isinstance(e, (PermissionError, FileNotFoundError))
 
 
 # ── повторы: быстрый пересчёт ────────────────────────────────────────────────
@@ -239,6 +276,12 @@ class Scheduler:
         self._warned_no_notifier = False
         self._warned_times: set[str] = set()
         self._fail_since: dict[tuple[str, int], datetime] = {}
+        self._outage: tuple[datetime, datetime | None] | None = None   # последний обрыв связи: (с, по)
+        self._offline = False                              # в этом тике сеть уже падала — остальное потом
+        self._job_tasks: dict[str, asyncio.Task] = {}
+        self._job_retry_at: dict[str, datetime] = {}
+        self._job_fails: dict[str, int] = {}
+        self._job_text: dict[tuple[str, date], str] = {}   # готовый текст сводки/дайджеста — для повтора
         self._last_summary: datetime | None = None
         self._summary_task: asyncio.Task | None = None
         self.ticks = 0
@@ -295,6 +338,7 @@ class Scheduler:
         async with self._lock:
             now = timeutil.now_utc()
             self.ticks += 1
+            self._offline = False
             for step in (self._due, self._snoozed, self._nags, self._daily, self._housekeeping):
                 try:
                     await step(now)
@@ -305,9 +349,10 @@ class Scheduler:
 
     # ── отправка ──
     async def _deliver(self, key: tuple[str, int], text: str, buttons: Buttons | None,
-                       now: datetime) -> bool:
-        """Отправить владельцу. False — не вышло, состояние не двигать (повторим на следующем тике).
-        Не выходит дольше SEND_GIVE_UP — сдаёмся и двигаем (True), чтобы не застрять навсегда."""
+                       now: datetime) -> bool | str:
+        """Отправить владельцу. True — ушло; False — не вышло, состояние не двигать (повторим на
+        следующем тике). Нет связи — ждём сколько угодно; Telegram отказывает дольше SEND_GIVE_UP —
+        сдаёмся (GAVE_UP): состояние двигаем, чтобы не застрять навсегда, а владельцу скажем потом."""
         notifier = self.ctx.services.notifier
         if notifier is None:
             if not self._warned_no_notifier:
@@ -319,28 +364,82 @@ class Scheduler:
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            if is_transient(e):
+                self._offline = True
+                if self._outage is None or self._outage[1] is not None:
+                    self._outage = (now, None)
+                log.warning("нет связи с Telegram (%s) — %s:%s отправлю, когда появится", _err(e), key[0], key[1])
+                return False
             since = self._fail_since.setdefault(key, now)
             if now - since < SEND_GIVE_UP:
                 log.warning("не смог отправить %s:%s (%s) — повторю", key[0], key[1], _err(e))
                 return False
-            log.error("не могу отправить %s:%s уже %s — пропускаю", key[0], key[1], now - since)
+            log.error("не могу отправить %s:%s уже %s (%s) — пропускаю", key[0], key[1], now - since, _err(e))
             self._fail_since.pop(key, None)
-            return True
+            await self._note_undelivered(text)
+            return GAVE_UP
         self._fail_since.pop(key, None)
+        if self._outage is not None and self._outage[1] is None:
+            self._outage = (self._outage[0], now)          # связь вернулась
+        await self._flush_undelivered(notifier)
         return True
 
-    async def _send_bg(self, text: str, buttons: Buttons | None = None) -> None:
-        """Отправка из фоновой задачи: без повторов, ошибки — в лог."""
-        notifier = self.ctx.services.notifier
-        if notifier is None:
-            log.info("нет notifier — сообщение не отправлено: %.80s", text)
-            return
+    def _missed_why(self, occurred: datetime) -> str:
+        """Почему опоздали: бот лежал или не было связи с Telegram (вхождение попало в обрыв)."""
+        o = self._outage
+        if o is not None and o[0] - timedelta(minutes=1) <= occurred and (o[1] is None or occurred <= o[1]):
+            return "пока не было связи"
+        return "пока был выключен"
+
+    async def _note_undelivered(self, text: str) -> None:
         try:
-            await asyncio.wait_for(notifier.send(text, buttons=buttons), SEND_TIMEOUT)
+            items = await self.ctx.db.kv_get(UNDELIVERED_KEY) or []
+            first = next((ln.strip() for ln in str(text).splitlines() if ln.strip()), "")
+            items = (list(items) if isinstance(items, list) else []) + [first[:150]]
+            await self.ctx.db.kv_set(UNDELIVERED_KEY, items[-UNDELIVERED_MAX:])
+        except Exception:
+            log.exception("не записал недоставленное")
+
+    async def _flush_undelivered(self, notifier: Any) -> None:
+        """Связь с владельцем есть — сказать, что раньше не дошло (один раз)."""
+        try:
+            items = await self.ctx.db.kv_get(UNDELIVERED_KEY)
+            if not items:
+                return
+            await self.ctx.db.kv_delete(UNDELIVERED_KEY)
+            lines = "\n".join(f"• {x}" for x in items if x)
+            await asyncio.wait_for(notifier.send(f"⚠️ Раньше Telegram не принимал мои сообщения — "
+                                                 f"не дошло:\n{lines}"), SEND_TIMEOUT)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log.error("не смог отправить сообщение: %s", _err(e))
+            log.warning("не сообщил о недоставленном: %s", _err(e))
+
+    async def _send_once(self, text: str, buttons: Buttons | None = None) -> bool:
+        """Отправка из фоновой задачи, одна попытка → ушло ли (нет notifier — «ушло», делать нечего)."""
+        notifier = self.ctx.services.notifier
+        if notifier is None:
+            log.info("нет notifier — сообщение не отправлено: %.80s", text)
+            return True
+        try:
+            await asyncio.wait_for(notifier.send(text, buttons=buttons), SEND_TIMEOUT)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("не смог отправить сообщение: %s", _err(e))
+            return False
+
+    async def _send_bg(self, text: str, buttons: Buttons | None = None) -> bool:
+        """Отправка из фоновой задачи с повторами (FOLLOWUP_RETRY, ≈ SEND_GIVE_UP) → ушло ли."""
+        if await self._send_once(text, buttons):
+            return True
+        for pause in FOLLOWUP_RETRY:
+            await asyncio.sleep(pause)
+            if await self._send_once(text, buttons):
+                return True
+        log.error("так и не отправил сообщение: %.80s", text)
+        return False
 
     async def _record(self, text: str) -> None:
         try:
@@ -360,6 +459,8 @@ class Scheduler:
             "SELECT * FROM reminders WHERE status='active' AND next_at IS NOT NULL AND next_at <= ? "
             "ORDER BY next_at, id LIMIT ?", (timeutil.iso(now), BATCH))
         for row in rows:
+            if self._offline:           # сети нет — остальное на следующем тике, а не по минуте на строку
+                break
             try:
                 await self.fire(row, now)
             except asyncio.CancelledError:
@@ -377,16 +478,23 @@ class Scheduler:
         except Exception:
             log.exception("напоминание #%s: не смог снять", row.get("id"))
 
+    async def _unchanged(self, rid: int, col: str, value: Any) -> bool:
+        """Строка всё ещё та, что прочитали в начале тика (не отменили, не перенесли, не отложили)."""
+        return bool(await self.ctx.db.scalar(
+            f"SELECT 1 FROM reminders WHERE id=? AND status='active' AND {col} IS ?", (rid, value)))
+
     async def fire(self, row: dict, now: datetime | None = None) -> bool:
         """Сработать напоминанию: сообщение (или follow-up через агента), следующий next_at,
-        долбёжка, запись в диалог. False — отправка не удалась, повторим на следующем тике."""
+        долбёжка, запись в диалог. False — отправка не удалась, повторим на следующем тике.
+        Пока шла отправка, строку отменили/перенесли — её новое состояние не затираем."""
         now = now or timeutil.now_utc()
         rid = int(row["id"])
         kind = row.get("kind") or "reminder"
         tz = _zone(row.get("tz"), self.ctx.tz)
         text = str(row.get("text") or "").strip() or "(без текста)"
         rule = row.get("rrule") or None
-        due = timeutil.from_iso(row.get("next_at")) or now
+        seen_next = row.get("next_at")
+        due = timeutil.from_iso(seen_next) or now
         occurred = last_occurrence(rule, row.get("local_start"), tz, now, due)
         late = now - occurred > LATE_AFTER
 
@@ -397,37 +505,48 @@ class Scheduler:
             except Exception as e:   # битое правило в базе — срабатывает последний раз
                 log.warning("напоминание #%s: правило %r не считается (%s) — больше не повторяю", rid, rule, e)
         nag = bool(row.get("nag")) and kind != "followup"
-        if nag and kind == "wake" and now - occurred > STALE_WAKE:
-            nag = False   # будильник, проспанный вместе с ботом, долбить поздно
         interval, _ = self._nag_params(row)
+        # долбить о вхождении, проспанном вместе с ботом (или без связи), поздно: одно сообщение, без долбёжки
+        stale = STALE_WAKE if kind == "wake" else max(STALE_NAG, timedelta(minutes=3 * interval))
+        if nag and now - occurred > stale:
+            nag = False
         status = row.get("status") or "active"
         if nxt is None and not nag:
             status = "done"
         params = (timeutil.iso(now), timeutil.iso(nxt) if nxt else None, int(nag),
-                  timeutil.iso(now + timedelta(minutes=interval)) if nag else None, status, rid)
+                  timeutil.iso(now + timedelta(minutes=interval)) if nag else None, status, rid, seen_next)
         update = ("UPDATE reminders SET fire_count=fire_count+1, last_fired_at=?, next_at=?, snooze_at=NULL, "
-                  "nag_active=?, nag_count=0, nag_next_at=?, status=? WHERE id=?")
+                  "nag_active=?, nag_count=0, nag_next_at=?, status=? "
+                  "WHERE id=? AND status='active' AND next_at IS ?")
+        if not await self._unchanged(rid, "next_at", seen_next):
+            return True     # отменили или перенесли, пока отправлялись строки раньше в этом тике
 
         agent = self.ctx.services.agent
         if kind == "followup" and agent is not None:
-            await self.ctx.db.execute(update, params)
-            self.ctx.services.spawn(self._followup(rid, text), name=f"followup:{rid}")
+            if await self.ctx.db.execute(update, params):
+                self.ctx.services.spawn(self._followup(rid, text), name=f"followup:{rid}")
             return True
 
         msg = fire_text(row)
         if late:
-            msg = f"(пропустил, пока был выключен — было на {timeutil.fmt_local(occurred, tz)}) {msg}"
-        if not await self._deliver(("fire", rid), msg, reminder_buttons(row), now):
+            msg = f"(пропустил, {self._missed_why(occurred)} — было на {timeutil.fmt_local(occurred, tz)}) {msg}"
+        sent = await self._deliver(("fire", rid), msg, reminder_buttons(row), now)
+        if not sent:
             return False
-        await self.ctx.db.execute(update, params)
-        if kind == "followup":
+        if not await self.ctx.db.execute(update, params):
+            log.info("напоминание #%s изменили во время отправки — его состояние не трогаю", rid)
+            return True
+        if sent == GAVE_UP:
+            await self._record(f"Не смог доставить напоминание #{rid} (Telegram не принимал): {text}")
+        elif kind == "followup":
             await self._record(f"Бот сам вернулся к теме (follow-up #{rid}): {text}")
         else:
             await self._record(f"Сработало напоминание #{rid}: {text}")
         return True
 
     async def _followup(self, rid: int, text: str) -> None:
-        """Фон: агент сам пишет по теме follow-up'а; не вышло — короткое напоминание."""
+        """Фон: агент сам пишет по теме follow-up'а; не вышло — короткое напоминание.
+        Сеть моргнула — повторяем (FOLLOWUP_RETRY), а не теряем."""
         agent = self.ctx.services.agent
         msg = ""
         try:
@@ -437,10 +556,11 @@ class Scheduler:
             raise
         except Exception as e:
             log.warning("follow-up #%s: агент не ответил: %s", rid, _err(e))
-        if not msg:
+        fallback = not msg
+        if fallback:
             msg = f"🔔 Хотел вернуться к теме: {text}"
+        if await self._send_bg(msg) and fallback:
             await self._record(f"Бот сам вернулся к теме (follow-up #{rid}): {text}")
-        await self._send_bg(msg)
 
     # ── 2) отложенные ──
     async def _snoozed(self, now: datetime) -> None:
@@ -448,6 +568,8 @@ class Scheduler:
             "SELECT * FROM reminders WHERE status='active' AND snooze_at IS NOT NULL AND snooze_at <= ? "
             "ORDER BY snooze_at, id LIMIT ?", (timeutil.iso(now), BATCH))
         for row in rows:
+            if self._offline:
+                break
             try:
                 await self._refire(row, now)
             except asyncio.CancelledError:
@@ -466,20 +588,28 @@ class Scheduler:
         text = str(row.get("text") or "").strip() or "(без текста)"
         nag = bool(row.get("nag")) and kind != "followup"
         interval, _ = self._nag_params(row)
+        seen = row.get("snooze_at")
         # разовое без долбёжки после повтора закрывается — иначе висело бы «активным» без срабатываний
         status = "done" if not nag and not row.get("next_at") else (row.get("status") or "active")
         update = ("UPDATE reminders SET snooze_at=NULL, last_fired_at=?, nag_active=?, nag_count=0, "
-                  "nag_next_at=?, status=? WHERE id=?")
+                  "nag_next_at=?, status=? WHERE id=? AND status='active' AND snooze_at IS ?")
         params = (timeutil.iso(now), int(nag), timeutil.iso(now + timedelta(minutes=interval)) if nag else None,
-                  status, rid)
-        if kind == "followup" and self.ctx.services.agent is not None:
-            await self.ctx.db.execute(update, params)
-            self.ctx.services.spawn(self._followup(rid, text), name=f"followup:{rid}")
+                  status, rid, seen)
+        if not await self._unchanged(rid, "snooze_at", seen):
             return True
-        if not await self._deliver(("snooze", rid), "💤→ " + fire_text(row), reminder_buttons(row), now):
+        if kind == "followup" and self.ctx.services.agent is not None:
+            if await self.ctx.db.execute(update, params):
+                self.ctx.services.spawn(self._followup(rid, text), name=f"followup:{rid}")
+            return True
+        sent = await self._deliver(("snooze", rid), "💤→ " + fire_text(row), reminder_buttons(row), now)
+        if not sent:
             return False
-        await self.ctx.db.execute(update, params)
-        await self._record(f"Сработало отложенное напоминание #{rid}: {text}")
+        if not await self.ctx.db.execute(update, params):
+            return True
+        if sent == GAVE_UP:
+            await self._record(f"Не смог доставить отложенное напоминание #{rid} (Telegram не принимал): {text}")
+        else:
+            await self._record(f"Сработало отложенное напоминание #{rid}: {text}")
         return True
 
     # ── 3) долбёжка ──
@@ -488,6 +618,8 @@ class Scheduler:
             "SELECT * FROM reminders WHERE status='active' AND nag_active=1 AND nag_next_at IS NOT NULL "
             "AND nag_next_at <= ? ORDER BY nag_next_at, id LIMIT ?", (timeutil.iso(now), BATCH))
         for row in rows:
+            if self._offline:
+                break
             try:
                 await self._nag(row, now)
             except asyncio.CancelledError:
@@ -503,25 +635,32 @@ class Scheduler:
     async def _nag(self, row: dict, now: datetime) -> bool:
         rid = int(row["id"])
         text = str(row.get("text") or "").strip() or "(без текста)"
+        wake = row.get("kind") == "wake"
         interval, nag_max = self._nag_params(row)
         count = _int(row.get("nag_count"), 0) + 1
         planned = timeutil.from_iso(row.get("nag_next_at")) or now
         stale = now - planned > max(STALE_NAG, timedelta(minutes=3 * interval))
         if count > nag_max or stale:
-            msg = (STALE_GIVE_UP if stale and count <= nag_max else GIVE_UP).format(text=text)
+            if wake:
+                msg = STALE_WAKE_GIVE_UP if stale and count <= nag_max else WAKE_GIVE_UP
+                if row.get("next_at"):
+                    msg += f" Следующий будильник — {timeutil.fmt_local(row['next_at'], self.ctx.tz)}."
+            else:
+                msg = (STALE_GIVE_UP if stale and count <= nag_max else GIVE_UP).format(text=text)
             if not await self._deliver(("nag", rid), msg, None, now):
                 return False
             await self.ctx.db.execute(
                 "UPDATE reminders SET nag_active=0, nag_next_at=NULL, nag_count=?, "
-                "status=CASE WHEN next_at IS NULL THEN 'done' ELSE status END WHERE id=?",
+                "status=CASE WHEN next_at IS NULL THEN 'done' ELSE status END "
+                "WHERE id=? AND status='active' AND nag_active=1",
                 (min(count, nag_max), rid))
             return True
-        line = nag_line(count, nag_max, wake=row.get("kind") == "wake")
+        line = nag_line(count, nag_max, wake=wake)
         msg = f"{line}\n⏰ {text}  (#{rid}, {count}/{nag_max})"
         if not await self._deliver(("nag", rid), msg, reminder_buttons(row), now):
             return False
         await self.ctx.db.execute(
-            "UPDATE reminders SET nag_count=?, nag_next_at=? WHERE id=?",
+            "UPDATE reminders SET nag_count=?, nag_next_at=? WHERE id=? AND nag_active=1",
             (count, timeutil.iso(now + timedelta(minutes=interval)), rid))
         return True
 
@@ -551,42 +690,89 @@ class Scheduler:
             key = job_key(name)
             if await self.ctx.db.kv_get(key) == day.isoformat():
                 continue
-            await self.ctx.db.kv_set(key, day.isoformat())      # отметка ДО запуска: не задвоится
-            if now - at > CATCH_UP:
-                log.info("ежедневная задача %s за %s пропущена: бот лежал дольше %s", name, day, CATCH_UP)
+            task = self._job_tasks.get(name)
+            if task is not None and not task.done():
+                continue        # ещё идёт (модель пишет поздравление дольше тика) — не задваиваем
+            # дни рождения догоняем весь свой день: поздравление, потерянное в 9 утра, нужно и в 15:00
+            if not (name == "birthdays" and day == today) and now - at > CATCH_UP:
+                await self.ctx.db.kv_set(key, day.isoformat())
+                self._job_retry_at.pop(name, None)
+                self._job_fails.pop(name, None)
+                log.info("ежедневная задача %s за %s пропущена: не вышло за %s", name, day, CATCH_UP)
+                continue
+            retry = self._job_retry_at.get(name)
+            if retry is not None and now < retry:
                 continue
             log.info("ежедневная задача %s за %s", name, day)
-            self.ctx.services.spawn(self._job(name), name=f"job:{name}")
+            self._job_tasks[name] = self.ctx.services.spawn(self._run_daily(name, day), name=f"job:{name}")
 
-    async def run_job(self, name: str) -> None:
+    async def _run_daily(self, name: str, day: date) -> None:
+        """Фон: задача; сделана — отметка в kv, нет — повтор через JOB_RETRY (отметки нет, так что и
+        перезапуск посреди дела не теряет задачу)."""
+        try:
+            ok = await self._job(name, day)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("ежедневная задача %s упала", name)
+            ok = False
+        if ok:
+            await self.ctx.db.kv_set(job_key(name), day.isoformat())
+            self._job_retry_at.pop(name, None)
+            self._job_fails.pop(name, None)
+            return
+        n = self._job_fails[name] = self._job_fails.get(name, 0) + 1
+        pause = JOB_RETRY[min(n, len(JOB_RETRY)) - 1]
+        self._job_retry_at[name] = timeutil.now_utc() + pause
+        log.warning("ежедневная задача %s за %s не доставлена — повтор через %s", name, day, pause)
+
+    async def run_job(self, name: str) -> bool:
         """Выполнить ежедневную задачу сразу (без отметки в kv) — для команд бота и тестов."""
-        await self._job(name)
+        return await self._job(name)
 
-    async def _job(self, name: str) -> None:
+    async def _text_for(self, name: str, day: date, make: Any) -> str:
+        """Текст сводки/дайджеста за day: готовый от прошлой (недоставленной) попытки или новый."""
+        text = self._job_text.get((name, day))
+        if text is None:
+            text = str(await make() or "").strip()
+            self._job_text = {k: v for k, v in self._job_text.items() if k[1] == day}
+            self._job_text[(name, day)] = text
+        return text
+
+    async def _job(self, name: str, day: date | None = None) -> bool:
+        """Ежедневная задача. → True — сделана (или делать нечего, или собрать не вышло — об этом
+        сказано владельцу); False — не доставлена, повторить позже."""
         ctx = self.ctx.child()
+        day = day or ctx.now_local().date()
         try:
             if name == "morning":
                 from . import brief
-                text = await brief.morning_brief(ctx)
-                if text.strip():
-                    await self._send_bg(text)
-                    await self._record(f"Утренняя сводка владельцу:\n{text[:2000]}")
+                text = await self._text_for(name, day, lambda: brief.morning_brief(ctx))
+                if text:
+                    if not await self._send_once(text):
+                        return False
+                    await self._record(f"Утренняя сводка владельцу:\n{_clip(text, RECORD_MAX)}")
+                self._job_text.pop((name, day), None)
             elif name == "birthdays":
                 from ..tools import birthdays
-                n = await birthdays.birthday_jobs(ctx)
-                log.info("дни рождения: отправлено %s", n)
+                failed: list[int] = []
+                n = await birthdays.birthday_jobs(ctx, failures=failed)
+                log.info("дни рождения: отправлено %s, не ушло %s", n, len(failed))
+                return not failed
             elif name == "news":
                 from ..tools import news
-                text = await news.news_digest(ctx)
-                if text.strip():
-                    await self._send_bg("🗞 " + text.strip())
-                    short = text.strip()[:1500] + ("…" if len(text.strip()) > 1500 else "")
-                    await self._record(f"Дайджест новостей владельцу:\n{short}")
+                text = await self._text_for(name, day, lambda: news.news_digest(ctx))
+                if text:
+                    if not await self._send_once("🗞 " + text):
+                        return False
+                    # целиком (до RECORD_MAX): «подробнее про пятый сюжет» — агент должен видеть пятый
+                    await self._record(f"Дайджест новостей владельцу:\n{_clip(text, RECORD_MAX)}")
+                self._job_text.pop((name, day), None)
             elif name == "reflection":
                 agent = ctx.services.agent
                 if agent is None:
                     log.info("рефлексия: агента нет — пропускаю")
-                    return
+                    return True
                 await agent.reflect()
             else:
                 log.warning("неизвестная ежедневная задача %s", name)
@@ -595,9 +781,10 @@ class Scheduler:
         except Exception as e:
             log.exception("ежедневная задача %s упала", name)
             if name == "morning":
-                await self._send_bg(f"не собрал сводку: {_err(e)}")
+                await self._send_once(f"не собрал сводку: {_err(e)}")
             elif name == "news":
-                await self._send_bg(f"не собрал сводку новостей: {_err(e)}")
+                await self._send_once(f"не собрал сводку новостей: {_err(e)}")
+        return True
 
     # ── 5) уборка ──
     async def _housekeeping(self, now: datetime) -> None:

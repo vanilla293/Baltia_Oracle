@@ -5,11 +5,16 @@
   поэтому `latest` балансирует источники: одно издание не забьёт собой всю выдачу.
 • Веб-поиск — ddgs (DuckDuckGo и компания), синхронный, поэтому в отдельном потоке.
 • `read_url` — страница → читаемый текст (stdlib html.parser) с защитой от SSRF:
-  внутренние адреса (localhost, 10.x, 192.168.x, 169.254.x, …) не открываем, в том числе после редиректа.
+  внутренние адреса (localhost, 10.x, 192.168.x, 169.254.x, NAT64 64:ff9b::…) не открываем, в том числе
+  после редиректа. Страницы читает отдельный клиент, у которого имя резолвится в момент соединения и
+  соединение идёт ровно на проверенный IP: DNS rebinding (сначала публичный адрес, потом 127.0.0.1) не проходит.
 • Погода — Open-Meteo, без ключа: геокодинг города → прогноз, коды WMO → русские слова.
 
 Сеть никогда не роняет бота: ошибки лент пишутся в лог и пропускаются, поиск и погода отдают
 пусто/None. Исключение — `read_url`: там ValueError с человеческим текстом (его увидит модель).
+
+У каждого сетевого шага — общий срок (FEED_DEADLINE, READ_DEADLINE, WEATHER_DEADLINE): таймаут httpx
+считается на одно чтение, и сервер, отдающий по байту в 5 секунд, иначе держал бы ход агента минутами.
 """
 from __future__ import annotations
 
@@ -25,6 +30,7 @@ from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+import httpcore
 import httpx
 
 from .. import timeutil
@@ -39,6 +45,11 @@ KEEP_DAYS = 7
 SUMMARY_MAX = 600
 READ_CAP_BYTES = 2 * 1024 * 1024
 MAX_REDIRECTS = 5
+FEED_CAP_BYTES = 5 * 1024 * 1024
+FEED_DEADLINE = 20.0         # секунд на одну ленту целиком (все ленты качаются параллельно)
+READ_DEADLINE = 30.0         # секунд на страницу целиком, со всеми редиректами
+WEATHER_DEADLINE = 20.0      # секунд на один запрос погоды
+BLOCKED = "внутренние адреса не открываю"
 KV_LAST_REFRESH = "news:last_refresh"
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
@@ -270,16 +281,121 @@ _TEXT_TYPES = ("application/json", "application/xml", "application/rss+xml", "ap
                "application/ld+json", "application/javascript")
 
 
+_STREAM_TYPES = ("text/event-stream",)       # бесконечный поток — не страница
+
+
 def _is_textual(ctype: str) -> bool:
+    if ctype in _STREAM_TYPES:
+        return False
     return ctype.startswith("text/") or ctype in _HTML_TYPES or ctype in _TEXT_TYPES
 
 
 # ── SSRF ─────────────────────────────────────────────────────────────────────
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")            # NAT64: в последних 32 битах — IPv4
+_NAT64_LOCAL = ipaddress.ip_network("64:ff9b:1::/48")    # локальный NAT64 — только внутренние сети
+_V4_COMPAT = ipaddress.ip_network("::/96")               # устаревшие «IPv4-совместимые» ::a.b.c.d
+
+
 def _bad_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    mapped = getattr(ip, "ipv4_mapped", None)
-    if mapped is not None:
-        ip = mapped
+    """Внутренний адрес? IPv6-обёртки IPv4 (::ffff:…, NAT64 64:ff9b::…, 6to4 2002:…) разворачиваем:
+    решает вложенный IPv4 — иначе 64:ff9b::a9fe:a9fe (= 169.254.169.254) прошёл бы как «глобальный»."""
+    if ip.version == 6:
+        if ip.ipv4_mapped is not None:
+            return _bad_ip(ip.ipv4_mapped)
+        if ip in _NAT64_LOCAL or ip in _V4_COMPAT:
+            return True
+        inner = ip.sixtofour or (ipaddress.IPv4Address(int(ip) & 0xFFFF_FFFF) if ip in _NAT64 else None)
+        if inner is not None and _bad_ip(inner):
+            return True
     return (not ip.is_global) or ip.is_multicast
+
+
+class _BlockedAddress(httpcore.ConnectError):
+    """Соединение не открыто: адрес сайта в момент соединения оказался внутренним."""
+
+
+class _GuardedBackend(httpcore.AsyncNetworkBackend):
+    """Сетевой слой клиента страниц: имя резолвится здесь, внутренние адреса отсекаются, и соединение
+    идёт ровно на проверенный IP — второго резолва, который DNS мог бы подменить (rebinding), нет.
+    SNI, проверка сертификата и заголовок Host остаются по имени сайта (их ставит httpcore)."""
+
+    def __init__(self, inner: httpcore.AsyncNetworkBackend) -> None:
+        self._inner = inner
+
+    async def connect_tcp(self, host: str, port: int, timeout: float | None = None,
+                          local_address: str | None = None, socket_options: Any = None):
+        try:
+            ips = [ipaddress.ip_address(host.strip("[]"))]
+        except ValueError:
+            try:
+                infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            except (OSError, UnicodeError) as e:
+                raise httpcore.ConnectError(f"не нашёл сайт {host}: {e}") from None
+            ips = []
+            for info in infos:
+                try:
+                    ip = ipaddress.ip_address(str(info[4][0]).split("%")[0])
+                except (ValueError, IndexError, TypeError):
+                    raise _BlockedAddress(BLOCKED) from None
+                if ip not in ips:
+                    ips.append(ip)
+        if not ips or any(_bad_ip(ip) for ip in ips):
+            raise _BlockedAddress(BLOCKED)
+        ips.sort(key=lambda ip: ip.version)        # сначала IPv4: сломанный IPv6 не съест срок страницы
+        last: Exception | None = None
+        for ip in ips[:4]:          # адрес не отвечает — пробуем следующий, как сделал бы браузер
+            try:
+                return await self._inner.connect_tcp(str(ip), port, timeout=timeout, local_address=local_address,
+                                                     socket_options=socket_options)
+            except (httpcore.ConnectError, httpcore.ConnectTimeout, OSError) as e:
+                last = e
+        if isinstance(last, OSError) or last is None:
+            raise httpcore.ConnectError(f"не соединился с {host}: {last}") from last
+        raise last
+
+    async def connect_unix_socket(self, path: str, timeout: float | None = None, socket_options: Any = None):
+        raise _BlockedAddress(BLOCKED)
+
+    async def sleep(self, seconds: float) -> None:
+        await self._inner.sleep(seconds)
+
+
+def _page_client() -> httpx.AsyncClient:
+    """Клиент для read_url: сетевой страж на соединении, без прокси из окружения (прокси резолвил бы
+    имя сам, мимо стража) и без автоматических редиректов (их проверяет read_url)."""
+    transport = httpx.AsyncHTTPTransport()
+    pool = getattr(transport, "_pool", None)
+    inner = getattr(pool, "_network_backend", None)
+    if inner is not None:
+        pool._network_backend = _GuardedBackend(inner)
+    else:   # другая версия httpx — остаётся проверка адреса собеседника после соединения
+        log.warning("сетевой страж read_url не встал (httpx %s) — проверяю адрес после соединения",
+                    httpx.__version__)
+    return httpx.AsyncClient(transport=transport, trust_env=False, timeout=15.0,
+                             headers={"User-Agent": USER_AGENT})
+
+
+def _peer_is_bad(r: httpx.Response) -> bool:
+    """Второй рубеж: с каким IP реально соединились (нет сведений — MockTransport — не мешаем)."""
+    stream = r.extensions.get("network_stream")
+    if stream is None:
+        return False
+    try:
+        peer = stream.get_extra_info("server_addr")
+        return bool(peer) and _bad_ip(ipaddress.ip_address(str(peer[0]).split("%")[0]))
+    except (ValueError, TypeError, IndexError, AttributeError):
+        return False
+
+
+def _blocked(e: BaseException) -> bool:
+    """Ошибка httpx выросла из отказа стража (httpx заворачивает исключения httpcore в свои)?"""
+    seen = 0
+    while e is not None and seen < 5:
+        if isinstance(e, _BlockedAddress):
+            return True
+        e = e.__cause__ or e.__context__
+        seen += 1
+    return False
 
 
 class NewsService:
@@ -291,11 +407,15 @@ class NewsService:
         self._own_http = http is None
         self.http = http or httpx.AsyncClient(
             follow_redirects=True, timeout=15.0, headers={"User-Agent": USER_AGENT})
+        # страницы по ссылкам от модели — только через клиент со стражем (подсунутый клиент — тестам)
+        self._page_http = _page_client() if http is None else http
         self._refresh_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
         if self._own_http:
             await self.http.aclose()
+            if self._page_http is not self.http:
+                await self._page_http.aclose()
 
     # ── RSS ──
     async def refresh(self, force: bool = False) -> int:
@@ -333,14 +453,25 @@ class NewsService:
             log.info("новости: лент %d/%d, новых %d", ok, len(feeds), new)
             return new
 
-    async def _fetch_feed(self, url: str) -> list[tuple] | None:
-        """Одна лента → строки (url, title, summary, source, published_at). None — не ответила."""
-        try:
-            r = await self.http.get(url)
+    async def _get_capped(self, url: str) -> bytes:
+        """Тело ленты, но не больше FEED_CAP_BYTES (больше — ValueError)."""
+        async with self.http.stream("GET", url) as r:
             r.raise_for_status()
-            data = r.content
+            buf = bytearray()
+            async for chunk in r.aiter_bytes():
+                buf.extend(chunk)
+                if len(buf) > FEED_CAP_BYTES:
+                    raise ValueError(f"лента больше {FEED_CAP_BYTES // (1024 * 1024)} МБ")
+            return bytes(buf)
+
+    async def _fetch_feed(self, url: str) -> list[tuple] | None:
+        """Одна лента → строки (url, title, summary, source, published_at). None — не ответила
+        (в том числе не уложилась в FEED_DEADLINE: медленная лента не держит остальные)."""
+        try:
+            data = await asyncio.wait_for(self._get_capped(url), FEED_DEADLINE)
         except Exception as e:
-            log.warning("лента %s не ответила: %s", url, e)
+            log.warning("лента %s не ответила: %s", url,
+                        "не уложилась в срок" if isinstance(e, asyncio.TimeoutError) else (str(e) or type(e).__name__))
             return None
         try:
             import feedparser
@@ -500,14 +631,14 @@ class NewsService:
         if not host:
             raise ValueError(f"в ссылке нет адреса сайта: {url}")
         if host == "localhost" or host.endswith((".localhost", ".local", ".internal", ".lan", ".home.arpa")):
-            raise ValueError("внутренние адреса не открываю")
+            raise ValueError(BLOCKED)
         try:
             literal = ipaddress.ip_address(host.strip("[]"))
         except ValueError:
             literal = None
         if literal is not None:
             if _bad_ip(literal):
-                raise ValueError("внутренние адреса не открываю")
+                raise ValueError(BLOCKED)
             return
         try:
             infos = await asyncio.get_running_loop().getaddrinfo(
@@ -522,28 +653,24 @@ class NewsService:
             except (ValueError, IndexError, TypeError):
                 raise ValueError(f"не понял адрес сайта {host}") from None
             if _bad_ip(ip):
-                raise ValueError("внутренние адреса не открываю")
+                raise ValueError(BLOCKED)
 
-    async def read_url(self, url: str, max_chars: int = 12000) -> dict:
-        """Открыть страницу → {"url", "title", "text"}. Внутренние адреса и не-текст — ValueError."""
-        u = str(url or "").strip()
-        if not u:
-            raise ValueError("пустая ссылка")
-        if "://" not in u and re.match(r"^[\w.-]+\.[a-z]{2,}(?:[:/?#]|$)", u, re.I):
-            u = "https://" + u      # «meduza.io/news/…» без схемы
-        max_chars = _as_int(max_chars, 12000, 200, 200_000)
-        current = u
+    async def _fetch_page(self, url: str) -> tuple[bytes, str, str | None, str]:
+        """Скачать страницу, сверяя каждый редирект со SSRF-стражем → (тело, тип, кодировка, итоговый url)."""
+        current = url
         for _ in range(MAX_REDIRECTS + 1):
             await self._check_url(current)
             try:
-                async with self.http.stream("GET", current, follow_redirects=False) as r:
+                async with self._page_http.stream("GET", current, follow_redirects=False) as r:
+                    if _peer_is_bad(r):
+                        raise ValueError(BLOCKED)
                     if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
                         current = urljoin(current, r.headers["location"])
                         continue
                     if r.status_code >= 400:
                         raise ValueError(f"страница не открылась: HTTP {r.status_code}")
                     ctype = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
-                    if ctype and not _is_textual(ctype):     # pdf, картинка, архив — даже не качаем
+                    if ctype and not _is_textual(ctype):     # pdf, картинка, архив, поток — даже не качаем
                         raise ValueError("это не текстовая страница")
                     charset = r.charset_encoding
                     buf = bytearray()
@@ -552,13 +679,26 @@ class NewsService:
                         if len(buf) >= READ_CAP_BYTES:
                             del buf[READ_CAP_BYTES:]
                             break
-                    final_url = str(r.url)
+                    return bytes(buf), ctype, charset, str(r.url)
             except httpx.HTTPError as e:
+                if _blocked(e):
+                    raise ValueError(BLOCKED) from None
                 raise ValueError(f"не смог открыть страницу: {type(e).__name__}") from None
-            break
-        else:
-            raise ValueError("слишком много редиректов")
-        data = bytes(buf)
+        raise ValueError("слишком много редиректов")
+
+    async def read_url(self, url: str, max_chars: int = 12000) -> dict:
+        """Открыть страницу → {"url", "title", "text"}. Внутренние адреса, не-текст и страница,
+        не отдавшаяся за READ_DEADLINE, — ValueError."""
+        u = str(url or "").strip()
+        if not u:
+            raise ValueError("пустая ссылка")
+        if "://" not in u and re.match(r"^[\w.-]+\.[a-z]{2,}(?:[:/?#]|$)", u, re.I):
+            u = "https://" + u      # «meduza.io/news/…» без схемы
+        max_chars = _as_int(max_chars, 12000, 200, 200_000)
+        try:
+            data, ctype, charset, final_url = await asyncio.wait_for(self._fetch_page(u), READ_DEADLINE)
+        except asyncio.TimeoutError:
+            raise ValueError(f"страница грузится слишком долго (дольше {int(READ_DEADLINE)} с) — бросил") from None
         is_html = ctype in _HTML_TYPES
         if not ctype:   # без типа — нюхаем
             head = data[:1024].lstrip().lower()
@@ -575,12 +715,16 @@ class NewsService:
         return {"url": final_url, "title": title, "text": text}
 
     # ── погода ──
+    async def _get(self, url: str, params: dict) -> httpx.Response:
+        """GET с общим сроком на весь ответ (таймаут httpx — на каждое чтение, а не на всё)."""
+        return await asyncio.wait_for(self.http.get(url, params=params), WEATHER_DEADLINE)
+
     async def _geocode(self, name: str) -> tuple[float, float, str] | None:
         key = "weather:geo:" + normalize_text(name).strip()
         cached = await self.db.kv_get(key)
         if isinstance(cached, dict) and "lat" in cached and "lon" in cached:
             return float(cached["lat"]), float(cached["lon"]), str(cached.get("name") or name)
-        r = await self.http.get(GEOCODE_URL, params={"name": name, "count": 1, "language": "ru", "format": "json"})
+        r = await self._get(GEOCODE_URL, {"name": name, "count": 1, "language": "ru", "format": "json"})
         r.raise_for_status()
         res = (r.json() or {}).get("results") or []
         if not res:
@@ -608,7 +752,7 @@ class NewsService:
                     log.info("погода: город «%s» не найден", name)
                     return None
                 lat, lon, label = geo
-            r = await self.http.get(FORECAST_URL, params={
+            r = await self._get(FORECAST_URL, {
                 "latitude": lat, "longitude": lon,
                 "current": "temperature_2m,weather_code,wind_speed_10m",
                 "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,"

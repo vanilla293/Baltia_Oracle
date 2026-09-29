@@ -11,6 +11,7 @@ UTC первого вхождения. У события на весь день 
 """
 from __future__ import annotations
 
+import calendar as _cal
 import logging
 import re
 from datetime import date, datetime, time, timedelta
@@ -206,7 +207,18 @@ def shift_rrule(rule: str, day_offset: int, event_day: date, time_changed: bool)
         parts["BYMONTHDAY"] = ",".join(dict.fromkeys(new))
     else:
         rem_day = event_day - timedelta(days=day_offset)
-        if "BYMONTH" in parts:
+        if freq == "MONTHLY" and event_day.day >= 29:
+            # «каждое 31-е» бывает не в каждом месяце (dateutil такие месяцы пропускает) — напоминание
+            # ставим только на месяцы, где событие есть; 29-е (февраль лишь в високосный) так не выразить
+            if event_day.day == 29 or rem_day.month != event_day.month:
+                return None
+            allowed = [int(m) for m in parts.get("BYMONTH", "").split(",") if m] or list(range(1, 13))
+            months = [m for m in allowed if 1 <= m <= 12 and _cal.monthrange(2001, m)[1] >= event_day.day]
+            if not months:
+                return None
+            parts["BYMONTH"] = ",".join(map(str, months))
+            parts["BYMONTHDAY"] = str(rem_day.day)
+        elif "BYMONTH" in parts:
             if rem_day.month != event_day.month:
                 return None
         elif freq == "MONTHLY":
@@ -215,8 +227,13 @@ def shift_rrule(rule: str, day_offset: int, event_day: date, time_changed: bool)
                 if k - 1 < -28:
                     return None
                 parts["BYMONTHDAY"] = str(k - 1)
-        elif freq == "YEARLY" and (rem_day.month, rem_day.day) == (2, 29):
-            parts["BYMONTH"], parts["BYMONTHDAY"] = "2", "-1"
+        elif freq == "YEARLY" and rem_day < date(event_day.year, 3, 1) <= event_day:
+            # через конец февраля число напоминания зависит от високосности: «за день до 1 марта» —
+            # это последний день февраля (28 или 29), а не всегда 28-е
+            back = day_offset - (event_day.day - 1)        # сколько дней назад от 1 марта
+            if event_day.month != 3 or not 1 <= back <= 28:
+                return None
+            parts["BYMONTH"], parts["BYMONTHDAY"] = "2", str(-back)
     return ";".join(f"{k}={v}" for k, v in parts.items())
 
 
@@ -253,6 +270,7 @@ async def _make_reminder(ctx: ToolContext, ev: dict, rb: int | None) -> tuple[di
     else:
         rem_l = start_l - timedelta(minutes=rb)        # арифметика по местным часам
     rule = ev.get("rrule")
+    note = None
     if rule:
         off = (start_l.date() - rem_l.date()).days
         rule = shift_rrule(rule, off, start_l.date(), rem_l.time() != start_l.time())
@@ -260,13 +278,21 @@ async def _make_reminder(ctx: ToolContext, ev: dict, rb: int | None) -> tuple[di
             return None, ("для такого правила повтора напоминание заранее не ставлю — "
                           "если нужно, поставь отдельное через create_reminder")
     elif rem_l < timeutil.now_utc():
-        return None, f"напоминание не ставил: его время ({timeutil.fmt_local(rem_l, tz)}) уже прошло"
+        was = timeutil.fmt_local(rem_l, ctx.tz)
+        start_at = start_l if not ev.get("all_day") else \
+            datetime.combine(start_l.date(), time(9, 0)).replace(tzinfo=tz)
+        if rb == 0 or start_at <= timeutil.now_utc():
+            return None, f"напоминание не ставил: его время ({was}) уже прошло"
+        # «созвон в 19:00», а сейчас 18:45: за 30 минут уже не успеть — напомню в сам момент начала
+        rb, rem_l = 0, start_at
+        note = f"заранее напомнить уже не успеть ({was} прошло) — напомню в {timeutil.fmt_local(rem_l, ctx.tz)}"
     try:
+        # в поясе события: иначе событие и напоминание о нём раскрывались бы в разных поясах и расходились
         rem = await create_reminder(ctx, text=_reminder_text(ev, rb, start_l), when=rem_l, rrule=rule,
-                                    kind="event", ref_type="event", ref_id=ev["id"])
+                                    kind="event", ref_type="event", ref_id=ev["id"], tz=tz)
     except ValueError as e:
         return None, f"напоминание не поставил: {e}"
-    return rem, None
+    return rem, note
 
 
 def _summary(ev: dict, tz: ZoneInfo, rem: dict | None, note: str | None) -> dict:
@@ -295,7 +321,7 @@ async def add_event(ctx: ToolContext, *, title: str, start: str | datetime, end:
     all_day = bool(as_bool(all_day, False))
     start_l = _parse_start(start, tz, all_day)
     end_l = _parse_end(end, start_l, tz, all_day)
-    rule = clean_repeat(repeat)
+    rule = clean_repeat(repeat, tz)
     local_start = timeutil.naive_str(start_l)
     _check_rule(rule, datetime.fromisoformat(local_start))
     rb = _remind_minutes(remind_before_min)
@@ -324,14 +350,23 @@ async def update_event(ctx: ToolContext, eid: Any, *, title: str | None = None, 
         raise ValueError(f"события #{eid} нет")
     if ev["status"] != "active":
         raise ValueError(f"событие #{eid} отменено")
-    tz = zone(ev.get("tz"), ctx.tz.key)
+    ev_tz = zone(ev.get("tz"), ctx.tz.key)
     old_all_day = bool(ev["all_day"])
     new_all_day = bool(as_bool(all_day, old_all_day))
-    old_start = datetime.fromisoformat(ev["local_start"]).replace(tzinfo=tz)
-    old_end = (timeutil.from_iso(ev.get("ends_at")) or old_start).astimezone(tz)
-    old_dur = old_end.replace(tzinfo=None) - old_start.replace(tzinfo=None)     # по местным часам
     start_given = start is not None and str(start).strip() != ""
     end_given = end is not None and str(end).strip() != ""
+    # новое время модель считает по текущим часам — в текущем поясе (после смены TIMEZONE он другой);
+    # без нового времени событие остаётся в своём поясе
+    tz = ctx.tz if (start_given or end_given) else ev_tz
+    old_start = datetime.fromisoformat(ev["local_start"]).replace(tzinfo=ev_tz)
+    old_end = (timeutil.from_iso(ev.get("ends_at")) or old_start).astimezone(ev_tz)
+    old_dur = old_end.replace(tzinfo=None) - old_start.replace(tzinfo=None)     # по местным часам
+    if tz.key != ev_tz.key:
+        if old_all_day:     # день остаётся днём: полночь того же числа, но в новом поясе
+            old_start = datetime.fromisoformat(ev["local_start"]).replace(tzinfo=tz)
+            old_end = old_start + timedelta(days=max(1, round(old_dur / timedelta(days=1))))
+        else:
+            old_start, old_end = old_start.astimezone(tz), old_end.astimezone(tz)
 
     if start_given:
         new_start = _parse_start(start, tz, new_all_day)
@@ -351,7 +386,7 @@ async def update_event(ctx: ToolContext, eid: Any, *, title: str | None = None, 
     if new_end < new_start:
         raise ValueError("конец события раньше начала")
 
-    rule = clean_repeat(repeat) if repeat is not None else ev.get("rrule")
+    rule = clean_repeat(repeat, tz) if repeat is not None else ev.get("rrule")
     local_start = timeutil.naive_str(new_start)
     _check_rule(rule, datetime.fromisoformat(local_start))
     new_title = _clean_title(title) if title is not None and str(title).strip() else ev["title"]
@@ -689,6 +724,56 @@ async def t_list_events(ctx: ToolContext, **kw: Any) -> dict:
            "count": len(items), "items": [_item(it, tz) for it in items[:60]]}
     if len(items) > 60:
         out["note"] = "показаны первые 60 — сузь период, чтобы увидеть остальные"
+    return out
+
+
+AGENDA_MAX_DAYS = 31
+
+
+@tool("get_agenda",
+      "Повестка одним вызовом: события календаря, напоминания и будильники (повторяющиеся раскрыты по датам), "
+      "дни рождения и задачи со сроком. Для «что у меня сегодня / завтра / в пятницу / на неделе» — сюда, "
+      "а не в один list_events: «событий нет» ещё не значит «свободен». date — один день 'YYYY-MM-DD'; "
+      "или from/to — как в list_events ('YYYY-MM-DD' или 'YYYY-MM-DD HH:MM', дата в to — включительно). "
+      "Ничего не указано — остаток сегодняшнего дня. Период — не больше месяца.",
+      {"date": {"type": "string", "description": "один день 'YYYY-MM-DD'"},
+       "from": {"type": "string", "description": "начало периода"},
+       "to": {"type": "string", "description": "конец периода (включительно)"}})
+async def t_get_agenda(ctx: ToolContext, **kw: Any) -> dict:
+    tz = ctx.tz
+    day, frm, to = kw.get("date"), kw.get("from"), kw.get("to")
+    if day not in (None, ""):
+        frm = to = day
+    now = timeutil.now_utc()
+    start = _bound(frm, tz, is_end=False) if frm not in (None, "") else now
+    if to not in (None, ""):
+        end = _bound(to, tz, is_end=True)
+    else:               # до конца дня, с которого начали
+        end = _midnight(start.astimezone(tz).date() + timedelta(days=1), tz)
+    if end <= start:
+        raise ValueError("конец периода раньше начала")
+    if end - start > timedelta(days=AGENDA_MAX_DAYS):
+        raise ValueError(f"период больше {AGENDA_MAX_DAYS} дней — сузь его")
+    from ..services import brief
+    d = await brief.gather(ctx, start, end)
+    out: dict = {
+        "ok": True, "from": timeutil.fmt_local(start, tz), "to": timeutil.fmt_local(end, tz),
+        "events": [{"when": f"{x.get('date', '')} {x['time']}".strip(), "title": x["title"],
+                    **({"location": x["location"]} if x.get("location") else {})} for x in d["events"]],
+        "reminders": [{"when": f"{x.get('date', '')} {x['time']}".strip(), "text": x["text"],
+                       "kind": "будильник" if x.get("kind") == "wake" else x.get("kind") or "reminder",
+                       **({"repeat": x["repeat"]} if x.get("repeat") else {})} for x in d["reminders"]],
+        "birthdays": [{"date": x["date"], "name": x["name"],
+                       **({"relation": x["relation"]} if x.get("relation") else {}),
+                       **({"turns": x["turns"]} if x.get("turns") else {})} for x in d["birthdays"]],
+        "tasks": [{"due": x["due"], "text": x["text"], "overdue": x["overdue"],
+                   **({"project": x["project"]} if x.get("project") else {})} for x in d["tasks"]],
+    }
+    if d.get("failed"):
+        out["failed"] = d["failed"]
+        out["note"] = "часть данных не получил: " + ", ".join(d["failed"]) + " — не выдумывай их"
+    elif not any(out[k] for k in ("events", "reminders", "birthdays", "tasks")):
+        out["note"] = "в этот период ничего нет — свободен"
     return out
 
 

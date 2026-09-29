@@ -71,12 +71,17 @@ async def test_no_reminder(ctx, rb):
 
 
 async def test_reminder_moment_passed_does_not_fail(ctx):
+    # «созвон в 9:10», а сейчас 9:00: за 30 минут уже не успеть — напомню в сам момент начала
     ev = await cal.add_event(ctx, title="Скоро", start="2026-09-28 09:10")
-    assert ev["id"] and ev["reminder"] is None
-    assert "уже прошло" in ev["note"]
-    assert await linked(ctx, ev["id"]) == []
+    assert ev["id"] and ev["reminder"] == "пн 28.09 09:10"
+    assert "не успеть" in ev["note"] and "09:10" in ev["note"]
+    (r,) = await linked(ctx, ev["id"])
+    assert r["text"] == "Сейчас: Скоро" and r["next_at"] == "2026-09-28T06:10:00+00:00"
     past = await cal.add_event(ctx, title="Было", start="2026-09-20 10:00")   # прошлое событие — можно
-    assert past["id"] and past["reminder"] is None
+    assert past["id"] and past["reminder"] is None and "уже прошло" in past["note"]
+    assert await linked(ctx, past["id"]) == []
+    now = await cal.add_event(ctx, title="Сейчас", start="2026-09-28 09:00")   # уже началось — не напоминаю
+    assert now["reminder"] is None and "уже прошло" in now["note"]
 
 
 async def test_end_variants(ctx):
@@ -496,7 +501,9 @@ async def test_tool_add_event(ctx):
                    remind_before_min=None)
     assert r["ok"] and r["all_day"] is True and r["when"] == "пн 05.10, весь день" and r["repeat"] == "каждый год"
     assert r["reminder"] == "пн 05.10 09:00"
-    r = await call(ctx, "add_event", title="Скоро", start="2026-09-28 09:05")
+    r = await call(ctx, "add_event", title="Скоро", start="2026-09-28 09:05")   # за 30 мин не успеть — в начало
+    assert r["ok"] and r["reminder"] == "пн 28.09 09:05" and "не успеть" in r["note"]
+    r = await call(ctx, "add_event", title="Было", start="2026-09-28 08:00")
     assert r["ok"] and r["reminder"] is None and "уже прошло" in r["note"]
     r = await call(ctx, "add_event", title="Плохо", start="2026-09-30 11:00", end="2026-09-30 10:00")
     assert r["ok"] is False and "раньше начала" in r["error"]

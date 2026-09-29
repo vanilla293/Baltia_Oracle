@@ -138,7 +138,7 @@ async def test_add_birthday_tool(ctx):
                   notes="обожает горы", tg_username="@masha_k")
     assert r["date"] == "30 сентября 1996" and r["days_left"] == 2 and r["turns"] == 30
     assert r["weekday"] == "среда" and r["updated"] is False
-    assert r["note"].startswith("Напиши поздравление")
+    assert "Напиши поздравление" not in r["note"] and "не пиши" in r["note"]       # до ДР ещё 2 дня
     assert r["tg_username"] == "@masha_k"
     row = await bd.get_birthday(ctx.db, r["id"])
     assert (row["month"], row["day"], row["year"], row["tg_username"]) == (9, 30, 1996, "masha_k")
@@ -327,7 +327,9 @@ async def test_birthday_greeting_tool_userbot_button(ctx):
     assert len(ctx.outbox) == 1
     item = ctx.outbox[0]
     assert item.kind == "text" and "@masha_k" in item.text
-    assert item.buttons == [[("📨 Отправить", f"bday:send:{r['id']}")]]
+    assert item.text.startswith("Текст")                    # что уйдёт — видно в том же сообщении
+    assert item.buttons == [[("📨 Отправить", f"bday:send:{r['id']}:1")]]    # ровно этот вариант
+    assert await ctx.db.kv_get(bd.variant_key(r["id"], 1)) == "Текст"
 
 
 async def test_birthday_greeting_tool_errors(ctx):
@@ -384,7 +386,7 @@ async def test_birthday_jobs_prenotice_and_greeting(ctx, notifier):
 async def test_birthday_jobs_prenotice_once_per_year(ctx, notifier, clock):
     bid = await insert(ctx, "Иван", 10, 1, 1980, remind_days_before=3)   # 01.10 — через 3 дня
     assert await bd.birthday_jobs(ctx) == 1
-    assert notifier.sent[0]["text"].startswith("🎁 Через 3 дн. день рождения: Иван — исполнится 46")
+    assert notifier.sent[0]["text"].startswith("🎁 Через 3 дня день рождения: Иван — исполнится 46")
     assert "четверг, 1 октября" in notifier.sent[0]["text"]
     clock.advance(days=1)
     assert await bd.birthday_jobs(ctx) == 0                    # 2 дня — уже предупреждал в этом году
@@ -404,7 +406,7 @@ async def test_birthday_jobs_catch_up_missed_prenotice(ctx, notifier):
     """Бот лежал в день предупреждения — предупредит позже, но один раз."""
     await insert(ctx, "Иван", 9, 30, remind_days_before=5)
     assert await bd.birthday_jobs(ctx) == 1
-    assert notifier.sent[0]["text"].startswith("🎁 Через 2 дн. день рождения: Иван.")
+    assert notifier.sent[0]["text"].startswith("🎁 Через 2 дня день рождения: Иван.")
     assert await bd.birthday_jobs(ctx) == 0
 
 
@@ -424,7 +426,7 @@ async def test_birthday_jobs_userbot_send_button(ctx, notifier):
     masha = next(s for k, s in by_text.items() if "Маша" in k)
     petya = next(s for k, s in by_text.items() if "Петя" in k)
     assert masha["buttons"] == [[("🔁 Другой вариант", f"bday:regen:{bid}")],
-                                [("📨 Отправить @masha_k", f"bday:send:{bid}")]]
+                                [("📨 Отправить @masha_k", f"bday:send:{bid}:1")]]
     assert petya["buttons"] == [[("🔁 Другой вариант", f"bday:regen:{other}")]]
 
 

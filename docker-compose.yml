@@ -14,11 +14,23 @@ services:
     image: baltia-oracle
     container_name: baltia-oracle
     env_file: .env
+    environment:
+      # В контейнере данные живут только в смонтированной ./data: путь из .env мимо неё попал бы
+      # внутрь контейнера и стёрся бы при --force-recreate / --build. Пустые DB_PATH и USERBOT_SESSION —
+      # oracle.db и userbot.session в этой же папке.
+      DATA_DIR: /app/data
+      DB_PATH: ""
+      USERBOT_SESSION: ""
     volumes:
       - ./data:/app/data
     restart: unless-stopped
     stop_grace_period: 30s
-    # Ollama / LM Studio на этой же машине: LLM_BASE_URL=http://host.docker.internal:11434/v1
+    # Ollama / LM Studio на этой же машине:
+    #   Windows / macOS (Docker Desktop): LLM_BASE_URL=http://host.docker.internal:11434/v1
+    #   Linux: Ollama по умолчанию слушает только 127.0.0.1, и через host.docker.internal до неё не достучаться.
+    #   Проще всего — убрать блок extra_hosts ниже, раскомментировать network_mode: host
+    #   и писать LLM_BASE_URL=http://localhost:11434/v1 (подробно — README, «Совсем свободная модель»).
+    # network_mode: host
     extra_hosts:
       - "host.docker.internal:host-gateway"
     logging:

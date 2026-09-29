@@ -123,7 +123,7 @@ async def test_list_projects(ctx, fake_rem, clock):
     assert r["count"] == 1
     item = r["items"][0]
     assert item["id"] == a["id"] and item["open_tasks"] == 2 and item["done_tasks"] == 1
-    assert item["next_due"] == "чт 01.10 09:00" and item["goal"] == "окупиться" and item["idle_days"] == 0
+    assert item["next_due"] == "чт 01.10 23:59" and item["goal"] == "окупиться" and item["idle_days"] == 0
     r = await ok(ctx, "list_projects", status="all")
     assert [i["name"] for i in r["items"]] == ["Кофейня", "Ремонт"]
     assert r["items"][1]["next_due"] is None
@@ -206,10 +206,11 @@ async def test_add_task_with_due_creates_reminder(ctx, fake_rem):
                                  "ref_id": r["id"]}]
     row = await ctx.db.fetchone("SELECT * FROM tasks WHERE id=?", (r["id"],))
     assert row["due_at"] == "2026-09-30T12:00:00+00:00" and row["status"] == "todo"
-    # без проекта — без скобок, только дата → 09:00
+    # без проекта — без скобок, только дата → срок до конца дня, напоминание утром в 09:00
     r2 = await ok(ctx, "add_task", text="Купить кофемолку", due="2026-10-02")
     assert fake_rem.created[-1]["text"] == "Задача: Купить кофемолку"
     assert fake_rem.created[-1]["when"] == "2026-10-02 09:00" and r2["project"] is None
+    assert r2["due"] == "пт 02.10 23:59"
 
 
 async def test_add_task_past_due_skips_reminder(ctx, fake_rem):

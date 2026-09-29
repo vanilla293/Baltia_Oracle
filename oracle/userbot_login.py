@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import getpass
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -65,11 +66,24 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError:
         print("Не установлен telethon: pip install telethon")
         return 2
+    # всё, что создаст вход (файл сессии, его журнал), — сразу только владельцу, без окна «0644 до chmod»
+    old_mask = os.umask(0o077) if hasattr(os, "umask") else None
+    try:
+        return _run(cfg)
+    finally:
+        if old_mask is not None:
+            os.umask(old_mask)
+
+
+def _run(cfg: Any) -> int:
     session = Path(cfg.userbot_session)
     try:
         session.parent.mkdir(parents=True, exist_ok=True)
+        sf = session_file(session)
+        if not sf.exists():
+            os.close(os.open(sf, os.O_CREAT | os.O_WRONLY, 0o600))
     except OSError as e:
-        print(f"Не могу создать папку для сессии {session.parent}: {e}")
+        print(f"Не могу создать папку или файл для сессии {session.parent}: {e}")
         return 1
     print(f"Вход в Telegram для userbot. Сессия: {session_file(session)}")
     try:

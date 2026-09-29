@@ -168,6 +168,7 @@ class FakeUserbot:
     def __init__(self, ready: bool = True) -> None:
         self.ready = ready
         self.sent: list[tuple[int, str]] = []
+        self.resolved: list[tuple[Any, dict]] = []
 
     async def dialogs(self, limit: int = 20, unread_only: bool = False) -> list[dict]:
         return [{"id": 555, "title": "Маша", "unread": 2, "last_text": "ты где?", "last_out": False,
@@ -175,7 +176,8 @@ class FakeUserbot:
                 {"id": -100123, "title": "Работа", "unread": 5, "last_text": "созвон в 11", "last_out": False,
                  "last_date": "пн 28.09 08:40", "kind": "group"}]
 
-    async def resolve(self, query: Any) -> tuple[int, str]:
+    async def resolve(self, query: Any, **kw: Any) -> tuple[int, str]:
+        self.resolved.append((query, kw))
         if str(query).lstrip("@") == "masha_k":
             return 555, "Маша"
         if isinstance(query, int) or str(query).lstrip("-").isdigit():
@@ -205,10 +207,11 @@ def msg(bot: FakeBot, text: str | None = None, uid: int = OWNER, **kw: Any) -> M
                    chat=Chat(id=uid, type="private"), from_user=user(uid), text=text, **kw).as_(bot)
 
 
-def cbq(bot: FakeBot, data: str, uid: int = OWNER, markup: InlineKeyboardMarkup | None = None) -> CallbackQuery:
+def cbq(bot: FakeBot, data: str, uid: int = OWNER, markup: InlineKeyboardMarkup | None = None,
+        text: str = "сообщение с кнопками", chat_type: str = "private") -> CallbackQuery:
     m = Message(message_id=next(_ids), date=datetime(2026, 9, 28, 6, 0, tzinfo=UTC),
-                chat=Chat(id=uid, type="private"), from_user=User(id=1, is_bot=True, first_name="bot"),
-                text="сообщение с кнопками", reply_markup=markup)
+                chat=Chat(id=uid, type=chat_type), from_user=User(id=1, is_bot=True, first_name="bot"),
+                text=text, reply_markup=markup)
     return CallbackQuery(id=str(next(_ids)), from_user=user(uid), chat_instance="ci", data=data,
                          message=m).as_(bot)
 
@@ -541,7 +544,8 @@ def test_small_helpers():
 def test_build_router_smoke(deps):
     router = build_router(deps)
     assert isinstance(router.oracle_handlers, Handlers)
-    assert len(router.message.handlers) == len(H.COMMANDS) + 4
+    assert len(router.message.handlers) == len(H.COMMANDS) + 5
+    assert len(router.edited_message.handlers) == 1
     assert len(router.callback_query.handlers) == 1
     assert set(router.oracle_handlers.routes) == set(H.CB_ARITY)
 
@@ -551,7 +555,7 @@ def test_app_imports_and_dispatcher(cfg, deps):
     from oracle import app
     assert callable(entry.run) and callable(app.main)
     dp = app.build_dispatcher(cfg, deps)
-    assert set(dp.resolve_used_update_types()) == {"message", "callback_query"}
+    assert set(dp.resolve_used_update_types()) == {"message", "edited_message", "callback_query"}
     cmds = app.bot_commands()
     assert [c.command for c in cmds] == [c for c, _ in H.COMMANDS]
     assert all(1 <= len(c.description) <= 256 for c in cmds)
@@ -775,25 +779,29 @@ async def test_today_uses_brief(h, notifier, bot, monkeypatch):
     brief = importlib.import_module("oracle.services.brief")
 
     async def fake_brief(ctx: Any) -> str:
-        return "Доброе утро. Сегодня: ничего."
+        return "Сегодня: ничего."
 
-    monkeypatch.setattr(brief, "morning_brief", fake_brief)
+    monkeypatch.setattr(brief, "today_brief", fake_brief)       # /today — остаток дня, не «доброе утро»
     await h.cmd_today(msg(bot, "/today"))
-    assert notifier.texts() == ["Доброе утро. Сегодня: ничего."]
+    assert notifier.texts() == ["Сегодня: ничего."]
 
 
-async def test_news_command(h, notifier, bot, monkeypatch):
+async def test_news_command(h, db, notifier, bot, monkeypatch):
     tnews = importlib.import_module("oracle.tools.news")
-    topics = []
+    calls = []
 
-    async def fake_digest(ctx: Any, topic: str = "") -> str:
-        topics.append(topic)
+    async def fake_digest(ctx: Any, topic: str = "", *, deep: bool = True) -> str:
+        calls.append((topic, deep))
         return "Сюжет 1"
 
     monkeypatch.setattr(tnews, "news_digest", fake_digest)
     await h.cmd_news(msg(bot, "/news нефть"))
-    assert topics == ["нефть"]
+    assert calls == [("нефть", False)]                 # быстрый режим — быстрая модель, без минут ожидания
     assert notifier.texts() == ["Собираю новости про «нефть»…", "🗞 Сюжет 1"]
+    await db.kv_set("mode", "deep")
+    await h.cmd_news(msg(bot, "/news"))
+    assert calls[-1] == ("", True)
+    assert "пару минут" in notifier.texts()[-2]
 
 
 async def test_reminders_list_with_delete_buttons(h, ctx, notifier, bot):
@@ -982,7 +990,7 @@ async def test_wake_challenge_flow(h, ctx, db, notifier, bot, monkeypatch):
     monkeypatch.setattr(H, "make_challenge", lambda rng=None: ("20 + 22 = ?", 42, [41, 42, 52, 32]))
 
     await h.on_callback(cbq(bot, f"rem:done:{rid}"))
-    assert await db.kv_get(f"challenge:{rid}") == 42
+    assert (await db.kv_get(f"challenge:{rid}"))["a"] == 42
     assert notifier.texts()[-1] == "🧮 Докажи, что проснулся: 20 + 22 = ?"
     assert notifier.sent[-1]["buttons"] == challenge_buttons(rid, [41, 42, 52, 32])
     assert (await rem.get_reminder(db, rid))["nag_active"] == 1
@@ -991,7 +999,7 @@ async def test_wake_challenge_flow(h, ctx, db, notifier, bot, monkeypatch):
     monkeypatch.setattr(H, "make_challenge", lambda rng=None: ("30 + 30 = ?", 60, [60, 61, 50, 70]))
     await h.on_callback(cbq(bot, f"wake:ans:{rid}:41"))
     assert notifier.texts()[-1] == "❌ Мимо. 🧮 Докажи, что проснулся: 30 + 30 = ?"
-    assert await db.kv_get(f"challenge:{rid}") == 60
+    assert (await db.kv_get(f"challenge:{rid}"))["a"] == 60
     assert (await rem.get_reminder(db, rid))["nag_active"] == 1
 
     await h.on_callback(cbq(bot, f"wake:ans:{rid}:60"))
@@ -1073,12 +1081,14 @@ async def test_bday_send_via_userbot(h, deps, ctx, db, notifier, bot):
     await h.on_callback(cbq(bot, f"bday:send:{bid}"))
     assert "Текста поздравления нет" in cb_answers(bot)[-1].text
     await db.kv_set(bd.greeting_key(bid), "С днём рождения, Маша!")
-    await h.on_callback(cbq(bot, f"bday:send:{bid}"))
+    shown = "🎂 Сегодня ДР: Маша\n\nС днём рождения, Маша!"                # кнопка — под этим текстом
+    await h.on_callback(cbq(bot, f"bday:send:{bid}", text=shown))
     assert ub.sent == [(555, "С днём рождения, Маша!")]
-    assert notifier.texts()[-1] == "📨 Отправил поздравление: Маша (@masha_k)."
-    await h.on_callback(cbq(bot, f"bday:send:{bid}"))              # второй раз то же — нет
+    assert ub.resolved == [("@masha_k", {"strict": True})]            # username — без угадывания по именам
+    assert notifier.texts()[-1] == "📨 Отправил поздравление: Маша (@masha_k):\n«С днём рождения, Маша!»"
+    await h.on_callback(cbq(bot, f"bday:send:{bid}", text=shown))  # второй раз — нет
     assert ub.sent == [(555, "С днём рождения, Маша!")]
-    assert cb_answers(bot)[-1].text == "Это поздравление уже отправлено"
+    assert cb_answers(bot)[-1].text == "Поздравление уже отправлено"
 
 
 async def test_bday_send_without_username(h, deps, db, bot):
@@ -1115,7 +1125,7 @@ async def test_draft_buttons(h, deps, ctx, db, notifier, bot, fake_llm):
     ctx.services.userbot = ub
     fake_llm.script = ["ща буду", "уже бегу"]
     await h.on_callback(cbq(bot, "draft:new:555"))
-    assert notifier.texts()[-1] == "✍️ Черновик для «Маша»:\n\nща буду"
+    assert notifier.texts()[-1] == "✍️ Черновик для «Маша»:\n\n```\nща буду\n```"
     did = int(notifier.sent[-1]["buttons"][0][0][1].split(":")[-1])
 
     await h.on_callback(cbq(bot, f"draft:regen:{did}"))
@@ -1152,7 +1162,7 @@ async def test_draft_regen_falls_back_to_new_message_when_edit_fails(h, deps, ct
     did = int(notifier.sent[-1]["buttons"][0][0][1].split(":")[-1])
     bot.fail["edit_message_text"] = [bad_request("Bad Request: message can't be edited")]
     await h.on_callback(cbq(bot, f"draft:regen:{did}"))
-    assert notifier.texts()[-1] == "✍️ Черновик для «Маша»:\n\nдва"
+    assert notifier.texts()[-1] == "✍️ Черновик для «Маша»:\n\n```\nдва\n```"
 
 
 async def test_typing_indicator_repeats_while_waiting(h, deps, bot):
@@ -1329,9 +1339,9 @@ async def test_app_main_full_wiring_without_network(monkeypatch, cfg):
     monkeypatch.setattr(Bot, "set_my_commands", fake_set_commands)
     monkeypatch.setattr(Dispatcher, "start_polling", fake_polling)
     assert await app.main() == 0
-    assert set(seen["allowed"]) == {"message", "callback_query"}
+    assert set(seen["allowed"]) == {"message", "edited_message", "callback_query"}
     assert seen["commands"][0] == "start" and "status" in seen["commands"]
-    assert seen["handlers"] == len(H.COMMANDS) + 4
+    assert seen["handlers"] == len(H.COMMANDS) + 5
 
 
 async def test_app_main_setup_mode_skips_agent(monkeypatch, cfg):

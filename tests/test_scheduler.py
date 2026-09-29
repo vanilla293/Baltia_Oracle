@@ -528,8 +528,18 @@ async def test_send_failure_retries_next_tick(sctx, clock):
     assert (await row(sctx, rid))["status"] == "done"
 
 
+class RefusingNotifier(FlakyNotifier):
+    """Telegram отказывает всерьёз (бот заблокирован) — это не «нет сети»."""
+
+    async def send(self, text, buttons=None, *, silent=False):
+        self.attempts += 1
+        if self.fail:
+            raise RuntimeError("Forbidden: bot was blocked by the user")
+        return await FakeNotifier.send(self, text, buttons, silent=silent)
+
+
 async def test_send_failure_gives_up_after_a_while(sctx, clock):
-    flaky = FlakyNotifier()
+    flaky = RefusingNotifier()
     sctx.services.notifier = flaky
     rid = await add_rem(sctx, "Позвонить", "2026-09-28 09:00")
     s = Scheduler(sctx)
@@ -538,10 +548,21 @@ async def test_send_failure_gives_up_after_a_while(sctx, clock):
     await s.tick()
     assert (await row(sctx, rid))["fire_count"] == 0
     clock.advance(minutes=25)
-    await s.tick()                                      # 35 минут не отправляется — не застреваем
+    await s.tick()                                      # 35 минут отказывает — не застреваем
     r = await row(sctx, rid)
     assert r["status"] == "done" and r["fire_count"] == 1
     assert flaky.attempts == 3
+    assert await events(sctx) == [f"Не смог доставить напоминание #{rid} (Telegram не принимал): Позвонить"]
+    # связь с владельцем вернулась — первым же удачным сообщением говорим, что не дошло
+    flaky.fail = False
+    await add_rem(sctx, "Следующее", "2026-09-28 09:40")
+    clock.advance(minutes=5)
+    await s.tick()
+    assert flaky.texts()[0] == "⏰ Следующее"
+    assert flaky.texts()[1].startswith("⚠️ Раньше Telegram не принимал") and "⏰ Позвонить" in flaky.texts()[1]
+    clock.advance(minutes=1)
+    await s.tick()
+    assert len(flaky.sent) == 2
 
 
 # ── ежедневные задачи ────────────────────────────────────────────────────────
@@ -653,7 +674,7 @@ async def test_birthday_job_calls_birthday_jobs(ctx, clock, notifier, monkeypatc
     bd = importlib.import_module("oracle.tools.birthdays")
     calls = []
 
-    async def fake(c):
+    async def fake(c, **kw):
         calls.append(c)
         return 0
 

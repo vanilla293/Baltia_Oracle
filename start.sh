@@ -42,7 +42,9 @@ if [ -z "$PY" ]; then
 fi
 
 # ── 2. Окружение .venv ──────────────────────────────────────────────────
-if [ ! -x .venv/bin/python ] || ! py_ok .venv/bin/python; then
+# живое окружение — это python и pip: без pip (оборвалась установка) зависимости не поставить
+if [ ! -x .venv/bin/python ] || ! py_ok .venv/bin/python \
+        || ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
     rm -rf .venv
     say "Создаю окружение .venv ($("$PY" --version 2>&1))…"
     if ! "$PY" -m venv .venv; then

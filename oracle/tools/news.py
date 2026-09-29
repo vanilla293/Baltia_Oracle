@@ -1,16 +1,20 @@
 """Инструменты новостей, веба и погоды + дайджест «правды» и строка погоды для утренней сводки.
 
 Новости модель получает сырьём (заголовок, источник, время, выжимка) вместе с напоминанием,
-как их разбирать: факт / заявление / интерпретация, подача разных лагерей, умолчания.
-`news_digest` — готовый разбор для рассылки по расписанию и команды /news.
+как их разбирать: факт / заявление / интерпретация, подача разных лагерей, умолчания. Список новостей
+подрезается под лимит результата инструмента: сначала короче выжимки, потом без хвоста — с пометкой,
+сколько не влезло (иначе JSON рвался посередине и указание «как разбирать» терялось).
+`news_digest` — готовый разбор: по расписанию — в глубоком режиме (в фоне, спешить некуда),
+по команде /news — в быстром, если владелец не включил глубокий (он ждёт ответа).
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
 from .. import timeutil
-from .base import ToolContext, tool
+from .base import MAX_RESULT_CHARS, ToolContext, tool
 
 log = logging.getLogger("oracle.tools.news")
 
@@ -20,6 +24,10 @@ WEATHER_NOT_SET = "погода не настроена: задай WEATHER_CITY
 EMPTY_DIGEST = "Лента пустая — источники не ответили. Попробуй позже."
 WEB_NEWS_MAX = 8
 READ_MAX_CHARS = 8000
+ITEMS_BUDGET = MAX_RESULT_CHARS - 2000     # знаков JSON на список новостей (остальное — пометки)
+SHORT_SUMMARY = 150                         # выжимка, когда полные не влезают
+INTEREST_CATEGORIES = ("work", "plan", "preference")   # из памяти — это и есть «его интересы»
+INTERESTS_MAX = 25
 
 
 def _svc(ctx: ToolContext):
@@ -63,6 +71,27 @@ def _web_items(results: list[dict], tz) -> list[dict]:
                     "time": _web_time(r.get("date"), tz), "summary": _cut(r.get("snippet") or "", 300),
                     "url": r.get("url") or ""})
     return out
+
+
+def _json_len(v: Any) -> int:
+    return len(json.dumps(v, ensure_ascii=False, default=str))
+
+
+def _fit(items: list[dict], budget: int = ITEMS_BUDGET) -> tuple[list[dict], int]:
+    """Новости → (сколько влезает в budget знаков JSON, сколько выкинуто). Сначала укорачиваем
+    выжимки, потом отрезаем хвост; хотя бы одна новость остаётся всегда."""
+    if _json_len(items) <= budget:
+        return items, 0
+    short = [{**it, "summary": _cut(it.get("summary") or "", SHORT_SUMMARY)} for it in items]
+    kept: list[dict] = []
+    used = 2
+    for it in short:
+        n = _json_len(it) + 2
+        if kept and used + n > budget:
+            break
+        kept.append(it)
+        used += n
+    return kept, len(items) - len(kept)
 
 
 async def _collect(ctx: ToolContext, topic: str, hours: int, limit: int) -> list[dict]:
@@ -117,7 +146,13 @@ async def get_news(ctx: ToolContext, *, topic: str | None = None, hours: int | N
         else:
             note = "Ленты не ответили — новостей нет. Скажи об этом прямо и не выдумывай; можно попробовать web_search."
         return {"ok": True, "count": 0, "items": [], "note": note}
-    return {"ok": True, "count": len(items), "items": items, "note": ANALYST_NOTE}
+    kept, dropped = _fit(items)
+    out = {"ok": True, "note": ANALYST_NOTE, "count": len(kept)}    # указание — до списка: не отрежется
+    if dropped:
+        out["omitted"] = dropped
+        out["omitted_note"] = f"не влезло ещё {dropped} (хвост списка) — если нужно больше, сузь тему или часы"
+    out["items"] = kept
+    return out
 
 
 @tool(
@@ -231,8 +266,28 @@ def _plain_headlines(items: list[dict], err: str) -> str:
     return "\n".join(lines)
 
 
-async def news_digest(ctx: ToolContext, topic: str = "") -> str:
-    """Дайджест «правды» за сутки: 5–7 сюжетов, факт/заявление/манипуляция, в конце — мнение бота."""
+async def _interests(db, topic: str) -> list[str]:
+    """Что дайджесту знать о нём: сначала работа, планы и предпочтения (свежие первыми) — это и есть
+    его интересы, — потом факты по теме и недавние. Просто «25 последних фактов» — это чаще дети
+    и спортзал, а не то, за чем он следит."""
+    out: list[str] = []
+    marks = ",".join("?" * len(INTEREST_CATEGORIES))
+    rows = await db.fetchall(
+        f"SELECT content FROM facts WHERE category IN ({marks}) ORDER BY updated_at DESC, id DESC LIMIT ?",
+        (*INTEREST_CATEGORIES, INTERESTS_MAX * 3 // 5))
+    from .memory import facts_for_prompt
+    for f in [*rows, *await facts_for_prompt(db, topic, limit=INTERESTS_MAX)]:
+        c = str(f.get("content") or "").strip()
+        if c and c not in out:
+            out.append(c)
+    return out[:INTERESTS_MAX]
+
+
+async def news_digest(ctx: ToolContext, topic: str = "", *, deep: bool = True) -> str:
+    """Дайджест «правды» за сутки: 5–7 сюжетов, факт/заявление/манипуляция, в конце — мнение бота.
+
+    deep=True — утренняя рассылка в фоне: глубокая модель, при сбое — быстрая. deep=False — /news,
+    когда владелец ждёт: один быстрый вызов, при сбое — заголовки как есть, без второй попытки."""
     from ..llm import LLMError
 
     topic = str(topic or "").strip()
@@ -241,9 +296,7 @@ async def news_digest(ctx: ToolContext, topic: str = "") -> str:
         return EMPTY_DIGEST
     interests: list[str] = []
     try:
-        from .memory import facts_for_prompt
-        facts = await facts_for_prompt(ctx.db, topic, limit=25)
-        interests = [f"- {f['content']}" for f in facts if f.get("content")]
+        interests = [f"- {c}" for c in await _interests(ctx.db, topic)]
     except Exception as e:   # модуля памяти может не быть — дайджест и без неё полезен
         log.debug("факты для дайджеста: %s", e)
 
@@ -261,6 +314,14 @@ async def news_digest(ctx: ToolContext, topic: str = "") -> str:
     parts.append(f"НОВОСТИ ЗА СУТКИ ({len(items)} шт., источники: {', '.join(sources)}):\n\n{_format_items(items)}")
     user = "\n\n".join(parts)
 
+    if not deep:
+        try:
+            text = await ctx.llm.ask(system, user, deep=False, timeout=cfg.llm_fast_timeout)
+        except LLMError as e:
+            log.warning("дайджест не вышел: %s", e)
+            return _plain_headlines(items, str(e))
+        text = (text or "").strip()
+        return text or _plain_headlines(items, "пустой ответ")
     try:
         text = await ctx.llm.ask(system, user, deep=True, timeout=cfg.llm_deep_timeout)
     except LLMError as e:

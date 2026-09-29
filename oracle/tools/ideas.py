@@ -5,14 +5,17 @@
 добавляются свежие идеи, чтобы модель выбрала подходящую по смыслу сама.
 
 Глубокий разбор (`deep_evaluate`) идёт в фоне глубокой моделью: статус на время — 'thinking',
-прежний запоминается в kv `idea_deep:<id>` (переживёт падение и перезапуск), итог — владельцу
-отдельным сообщением «🧠 Додумал идею #id …» и событием в диалог.
+прежний запоминается в kv `idea_deep:<id>` вместе с меткой процесса, итог — владельцу
+отдельным сообщением «🧠 Додумал идею #id …» и событием в диалог. Разбор прошлого процесса
+(бот упал или перезапустился посреди) не считается идущим: `recover_interrupted` при старте
+возвращает таким идеям прежний статус, а повторный запуск не ждёт протухания пометки.
 """
 from __future__ import annotations
 
 import importlib
 import logging
 import re
+import uuid
 from datetime import timedelta
 from typing import Any
 
@@ -44,8 +47,9 @@ CONTENT_MAX = 20_000
 EVAL_MAX = 8_000
 TAGS_MAX = 10
 DEEP_KEY = "idea_deep:{}"
+_BOOT = uuid.uuid4().hex         # метка этого процесса: разбор с чужой меткой — от прошлого запуска, он мёртв
 _EMPTY = {"", "none", "null", "нет", "-", "—"}
-_WORD = re.compile(r"[0-9a-zа-я]+", re.I)
+_WORD = re.compile(r"[^\W_]+")   # буквы любых алфавитов и цифры: «Jānis» — одно слово
 # мусор из запросов «найди мою идею про…»
 _FILLER = frozenset({
     "идея", "идеи", "идею", "идей", "идеей", "идеям", "идеях", "мою", "мои", "моя", "мой", "моих",
@@ -259,7 +263,7 @@ async def _begin_deep(db, row: dict) -> str:
     mark = await db.kv_get(key)
     if row["status"] == "thinking" and isinstance(mark, dict) and mark.get("prev") in STATUSES:
         prev = mark["prev"]          # разбор уже идёт или прошлый не вернул статус
-    await db.kv_set(key, {"prev": prev, "at": _now_iso()})
+    await db.kv_set(key, {"prev": prev, "at": _now_iso(), "boot": _BOOT})
     await db.execute("UPDATE ideas SET status='thinking' WHERE id=?", (row["id"],))
     return prev
 
@@ -270,14 +274,40 @@ async def _end_deep(db, idea_id: int, prev: str) -> None:
     await db.execute("DELETE FROM kv WHERE key=?", (DEEP_KEY.format(idea_id),))
 
 
+async def recover_interrupted(db) -> list[dict]:
+    """При старте: разборы, начатые прошлым процессом (упал, перезапустили), уже не идут — вернуть
+    идеям прежний статус и снять пометки. → [{id, title, status}] восстановленных (можно сказать владельцу)."""
+    out: list[dict] = []
+    for r in await db.fetchall("SELECT key, value FROM kv WHERE key LIKE 'idea_deep:%'"):
+        key = r["key"]
+        try:
+            iid = int(key.split(":", 1)[1])
+        except (IndexError, ValueError):
+            await db.kv_delete(key)
+            continue
+        mark = await db.kv_get(key)
+        if isinstance(mark, dict) and mark.get("boot") == _BOOT:
+            continue                                       # идёт в этом процессе
+        prev = mark.get("prev") if isinstance(mark, dict) else None
+        prev = prev if prev in STATUSES and prev != "thinking" else "new"
+        n = await db.execute("UPDATE ideas SET status=? WHERE id=? AND status='thinking'", (prev, iid))
+        await db.kv_delete(key)
+        if n:
+            row = await load_idea(db, iid)
+            if row:
+                out.append({"id": iid, "title": row["title"], "status": prev})
+                log.info("идея #%s: разбор прервался перезапуском — статус возвращён в %s", iid, prev)
+    return out
+
+
 async def deep_busy(ctx: ToolContext, idea_id: Any) -> bool:
-    """Идёт ли уже глубокий разбор этой идеи (пометка свежая и статус 'thinking')."""
+    """Идёт ли уже глубокий разбор этой идеи (пометка этого процесса, свежая, статус 'thinking')."""
     row = await load_idea(ctx.db, idea_id)
     if row is None or row["status"] != "thinking":
         return False
     mark = await ctx.db.kv_get(DEEP_KEY.format(row["id"]))
-    if not isinstance(mark, dict):
-        return False
+    if not isinstance(mark, dict) or mark.get("boot") != _BOOT:
+        return False                 # пометки нет или она от прошлого запуска — там разбор уже умер
     try:
         at = timeutil.from_iso(mark.get("at"))
     except (TypeError, ValueError):
@@ -387,9 +417,10 @@ def _brief(row: dict, tz, *, match: bool | None = None) -> dict:
 
 
 @tool("save_idea",
-      "Сохранить идею владельца (бизнес, проект, продукт, текст, что угодно). ПОРЯДОК: сначала честно "
-      "оцени идею в ответе — что в ней сильное, что её убьёт, какой первый шаг, оценка 1–10 (большинство "
-      "идей 4–6, это нормально; 8+ — редкость) — потом сохрани вместе с этой оценкой. "
+      "Сохранить идею владельца (бизнес, проект, продукт, текст, что угодно). Сначала честно оцени "
+      "её про себя — что в ней сильное, что её убьёт, какой первый шаг, оценка 1–10 (большинство идей 4–6, "
+      "это нормально; 8+ — редкость) — и сохрани вместе с этой оценкой (evaluation, score). Сам разбор "
+      "владельцу пиши в ответе после того, как инструмент вернул ok. "
       "content — сама идея его словами, подробно, ничего не теряя; evaluation — твоя оценка коротко.",
       {"title": {"type": "string", "description": "короткое название, 2–6 слов: «Кофейня у вокзала»"},
        "content": {"type": "string", "description": "суть идеи подробно, его словами"},

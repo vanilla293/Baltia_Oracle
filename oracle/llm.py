@@ -10,6 +10,9 @@
 Инструменты (function calling): в режиме размышления DeepSeek требует возвращать
 `reasoning_content` ассистентских сообщений с tool_calls во всех последующих запросах —
 `LLMResponse.to_message()` кладёт его туда сам.
+
+Таймаут не повторяется, если сервер уже принял запрос и молчит: второй раз он быстрее не ответит,
+а владелец ждёт. Повторяются только дешёвые сбои до генерации (не дозвонились, 5xx, 429).
 """
 from __future__ import annotations
 
@@ -22,18 +25,21 @@ from typing import Any
 
 import httpx
 
-from .config import Settings
+from .config import Settings, clean_effort
 
 log = logging.getLogger("oracle.llm")
 
 
 class LLMError(Exception):
-    """Ошибка модели человеческим текстом. fatal — повторять бессмысленно (ключ, баланс)."""
+    """Ошибка модели человеческим текстом. fatal — повторять бессмысленно (ключ, баланс).
+    kind — что именно: "model" (модель не принята/нет такой), "context" (контекст переполнен),
+    "filtered" (ответ отфильтровал провайдер), "timeout", "" — прочее."""
 
-    def __init__(self, message: str, *, status: int | None = None, fatal: bool = False):
+    def __init__(self, message: str, *, status: int | None = None, fatal: bool = False, kind: str = ""):
         super().__init__(message)
         self.status = status
         self.fatal = fatal
+        self.kind = kind
 
 
 @dataclass
@@ -68,8 +74,26 @@ def _is_deepseek_model(model: str) -> bool:
     return "deepseek" in (model or "").lower()
 
 
-def human_error(status: int | None, body: str = "", exc: Exception | None = None) -> tuple[str, bool]:
-    """(текст, fatal) по коду ответа/исключению."""
+_CONTEXT_WORDS = ("context length", "context_length", "maximum context", "context window", "too many tokens",
+                  "prompt is too long", "reduce the length", "exceeds the model")
+_NO_MODEL_WORDS = ("not exist", "does not exist", "not found", "model_not_found", "unknown model",
+                   "no such model", "invalid model", "not a valid model", "unsupported model")
+
+
+def error_kind(status: int | None, body: str = "") -> str:
+    """По ответу API: "context" — контекст переполнен, "model" — такой модели нет/не принята, "" — прочее."""
+    low = (body or "").lower()
+    if status in (400, 413, 422) and any(w in low for w in _CONTEXT_WORDS):
+        return "context"
+    if status in (400, 404, 422) and "model" in low and any(w in low for w in _NO_MODEL_WORDS):
+        return "model"
+    return ""
+
+
+def human_error(status: int | None, body: str = "", exc: Exception | None = None, *,
+                local: bool = False) -> tuple[str, bool]:
+    """(текст, fatal) по коду ответа/исключению. local — модель не DeepSeek (свой LLM_BASE_URL: Ollama,
+    LM Studio…): нет связи — скорее всего, адрес, а не интернет."""
     b = (body or "")[:300]
     if status == 401:
         return "ключ LLM не принят (401) — проверь DEEPSEEK_API_KEY в .env", True
@@ -77,10 +101,18 @@ def human_error(status: int | None, body: str = "", exc: Exception | None = None
         return "на счёте DeepSeek кончились деньги (402) — пополни на platform.deepseek.com", True
     if status == 403:
         return "доступ к модели запрещён (403)", True
-    if status == 422 or (status == 400 and "model" in b.lower()):
-        return f"модель не принята API ({status}): {b}", True
+    kind = error_kind(status, body)
+    if kind == "context":
+        return ("контекст переполнен — разговор стал слишком длинным для модели: сделай /reset "
+                "(свежие реплики свернутся, память и позиции останутся) или спроси короче"), True
+    if kind == "model":
+        return f"модель не принята API ({status}): {b} — проверь LLM_MODEL / LLM_MODEL_DEEP в .env", True
+    if status == 422:
+        return f"неверный параметр запроса (422): {b} — проверь настройки LLM_* в .env", True
     if status == 400:
         return f"запрос не принят API (400): {b}", True
+    if status == 404:
+        return f"адрес API не найден (404) — проверь LLM_BASE_URL в .env: {b}", True
     if status == 429:
         return "слишком много запросов к модели (429) — подожди минуту", False
     if status is not None and status >= 500:
@@ -88,6 +120,9 @@ def human_error(status: int | None, body: str = "", exc: Exception | None = None
     if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
         return "модель не ответила вовремя (таймаут)", False
     if isinstance(exc, httpx.TransportError):
+        if local:
+            return ("нет связи с сервером модели (LLM_BASE_URL) — проверь адрес и что сервер запущен; "
+                    "Ollama/LM Studio из Docker на Linux — см. README"), False
         return "нет связи с сервером модели — проверь интернет", False
     return (f"ошибка модели: {b or exc}", False)
 
@@ -152,13 +187,16 @@ class LLM:
         if cfg.is_deepseek or _is_deepseek_model(model):
             if deep:
                 thinking = True
-                if cfg.llm_deep_effort and cfg.llm_deep_effort not in {"auto", "default"}:
-                    payload["reasoning_effort"] = cfg.llm_deep_effort
-            elif cfg.llm_fast_thinking in {"", "off", "none", "disabled", "0", "false"}:
-                payload["thinking"] = {"type": "disabled"}
+                effort, _ = clean_effort(cfg.llm_deep_effort, fast=False)
+                if effort not in {"auto", "default"}:
+                    payload["reasoning_effort"] = effort
             else:
-                thinking = True
-                payload["reasoning_effort"] = cfg.llm_fast_thinking
+                effort, _ = clean_effort(cfg.llm_fast_thinking, fast=True)   # API примет только low|high|max
+                if effort == "off":
+                    payload["thinking"] = {"type": "disabled"}
+                else:
+                    thinking = True
+                    payload["reasoning_effort"] = effort
         if not thinking:  # в режиме размышления температура игнорируется — не шлём
             payload["temperature"] = cfg.llm_temperature if temperature is None else temperature
         if tools:
@@ -173,7 +211,10 @@ class LLM:
                        deep: bool = False, json_mode: bool = False,
                        max_tokens: int | None = None, temperature: float | None = None,
                        timeout: float | None = None, tool_choice: str | dict | None = None,
-                       model: str | None = None) -> LLMResponse:
+                       model: str | None = None, allow_empty: bool = False) -> LLMResponse:
+        """Один ответ модели. Повторяет дешёвые сбои (5xx, 429, обрыв связи, таймаут соединения);
+        таймаут генерации не повторяет. Пустой ответ без tool_calls — ошибка после повторов, если только
+        не allow_empty (агент после успешных инструментов: пустой итог — не повод гонять модель ещё раз)."""
         if not self.cfg.llm_api_key:
             raise LLMError("нет ключа DeepSeek — впиши DEEPSEEK_API_KEY в .env", fatal=True)
         payload = self.build_payload(messages, tools=tools, deep=deep, json_mode=json_mode,
@@ -188,9 +229,8 @@ class LLM:
             except LLMError as e:
                 last = e
                 # глубокая модель недоступна (сняли с API) — один раз уходим на быструю
-                if e.fatal and e.status in (400, 404, 422) and deep and not fell_back \
-                        and payload["model"] != self.cfg.llm_model \
-                        and any(w in str(e).lower() for w in ("model", "модел")):
+                if e.kind == "model" and deep and not fell_back \
+                        and payload["model"] != self.cfg.llm_model:
                     log.warning("глубокая модель %s не принята — переключаюсь на %s",
                                 payload["model"], self.cfg.llm_model)
                     payload["model"] = self.cfg.llm_model
@@ -202,19 +242,27 @@ class LLM:
                 continue
             except (asyncio.TimeoutError, httpx.TimeoutException) as e:
                 msg, _ = human_error(None, exc=e)
-                last = LLMError(msg)
-                if attempt >= 2:   # длинную генерацию больше одного раза не повторяем
+                last = LLMError(msg, kind="timeout")
+                # не дозвонились / пул занят / не отправили запрос — повтор дешёвый; а если сервер принял
+                # запрос и молчит (занят), второй раз он быстрее не ответит — сразу ошибка, не держим владельца
+                cheap = isinstance(e, (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.WriteTimeout))
+                if attempt >= 2 or not cheap:
                     raise last
                 await asyncio.sleep(2.0)
                 continue
             except httpx.TransportError as e:
-                msg, _ = human_error(None, exc=e)
+                msg, _ = human_error(None, exc=e, local=not self.cfg.is_deepseek)
                 last = LLMError(msg)
                 if attempt == self.RETRIES:
                     raise last
                 await asyncio.sleep(2.0 * attempt)
                 continue
             if not resp.content.strip() and not resp.tool_calls:
+                if resp.finish_reason == "content_filter":    # повтор даст то же самое
+                    raise LLMError("провайдер модели отфильтровал ответ (content_filter) — это цензура на стороне "
+                                   "DeepSeek, а не моя; переформулируй вопрос", kind="filtered")
+                if allow_empty:
+                    return resp
                 if resp.finish_reason == "length":
                     raise LLMError("модель упёрлась в потолок токенов и не успела ответить — "
                                    "увеличь LLM_*_MAX_TOKENS или спроси короче")
@@ -242,7 +290,7 @@ class LLM:
             raise
         if r.status_code != 200:
             text, fatal = human_error(r.status_code, r.text)
-            raise LLMError(text, status=r.status_code, fatal=fatal)
+            raise LLMError(text, status=r.status_code, fatal=fatal, kind=error_kind(r.status_code, r.text))
         try:
             data = r.json()
         except ValueError:

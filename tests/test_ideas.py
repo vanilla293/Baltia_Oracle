@@ -372,4 +372,5 @@ def test_tools_registered():
     names = {"save_idea", "find_ideas", "get_idea", "update_idea", "list_ideas", "delete_idea", "deep_think_idea"}
     assert names <= set(tb.REGISTRY)
     d = tb.REGISTRY["save_idea"].description
-    assert "сначала честно" in d and "4–6" in d and "1–10" in d
+    assert "сначала честно" in d.lower() and "4–6" in d and "1–10" in d
+    assert "после того, как инструмент вернул ok" in d        # разбор — в итоговом ответе, а не до вызова

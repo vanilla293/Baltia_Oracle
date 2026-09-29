@@ -12,9 +12,11 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
 
+from dateutil.parser import isoparse
 from dateutil.rrule import rrulestr
 
 UTC = timezone.utc
+PAST_GRACE = timedelta(minutes=3)   # «через минуту»: пока модель думала, минута могла пройти — это ещё не прошлое
 
 # подменяемые часы (тесты ставят свои)
 _clock: Callable[[], datetime] = lambda: datetime.now(UTC)
@@ -107,7 +109,7 @@ def parse_local(s: str, tz: ZoneInfo, *, default_time: time = time(9, 0),
 
     Понимает 'YYYY-MM-DD HH:MM[:SS]', ISO с 'T' (и со смещением — тогда переводит в tz),
     'DD.MM.YYYY HH:MM', одну дату 'YYYY-MM-DD' / 'DD.MM.YYYY' (время = default_time)
-    и одно время 'HH:MM' (сегодня, а если уже прошло и prefer_future — завтра).
+    и одно время 'HH:MM' (сегодня, а если уже прошло больше PAST_GRACE назад и prefer_future — завтра).
     Год вне YEAR_RANGE — ValueError.
     """
     d = _parse_local(s, tz, default_time, prefer_future)
@@ -122,11 +124,11 @@ def _parse_local(s: str, tz: ZoneInfo, default_time: time, prefer_future: bool) 
     raw = s.strip().replace("Z", "+00:00")
     # ISO со смещением
     if re.search(r"[+-]\d{2}:?\d{2}$", raw) and "T" in raw:
-        try:
-            d = datetime.fromisoformat(raw)
-            return d.astimezone(tz)
-        except (ValueError, OverflowError):
-            pass
+        for parse in (datetime.fromisoformat, isoparse):   # 3.10 не понимает «+0300» и «.5» — их берёт isoparse
+            try:
+                return parse(raw).astimezone(tz)
+            except (ValueError, OverflowError):
+                continue
     for fmt in _DT_FORMATS:
         try:
             return datetime.strptime(raw, fmt).replace(tzinfo=tz)
@@ -144,7 +146,7 @@ def _parse_local(s: str, tz: ZoneInfo, default_time: time, prefer_future: bool) 
         if h < 24 and mi < 60:
             now = now_local(tz)
             d = now.replace(hour=h, minute=mi, second=0, microsecond=0)
-            if prefer_future and d <= now:
+            if prefer_future and d < now - PAST_GRACE:
                 d += timedelta(days=1)
             return d
     raise ValueError(f"не понял дату/время «{s}» — нужен формат YYYY-MM-DD HH:MM")
@@ -154,16 +156,30 @@ def _parse_local(s: str, tz: ZoneInfo, default_time: time, prefer_future: bool) 
 _FORBIDDEN_FREQ = re.compile(r"FREQ=SECONDLY", re.I)
 
 
-def normalize_rrule(rule: str | None) -> str | None:
-    """'RRULE:FREQ=DAILY' → 'FREQ=DAILY'; UNTIL с 'Z' → локальный (dtstart у нас наивный).
-    Пусто → None. Бросает ValueError на заведомо плохое правило."""
+_DAY_EDGE = ("000000", "235959")    # UNTIL=…T235959Z — «до конца дня», а не точный момент в UTC
+
+
+def _until_local(m: re.Match, tz: ZoneInfo | None) -> str:
+    """UNTIL=…Z → локальное наивное (dtstart у нас наивный). Точный момент в UTC переводим в пояс
+    правила; «граница дня» (T000000Z, T235959Z) — это модель сказала «до такого-то числа»,
+    её оставляем как есть, иначе в поясе с минусом последний день выпал бы."""
+    stamp = m.group(1)
+    if tz is None or stamp[-6:] in _DAY_EDGE:
+        return f"UNTIL={stamp}"
+    local = datetime.strptime(stamp, "%Y%m%dT%H%M%S").replace(tzinfo=UTC).astimezone(tz)
+    return f"UNTIL={local:%Y%m%dT%H%M%S}"
+
+
+def normalize_rrule(rule: str | None, tz: ZoneInfo | None = None) -> str | None:
+    """'RRULE:FREQ=DAILY' → 'FREQ=DAILY'; UNTIL с 'Z' → локальный в поясе tz (dtstart у нас наивный;
+    без tz — просто снимаем 'Z'). Пусто → None. Бросает ValueError на заведомо плохое правило."""
     if not rule:
         return None
     r = rule.strip()
     if not r:
         return None
     r = re.sub(r"^RRULE:", "", r, flags=re.I).strip().upper()
-    r = re.sub(r"UNTIL=(\d{8}T\d{6})Z", r"UNTIL=\1", r)
+    r = re.sub(r"UNTIL=(\d{8}T\d{6})Z", lambda m: _until_local(m, tz), r)
     r = re.sub(r"UNTIL=(\d{8})(?=;|$)", r"UNTIL=\1T235959", r)
     if "FREQ=" not in r:
         raise ValueError(f"в правиле повтора нет FREQ: «{rule}»")
@@ -181,7 +197,8 @@ def normalize_rrule(rule: str | None) -> str | None:
 
 def next_occurrence(rule: str | None, local_start: datetime | str, tz: ZoneInfo,
                     after: datetime | None = None, *, inclusive: bool = False) -> datetime | None:
-    """Следующее срабатывание (aware UTC) строго после `after` (UTC, по умолчанию — сейчас).
+    """Следующее срабатывание (aware UTC) строго после `after` (UTC, по умолчанию — сейчас;
+    при inclusive — не раньше after с точностью до секунды).
 
     Без правила: сам local_start, если он позже after (или равен при inclusive), иначе None.
     """
@@ -189,16 +206,26 @@ def next_occurrence(rule: str | None, local_start: datetime | str, tz: ZoneInfo,
         local_start = datetime.fromisoformat(local_start)
     start_naive = local_start.replace(tzinfo=None) if local_start.tzinfo is None \
         else local_start.astimezone(tz).replace(tzinfo=None)
-    after = after or now_utc()
+    after = (after or now_utc()).replace(microsecond=0) if inclusive else (after or now_utc())
     after_local_naive = after.astimezone(tz).replace(tzinfo=None, microsecond=0)
+
+    def passed(d: datetime) -> bool:
+        return d < after if inclusive else d <= after
+
     if not rule:
         cand = localize(start_naive, tz)
-        ok = cand >= after if inclusive else cand > after
-        return cand.astimezone(UTC) if ok else None
+        if passed(cand):
+            # повторённый час перехода на зимнее: «02:45» второго прохода (fold=1) может быть ещё впереди
+            alt = start_naive.replace(tzinfo=tz, fold=1)
+            if alt.utcoffset() == cand.utcoffset() or passed(alt):
+                return None
+            cand = alt
+        return cand.astimezone(UTC)
     rr = rrulestr(normalize_rrule(rule), dtstart=start_naive)
     nxt = rr.after(after_local_naive, inc=inclusive)
-    # страховка от DST: локальное наивное сравнение могло дать момент ≤ after
-    while nxt is not None and localize(nxt, tz) <= after and not inclusive:
+    # страховка от DST: локальное наивное сравнение могло дать уже прошедший момент
+    # (в повторённый час наивное «позже» — на деле раньше) — и с inclusive тоже
+    while nxt is not None and passed(localize(nxt, tz)):
         nxt = rr.after(nxt, inc=False)
     return localize(nxt, tz).astimezone(UTC) if nxt else None
 

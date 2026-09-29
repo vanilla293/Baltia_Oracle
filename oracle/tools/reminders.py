@@ -3,7 +3,8 @@
 Строка `reminders`: `local_start` (первое срабатывание, локальное наивное) + `rrule` + `tz`;
 ближайшее срабатывание — `next_at` (UTC ISO), его двигает scheduler. Долбёжка: `nag=1` —
 после срабатывания повторять каждые `nag_interval_min`, пока владелец не отметит (`ack_reminder`).
-`challenge=1` — отметить можно только решив задачку кнопкой (будильник «не дай проспать»).
+`challenge=1` — отметить можно только решив задачку кнопкой (будильник «не дай проспать»);
+пока такой будильник звонит (долбит или отложен «💤»), ни отметить, ни отменить, ни перенести его нельзя.
 
 Публичные функции зовут scheduler, bot, calendar и другие инструменты; модели — инструменты внизу.
 """
@@ -117,8 +118,9 @@ def _feasible(rule: str) -> bool:
     return rrulestr(";".join(keep), dtstart=start).after(start, inc=True) is not None
 
 
-def clean_repeat(repeat: Any) -> str | None:
-    """Правило повтора от модели → нормализованный RRULE или None («none», "" — без повтора)."""
+def clean_repeat(repeat: Any, tz: ZoneInfo | None = None) -> str | None:
+    """Правило повтора от модели → нормализованный RRULE или None («none», "" — без повтора).
+    tz — пояс, в котором раскрывается правило: в него переводится UNTIL=…Z."""
     if repeat is None:
         return None
     if not isinstance(repeat, str):
@@ -126,7 +128,7 @@ def clean_repeat(repeat: Any) -> str | None:
     if repeat.strip().lower() in _NO_REPEAT:
         return None
     try:
-        rule = timeutil.normalize_rrule(repeat)
+        rule = timeutil.normalize_rrule(repeat, tz)
         ok = rule is None or _feasible(rule)
     except ValueError as e:
         if re.search(r"[а-яё]", str(e), re.I):     # наш человеческий текст из normalize_rrule
@@ -161,9 +163,13 @@ def _as_int(v: Any, default: int) -> int:
 
 
 def _next_at(rrule: str | None, local_start: str, tz: ZoneInfo) -> datetime:
-    """Ближайшее срабатывание (≥ сейчас) или ValueError человеческим текстом."""
+    """Ближайшее срабатывание (≥ сейчас) или ValueError человеческим текстом.
+    Разовое, опоздавшее не больше чем на PAST_GRACE («через минуту», а модель думала дольше), — не ошибка:
+    сработает на ближайшем тике."""
+    now = timeutil.now_utc()
     try:
-        nxt = timeutil.next_occurrence(rrule, local_start, tz, inclusive=True)
+        nxt = timeutil.next_occurrence(rrule, local_start, tz, inclusive=True,
+                                       after=now if rrule else now - timeutil.PAST_GRACE)
     except ValueError:
         raise
     except Exception:
@@ -172,8 +178,21 @@ def _next_at(rrule: str | None, local_start: str, tz: ZoneInfo) -> datetime:
         if rrule:
             raise ValueError("у повтора нет будущих срабатываний — проверь UNTIL/COUNT и дату начала")
         when = timeutil.fmt_local(timeutil.localize(datetime.fromisoformat(local_start), tz), tz)
-        raise ValueError(f"это время уже прошло: {when}")
+        raise ValueError(f"это время уже прошло: {when} (сейчас {timeutil.fmt_local(now, tz)})")
     return nxt
+
+
+WAKE_NOTE = ("Будильник — это сообщения Telegram каждые несколько минут. Если телефон на ночь в «Не беспокоить» — "
+             "разреши Telegram в исключениях и не глуши чат бота, иначе не услышишь.")
+WAKE_NOTE_KEY = "wake_dnd_told"
+CHALLENGE_BUSY = ("будильник с задачкой сейчас звонит — снять его можно только решив задачку кнопкой; "
+                  "отменить или перенести — после")
+
+
+def ringing_challenge(row: dict) -> bool:
+    """Будильник с задачкой звонит прямо сейчас (долбит или отложен «💤») — трогать его можно только задачкой."""
+    return bool(row.get("challenge")) and bool(row.get("nag_active") or row.get("snooze_at")) \
+        and (row.get("status") or "active") == "active"
 
 
 # ── публичный API ───────────────────────────────────────────────────────────
@@ -188,15 +207,19 @@ async def get_reminder(db, rid: int) -> dict | None:
 async def create_reminder(ctx: ToolContext, *, text: str, when: str | datetime, rrule: str | None = None,
                           kind: str = "reminder", nag: bool | None = None, challenge: bool | None = None,
                           nag_interval_min: int | None = None, ref_type: str | None = None,
-                          ref_id: int | None = None) -> dict:
-    """Создать напоминание. Возвращает строку reminders + "when_local" и "repeat"."""
+                          ref_id: int | None = None, tz: ZoneInfo | None = None,
+                          nag_max: int | None = None) -> dict:
+    """Создать напоминание. Возвращает строку reminders + "when_local" и "repeat".
+    tz — пояс, в котором читается when и раскрывается повтор (по умолчанию — текущий ctx.tz; календарь
+    передаёт пояс события, чтобы событие и напоминание о нём не разъезжались). nag_max — сколько раз
+    долбить (по умолчанию cfg.nag_max)."""
     text = _clean_text(text)
     kind = (str(kind or "reminder")).strip().lower()
     if kind not in KINDS:
         raise ValueError(f"неизвестный вид напоминания «{kind}» — бывает: {', '.join(KINDS)}")
-    tz = ctx.tz
+    tz = tz or ctx.tz
     local = to_local(when, tz)
-    rule = clean_repeat(rrule)
+    rule = clean_repeat(rrule, tz)
     local_start = timeutil.naive_str(local)
     nxt = _next_at(rule, local_start, tz)
 
@@ -204,15 +227,16 @@ async def create_reminder(ctx: ToolContext, *, text: str, when: str | datetime, 
     nag_v = as_bool(nag, is_wake)
     challenge_v = as_bool(challenge, bool(ctx.cfg.wake_challenge) if is_wake else False)
     interval = max(1, _as_int(nag_interval_min, ctx.cfg.nag_interval_min))
+    n_max = max(1, _as_int(nag_max, int(ctx.cfg.nag_max)))
     now = timeutil.iso(timeutil.now_utc())
     rid = await ctx.db.execute(
         "INSERT INTO reminders(text, kind, local_start, tz, rrule, next_at, status, nag, nag_interval_min, "
         "nag_max, challenge, ref_type, ref_id, created_at) VALUES(?,?,?,?,?,?,'active',?,?,?,?,?,?,?)",
         (text, kind, local_start, tz.key, rule, timeutil.iso(nxt), int(bool(nag_v)), interval,
-         int(ctx.cfg.nag_max), int(bool(challenge_v)), ref_type,
+         n_max, int(bool(challenge_v)), ref_type,
          int(ref_id) if ref_id is not None else None, now))
     row = await get_reminder(ctx.db, rid) or {}
-    row["when_local"] = timeutil.fmt_local(nxt, tz)
+    row["when_local"] = timeutil.fmt_local(nxt, ctx.tz)       # модель считает время в текущем поясе
     row["repeat"] = timeutil.describe_rrule(rule)
     return row
 
@@ -334,6 +358,7 @@ async def _active_or_fail(ctx: ToolContext, rid: Any) -> dict:
       "repeat — только для повторяющихся: правило RRULE без префикса, например FREQ=DAILY (каждый день), "
       "FREQ=WEEKLY;BYDAY=MO,WE,FR (по пн, ср, пт), FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR (по будням), "
       "FREQ=MONTHLY (каждый месяц в тот же день), FREQ=YEARLY, FREQ=DAILY;INTERVAL=2 (через день); "
+      "«до 5 октября включительно» — ;UNTIL=20261005T235959 (местное время, без Z); "
       "when при этом — первое срабатывание. kind=wake — будильник («разбуди», «не дай проспать», «подъём»): "
       "долбит каждые несколько минут, пока он не встанет, и снимается только решением задачки кнопкой. "
       "nag=true — обычное напоминание, которое долбит, пока его не отметят (для важного, что нельзя пропустить). "
@@ -355,6 +380,9 @@ async def t_create_reminder(ctx: ToolContext, *, text: str, when: str, repeat: s
            "repeat": row["repeat"], "kind": row["kind"], "nag": bool(row["nag"])}
     if row.get("challenge"):
         out["challenge"] = True
+    if row["kind"] == "wake" and not await ctx.db.kv_get(WAKE_NOTE_KEY):   # один раз — с первым будильником
+        out["note"] = WAKE_NOTE
+        await ctx.db.kv_set(WAKE_NOTE_KEY, True)
     return out
 
 
@@ -368,27 +396,49 @@ async def t_list_reminders(ctx: ToolContext) -> dict:
 
 @tool("update_reminder",
       "Изменить активное напоминание по id. Передавай только то, что меняется: text — новый текст; "
-      "when — новое время 'YYYY-MM-DD HH:MM' (для повторяющегося — новое первое срабатывание, время дня берётся из него); "
-      "repeat — новое правило RRULE (FREQ=DAILY, FREQ=WEEKLY;BYDAY=MO,TH …), а \"\" или \"none\" — убрать повтор "
-      "и оставить одно ближайшее срабатывание; nag — долбить ли до отметки. Текущая долбёжка при переносе сбрасывается.",
+      "when — новое время 'YYYY-MM-DD HH:MM' (для повторяющегося — новое первое срабатывание, время дня берётся "
+      "из него, и сдвигается ВСЯ серия); repeat — новое правило RRULE (FREQ=DAILY, FREQ=WEEKLY;BYDAY=MO,TH …), "
+      "а \"\" или \"none\" — убрать повтор и оставить одно ближайшее срабатывание; nag — долбить ли до отметки "
+      "(nag=false заодно останавливает текущую долбёжку). only_next=true — у повторяющегося тронуть только "
+      "ближайшее срабатывание (его время — when из list_reminders), серия остаётся как была: без when — просто "
+      "пропустить его («завтра не буди»), с when — перенести его на это время («завтра разбуди в 9, а не в 7»). "
+      "Текущая долбёжка при переносе сбрасывается. Будильник с задачкой, пока звонит, не переносится.",
       {"id": {"type": "integer"},
        "text": {"type": "string"},
        "when": {"type": "string", "description": "локальное 'YYYY-MM-DD HH:MM'"},
        "repeat": {"type": "string", "description": "RRULE; \"\" или \"none\" — без повтора"},
-       "nag": {"type": "boolean"}},
+       "nag": {"type": "boolean"},
+       "only_next": {"type": "boolean", "description": "только ближайшее срабатывание повторяющегося"}},
       required=["id"])
 async def t_update_reminder(ctx: ToolContext, *, id: Any, text: str | None = None, when: str | None = None,
-                            repeat: str | None = None, nag: Any = None) -> dict:
+                            repeat: str | None = None, nag: Any = None, only_next: Any = None) -> dict:
     row = await _active_or_fail(ctx, id)
-    tz = zone(row.get("tz"), ctx.tz.key)
-    new_text = _clean_text(text) if text is not None and str(text).strip() else row["text"]
+    old_tz = zone(row.get("tz"), ctx.tz.key)
+    text_given = text is not None and str(text).strip() != ""
+    new_text = _clean_text(text) if text_given else row["text"]
     new_nag = as_bool(nag, bool(row["nag"]))
     when_given = when is not None and str(when).strip() != ""
+    if as_bool(only_next, False) and row.get("rrule"):
+        if repeat is not None:
+            raise ValueError("only_next — только про ближайшее срабатывание; правило повтора меняй отдельным вызовом")
+        return await _only_next(ctx, row, text=new_text, when=when if when_given else None, nag=new_nag)
+    if ringing_challenge(row) and (when_given or repeat is not None or (row.get("nag") and not new_nag)):
+        raise ValueError(CHALLENGE_BUSY)
     if not when_given and repeat is None:           # только текст/nag — расписание не трогаем
-        await ctx.db.execute("UPDATE reminders SET text=?, nag=? WHERE id=?",
-                             (new_text, int(bool(new_nag)), row["id"]))
+        if not new_nag and (row.get("nag_active") or row.get("nag_next_at")):
+            # «не долби меня этим»: стоп текущей долбёжки; разовому, которому больше нечего ждать, — конец
+            await ctx.db.execute(
+                "UPDATE reminders SET text=?, nag=0, nag_active=0, nag_next_at=NULL, nag_count=0, "
+                "status=CASE WHEN next_at IS NULL AND snooze_at IS NULL THEN 'done' ELSE status END WHERE id=?",
+                (new_text, row["id"]))
+        else:
+            await ctx.db.execute("UPDATE reminders SET text=?, nag=? WHERE id=?",
+                                 (new_text, int(bool(new_nag)), row["id"]))
     else:
-        rule = clean_repeat(repeat) if repeat is not None else row.get("rrule")
+        # новое время модель считает по текущим часам — в текущем поясе; без нового времени
+        # остаётся пояс строки (иначе старое наивное local_start прочиталось бы в чужом поясе)
+        tz = ctx.tz if when_given else old_tz
+        rule = clean_repeat(repeat, tz) if repeat is not None else row.get("rrule")
         if when_given:
             local_start = timeutil.naive_str(to_local(when, tz))
         elif rule is None and row.get("rrule") and row.get("next_at"):
@@ -399,19 +449,58 @@ async def t_update_reminder(ctx: ToolContext, *, id: Any, text: str | None = Non
         nxt = _next_at(rule, local_start, tz)
         await ctx.db.execute(
             "UPDATE reminders SET text=?, nag=?, local_start=?, tz=?, rrule=?, next_at=?, nag_active=0, "
-            "nag_next_at=NULL, nag_count=0, snooze_at=NULL WHERE id=?",
+            "nag_next_at=NULL, nag_count=0, snooze_at=NULL, status='active' WHERE id=?",
             (new_text, int(bool(new_nag)), local_start, tz.key, rule, timeutil.iso(nxt), row["id"]))
     new = await get_reminder(ctx.db, row["id"])
     b = _brief(new, ctx.tz)
-    return {"ok": True, "id": b["id"], "text": b["text"], "when": b["when"], "repeat": b["repeat"],
-            "kind": b["kind"], "nag": b["nag"]}
+    out = {"ok": True, "id": b["id"], "text": b["text"], "when": b["when"], "repeat": b["repeat"],
+           "kind": b["kind"], "nag": b["nag"], "nagging": b["nagging"]}
+    if new.get("status") != "active":
+        out["status"] = new["status"]
+    return out
+
+
+async def _only_next(ctx: ToolContext, row: dict, *, text: str, when: str | None, nag: bool) -> dict:
+    """Пропустить (или перенести на when) только ближайшее срабатывание повторяющегося; серия — как была.
+    Сработает, потому что scheduler считает следующее вхождение от local_start после «сейчас».
+    Оговорка: следующий update_reminder с when/repeat пересчитает next_at от local_start и пропуск снимет."""
+    if ringing_challenge(row):
+        raise ValueError(CHALLENGE_BUSY)
+    tz = zone(row.get("tz"), ctx.tz.key)
+    cur = timeutil.from_iso(row.get("next_at"))
+    if cur is None:
+        raise ValueError(f"у напоминания #{row['id']} нет ближайшего срабатывания — пропускать нечего")
+    once = None
+    if when is not None:          # сначала разовое: не вышло (время в прошлом) — серию не трогаем
+        once = await create_reminder(ctx, text=text, when=when, kind=row.get("kind") or "reminder", nag=nag,
+                                     challenge=bool(row.get("challenge")),
+                                     nag_interval_min=row.get("nag_interval_min"), nag_max=row.get("nag_max"))
+    try:
+        nxt = timeutil.next_occurrence(row["rrule"], row["local_start"], tz, after=cur)
+    except Exception:
+        nxt = None
+    await ctx.db.execute(
+        "UPDATE reminders SET next_at=?, nag_active=0, nag_next_at=NULL, nag_count=0, snooze_at=NULL, "
+        "status=? WHERE id=?",
+        (timeutil.iso(nxt) if nxt else None, "active" if nxt else "done", row["id"]))
+    out = {"ok": True, "id": row["id"], "text": row["text"], "skipped": timeutil.fmt_local(cur, ctx.tz),
+           "repeat": timeutil.describe_rrule(row.get("rrule")),
+           "series_next": timeutil.fmt_local(nxt, ctx.tz) if nxt else None}
+    if once is not None:
+        out["once"] = {"id": once["id"], "when": once["when_local"], "text": once["text"]}
+    return out
 
 
 @tool("cancel_reminder",
-      "Отменить (удалить) напоминание или будильник по id. Если не знаешь id — сначала list_reminders.",
+      "Отменить (удалить) напоминание или будильник по id; у повторяющегося — все будущие срабатывания. "
+      "Остановить текущую долбёжку — ack_reminder; пропустить или перенести одно срабатывание повторяющегося — "
+      "update_reminder(only_next=true). Будильник с задачкой, пока звонит, отменить нельзя — только задачкой. "
+      "Если не знаешь id — сначала list_reminders.",
       {"id": {"type": "integer"}}, required=["id"])
 async def t_cancel_reminder(ctx: ToolContext, *, id: Any) -> dict:
     row = await _active_or_fail(ctx, id)
+    if ringing_challenge(row):
+        raise ValueError(CHALLENGE_BUSY)
     await cancel_reminder(ctx.db, row["id"])
     return {"ok": True, "id": row["id"], "text": row["text"], "cancelled": True}
 
@@ -423,10 +512,37 @@ async def t_cancel_reminder(ctx: ToolContext, *, id: Any) -> dict:
       {"id": {"type": "integer"}}, required=["id"])
 async def t_ack_reminder(ctx: ToolContext, *, id: Any) -> dict:
     row = await _active_or_fail(ctx, id)
-    if row.get("challenge") and row.get("nag_active"):
+    if ringing_challenge(row):
         raise ValueError("это будильник с задачкой — снять его можно только решив задачку кнопкой")
     if not row.get("rrule"):        # разовое отмечено (хоть и заранее) — больше не сработает
         await ctx.db.execute("UPDATE reminders SET next_at=NULL WHERE id=?", (row["id"],))
     new = await ack_reminder(ctx.db, row["id"]) or row
     return {"ok": True, "id": new["id"], "text": new["text"], "status": new["status"],
             "next": timeutil.fmt_local(new["next_at"], ctx.tz) if new.get("next_at") else None}
+
+
+@tool("snooze_reminder",
+      "Отложить то, что сейчас сработало или долбит, на minutes минут — как кнопка «💤»: «отложи на 10 минут», "
+      "«дай ещё полчаса поспать», «напомни об этом через час ещё раз». Долбёжка останавливается и через minutes "
+      "начнётся снова; расписание повторяющегося не меняется (перенести само время — update_reminder). "
+      "Будильник с задачкой и после этого снимается только задачкой. id — из «СЕЙЧАС ДОЛБЯТ» или list_reminders.",
+      {"id": {"type": "integer"},
+       "minutes": {"type": "integer", "description": "на сколько минут отложить, 1–1440 (по умолчанию 10)"}},
+      required=["id"])
+async def t_snooze_reminder(ctx: ToolContext, *, id: Any, minutes: Any = 10) -> dict:
+    rid = as_id(id)
+    row = await get_reminder(ctx.db, rid)
+    if row is None or row.get("status") == "cancelled":       # сработавшее разовое (done) — можно, как кнопкой
+        raise ValueError(f"напоминания #{rid} нет или оно отменено — поставь новое")
+    try:
+        m = int(float(minutes if minutes not in (None, "") else 10))
+    except (TypeError, ValueError):
+        raise ValueError("minutes — число минут, 1–1440") from None
+    if not 1 <= m <= 1440:
+        raise ValueError("отложить можно на 1–1440 минут")
+    new = await snooze_reminder(ctx.db, rid, m) or row
+    out = {"ok": True, "id": new["id"], "text": new["text"],
+           "until": timeutil.fmt_local(new["snooze_at"], ctx.tz) if new.get("snooze_at") else None}
+    if new.get("challenge"):
+        out["note"] = "будильник с задачкой: когда зазвонит снова, снять его можно только задачкой"
+    return out

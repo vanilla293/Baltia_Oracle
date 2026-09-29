@@ -108,7 +108,7 @@ _LINK = re.compile(r"\[([^\[\]\n]+)\]\(\s*<?(" + _URL_BODY + r")>?\s*(?:\"[^\"\n
 _AUTOLINK = re.compile(r"<((?:https?|tg)://[^\s<>]+)>")
 _BARE_URL = re.compile(r"(?:https?|tg)://[^\s<>\"'`]+")
 _MENTION = re.compile(r"(?<![\w@])@[A-Za-z0-9_]{3,32}\b")
-_URL_TAIL = ".,;:!?…»\"'"
+_URL_TAIL = ".,;:!?…»\"'*_~]"            # «**https://…**» — звёздочки не часть адреса
 
 
 def _trim_url(url: str) -> tuple[str, str]:
@@ -122,6 +122,13 @@ def _trim_url(url: str) -> tuple[str, str]:
             continue
         break
     return url, tail
+
+
+def unlink(s: str) -> str:
+    """Чужой текст перед markdown-рендером: «[надпись](ссылка)» → «надпись (ссылка)» — адрес виден
+    как есть, замаскированной ссылки в сообщении бота не будет."""
+    s = _LINK.sub(lambda m: f"{m.group(1)} ({m.group(2)})", s or "")
+    return _AUTOLINK.sub(lambda m: m.group(1), s)
 
 
 def _code_span(m: re.Match) -> str | None:
@@ -324,6 +331,20 @@ def plain(text: str) -> str:
         else:
             out.append(_line_plain(line))
     return store.restore("\n".join(out))
+
+
+# ── секреты ──────────────────────────────────────────────────────────────────
+_BOT_TOKEN = re.compile(r"\d{5,}:[A-Za-z0-9_-]{30,}")
+
+
+def redact(s: str, secrets: tuple[str, ...] | list[str] = ()) -> str:
+    """Токен бота (вида 123456:AAE…) и переданные секреты → «<token>» / «<secret>»: в текстах ошибок
+    aiohttp бывает полный адрес https://api.telegram.org/file/bot<TOKEN>/…"""
+    s = _BOT_TOKEN.sub("<token>", str(s or ""))
+    for secret in secrets:
+        if secret and len(secret) >= 8:
+            s = s.replace(secret, "<secret>")
+    return s
 
 
 # ── нарезка ──────────────────────────────────────────────────────────────────

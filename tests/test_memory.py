@@ -177,12 +177,12 @@ async def test_opinion_create_update_history(db, clock):
     assert json.loads(o2["history"]) == []
     # смена позиции → история
     clock.advance(days=1)
-    o3 = await mem.upsert_opinion(db, topic="Удалённая работа или офис", stance="Гибрид лучше чистой удалёнки",
+    o3 = await mem.upsert_opinion(db, topic="удалённая работа — против офиса", stance="Гибрид лучше чистой удалёнки",
                                   reasons="джунам нужен офис", confidence=65,
                                   why_changed="показал данные о росте джунов в офисе")
     assert o3["id"] == oid and o3["changed"] and not o3["created"]
     assert o3["previous_stance"] == "Удалёнка лучше для глубокой работы!"
-    assert o3["topic"] == "Удалённая работа против офиса"          # тему по похожести не переписываем
+    assert o3["topic"] == "Удалённая работа против офиса"          # без id тему не переписываем
     h = json.loads(o3["history"])
     assert len(h) == 1
     assert h[0]["stance"] == "Удалёнка лучше для глубокой работы!" and h[0]["confidence"] == 100

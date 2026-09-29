@@ -1,15 +1,30 @@
-"""Бот личный: слушается только владельца (OWNER_ID).
+"""Бот личный: слушается только владельца (OWNER_ID) и только в личке.
 
-Внешний (outer) middleware на сообщения и нажатия кнопок. Владелец проходит дальше.
+Внешний (outer) middleware на сообщения и нажатия кнопок. Владелец проходит дальше — но только
+из личного чата с ботом: в группе, куда бота кто-то добавил, его /backup или /memory ушли бы
+всем участникам, поэтому вне лички бот молчит (кнопкам отвечает «Нет доступа»).
 OWNER_ID ещё не задан — на /start бот присылает человеку его id и подсказку, что вписать в .env.
 Чужим: сообщения молча отбрасываются (раз в час — короткое «Это личный бот.»), кнопки
 отвечают «Нет доступа».
+
+Ещё два маленьких middleware:
+  • `TurnOrder` — реплики владельца доходят до агента в том порядке, в каком пришли. aiogram
+    обрабатывает каждое обновление отдельной задачей, и текст, отправленный сразу после
+    голосового, иначе обгонял бы его (голос сначала скачивается и распознаётся). Билет берётся
+    при входе, до первого await; скачивание и распознавание идут параллельно, а ход агента
+    (`wait_turn`) ждёт, пока закончатся все более ранние сообщения. Команды, которым агент не
+    нужен, свой билет сразу отпускают (`release_turn`) — /news не задерживает следующий вопрос.
+  • `Inflight` — какие обновления сейчас в работе: при остановке их дожидаются, прежде чем
+    закрывать базу и модель.
 """
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware
@@ -47,8 +62,15 @@ def is_start(text: Any) -> bool:
     return bool(isinstance(text, str) and _START.match(text.strip()))
 
 
+def event_chat(event: Any) -> Any:
+    """Чат события: у сообщения — его чат, у кнопки — чат сообщения с кнопкой (None — не знаем)."""
+    msg = event if isinstance(event, Message) else getattr(event, "message", None)
+    return getattr(msg, "chat", None)
+
+
 class OwnerOnly(BaseMiddleware):
-    """Пропускает только владельца. Ставится как outer middleware на message и callback_query."""
+    """Пропускает только владельца и только из лички. Ставится как outer middleware на message
+    и callback_query."""
 
     def __init__(self, cfg: Any, *, stranger_reply: bool = True, reply_every: float = REPLY_EVERY,
                  clock: Callable[[], float] = time.monotonic):
@@ -57,6 +79,7 @@ class OwnerOnly(BaseMiddleware):
         self.reply_every = float(reply_every)
         self._clock = clock
         self._replied: dict[int, float] = {}
+        self._warned: set[int] = set()
 
     def _may_reply(self, uid: int | None) -> bool:
         """Не чаще раза в reply_every на человека (и память не пухнет от спамеров)."""
@@ -79,7 +102,18 @@ class OwnerOnly(BaseMiddleware):
         user = getattr(event, "from_user", None)
         uid = getattr(user, "id", None)
         if is_owner(self.cfg, uid):
-            return await handler(event, data)
+            chat = event_chat(event)
+            chat_type = getattr(chat, "type", None)
+            if chat_type == "private":
+                return await handler(event, data)
+            log.info("владелец написал из чата %s (%s) — вне лички не отвечаю", getattr(chat, "id", None),
+                     chat_type)
+            if isinstance(event, CallbackQuery):
+                try:                                 # ответить надо всегда — иначе крутятся часики
+                    await event.answer(NO_ACCESS)
+                except Exception as e:
+                    log.debug("ответ на кнопку вне лички не ушёл: %r", e)
+            return None
         try:
             if isinstance(event, CallbackQuery):
                 await event.answer(NO_ACCESS, show_alert=True)
@@ -88,6 +122,17 @@ class OwnerOnly(BaseMiddleware):
         except Exception as e:   # ответ чужому — не повод падать
             log.debug("ответ постороннему не ушёл: %r", e)
         return None
+
+    def _log_stranger(self, uid: int | None) -> None:
+        """Первое сообщение от каждого чужого — в лог заметно: вдруг OWNER_ID вписан с ошибкой."""
+        if uid is None or uid in self._warned:
+            log.info("посторонний %s написал боту — игнорирую", uid)
+            return
+        if len(self._warned) >= _MEMORY_MAX:
+            self._warned.clear()
+        self._warned.add(uid)
+        log.warning("посторонний %s написал боту — игнорирую. Если это ты, OWNER_ID в .env неверный: "
+                    "впиши OWNER_ID=%s и перезапусти бота", uid, uid)
 
     async def _stranger_message(self, message: Message, uid: int | None) -> None:
         owner_set = bool(int(getattr(self.cfg, "owner_id", 0) or 0))
@@ -99,6 +144,92 @@ class OwnerOnly(BaseMiddleware):
             elif chat_type == "private" and self._may_reply(uid):
                 await message.answer(SETUP_HINT, parse_mode=None)
             return
-        log.info("посторонний %s написал боту — игнорирую", uid)
+        self._log_stranger(uid)
         if self.stranger_reply and chat_type == "private" and self._may_reply(uid):
             await message.answer(STRANGER_TEXT, parse_mode=None)
+
+
+# ── порядок реплик ───────────────────────────────────────────────────────────
+@dataclass
+class _Ticket:
+    prev: asyncio.Future | None           # билет сообщения, пришедшего перед этим
+    mine: asyncio.Future                  # готов, когда это сообщение обработано (и все до него)
+    waited: bool = False
+
+
+_ticket: contextvars.ContextVar[_Ticket | None] = contextvars.ContextVar("oracle_turn_ticket", default=None)
+
+
+def _finish_after(prev: asyncio.Future | None, mine: asyncio.Future) -> None:
+    """Пометить свой билет выполненным — но не раньше предыдущего: иначе быстрая команда,
+    пришедшая после голосового, «отпустила» бы и тех, кто пришёл после неё."""
+    def done(_f: Any = None) -> None:
+        if not mine.done():
+            mine.set_result(None)
+    if prev is None or prev.done():
+        done()
+    else:
+        prev.add_done_callback(done)
+
+
+class TurnOrder(BaseMiddleware):
+    """Очередь реплик владельца по порядку прихода. Ставится outer middleware на message ПОСЛЕ
+    OwnerOnly: до обработчика у владельца ничего не ждёт, так что билеты берутся в порядке
+    обновлений (фильтры роутера — уже потом, и они бывают асинхронными)."""
+
+    def __init__(self) -> None:
+        self._tail: asyncio.Future | None = None
+
+    async def __call__(self, handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+                       event: TelegramObject, data: dict[str, Any]) -> Any:
+        prev = self._tail
+        mine = asyncio.get_running_loop().create_future()
+        self._tail = mine
+        token = _ticket.set(_Ticket(prev, mine))
+        try:
+            return await handler(event, data)
+        finally:
+            _ticket.reset(token)
+            _finish_after(prev, mine)       # и при ошибке, и при отмене — очередь не встанет
+
+
+async def wait_turn() -> None:
+    """Дождаться, пока обработаются все сообщения, пришедшие раньше этого (вне TurnOrder — сразу)."""
+    t = _ticket.get()
+    if t is None or t.waited:
+        return
+    t.waited = True
+    if t.prev is not None and not t.prev.done():
+        await asyncio.shield(t.prev)
+
+
+def release_turn() -> None:
+    """Этому сообщению агент не нужен (команда со своим ответом) — следующие реплики его не ждут,
+    но порядок между ними сохраняется."""
+    t = _ticket.get()
+    if t is not None and not t.waited:
+        _finish_after(t.prev, t.mine)
+
+
+# ── что сейчас в работе ──────────────────────────────────────────────────────
+class Inflight(BaseMiddleware):
+    """Запоминает задачи, в которых сейчас обрабатываются обновления (для аккуратной остановки:
+    aiogram их не ждёт). Ставится outer middleware на update."""
+
+    def __init__(self) -> None:
+        self.tasks: set[asyncio.Task] = set()
+
+    async def __call__(self, handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+                       event: TelegramObject, data: dict[str, Any]) -> Any:
+        task = asyncio.current_task()
+        if task is not None:
+            self.tasks.add(task)
+        try:
+            return await handler(event, data)
+        finally:
+            if task is not None:
+                self.tasks.discard(task)
+
+    def pending(self) -> list[asyncio.Task]:
+        me = asyncio.current_task()
+        return [t for t in self.tasks if not t.done() and t is not me]
