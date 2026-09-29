@@ -412,8 +412,9 @@ def test_is_owner(cfg):
 def test_is_start_and_id_text():
     assert is_start("/start") and is_start("/start@MyBot") and is_start("/start payload")
     assert not is_start("/startle") and not is_start("start") and not is_start(None)
-    assert id_text(123) == ("Твой Telegram id: <code>123</code>\nВпиши в .env строку OWNER_ID=123 и "
-                            "перезапусти бота — после этого я буду слушаться только тебя.")
+    assert id_text(123).startswith("Твой Telegram id: <code>123</code>\nВпиши в .env строку OWNER_ID=123 и "
+                                   "перезапусти бота — после этого я буду слушаться только тебя.")
+    assert "другая, старая копия" in id_text(123)
 
 
 class _Handler:

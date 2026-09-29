@@ -102,3 +102,29 @@ def test_env_example_has_each_setting_once():
     keys = re.findall(r"(?m)^([A-Z][A-Z0-9_]*)=", s)
     assert [k for k, n in collections.Counter(keys).items() if n > 1] == []
     assert [ln for ln in s.splitlines() if ln and not ln.startswith("#") and "=" not in ln] == []
+
+
+def test_empty_os_env_does_not_hide_env_file(tmp_path, monkeypatch):
+    """Пустая системная переменная OWNER_ID не перебивает вписанный в .env id; непустая — главнее."""
+    from oracle import config
+    env = tmp_path / "o.env"
+    env.write_text("OWNER_ID=173682354\n", encoding="utf-8")
+    monkeypatch.setenv("OWNER_ID", "")
+    c = config.load(env)
+    assert c.owners == (173682354,) and config.LOADED_ENV == env
+    monkeypatch.setenv("OWNER_ID", "555")
+    assert config.load(env).owners == (555,)
+    monkeypatch.delenv("OWNER_ID", raising=False)
+
+
+def test_env_duplicates_bom_quotes_spaces(tmp_path, monkeypatch):
+    """Дописал OWNER_ID сверху, а пустая строка осталась ниже; BOM, кавычки, пробелы — id всё равно читается."""
+    from oracle import config
+    env = tmp_path / "d.env"
+    env.write_bytes("﻿OWNER_ID = \"173682354\"  \n# коммент\nBOT_NAME=Оракул # имя\nOWNER_ID=\n".encode("utf-8"))
+    for k in ("OWNER_ID", "BOT_NAME"):
+        monkeypatch.delenv(k, raising=False)
+    c = config.load(env)
+    assert c.owners == (173682354,) and c.bot_name == "Оракул"
+    for k in ("OWNER_ID", "BOT_NAME"):
+        monkeypatch.delenv(k, raising=False)

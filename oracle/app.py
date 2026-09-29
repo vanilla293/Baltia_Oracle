@@ -392,6 +392,9 @@ async def main() -> int:
         log.info("Baltia Oracle запущен%s: модель %s (глубокая %s), режим %s, распознавание: %s, userbot: %s, пояс %s",
                  f" как @{me.username}" if getattr(me, "username", None) else "",
                  cfg.llm_model, cfg.llm_model_deep, mode, stt.describe(), ub_state, cfg.tz.key)
+        env = config.LOADED_ENV
+        log.info("настройки: %s; OWNER_ID: %s", env if env is not None else "файл .env не найден",
+                 ", ".join(str(u) for u in cfg.owners) or "не задан")
         if setup:
             log.warning("режим настройки — отвечаю только на /start: %s", "; ".join(cfg.problems()))
 

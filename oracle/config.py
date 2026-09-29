@@ -12,6 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 ROOT = Path(__file__).resolve().parent.parent
+LOADED_ENV: Path | None = None          # какой .env прочитан при последнем load() (None — не нашёлся)
 
 DEFAULT_FEEDS = (
     # разные лагеря — чтобы сравнивать подачу, а не верить одному источнику
@@ -315,13 +316,45 @@ def _rooted(p: str) -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
+def _read_env(path: Path) -> dict[str, str]:
+    """Настройки из .env. Строка встречается дважды (дописал свою, а пустая осталась) — берётся
+    последнее НЕпустое значение: пустая строка не стирает вписанный id. Кавычки и пробелы вокруг
+    значения снимаются, BOM в начале файла не мешает."""
+    if not path.is_file():
+        return {}
+    out: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        text = path.read_text(encoding="cp1251", errors="replace")   # сохранён «блокнотом» не в UTF-8
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        elif " #" in value:                    # комментарий в конце строки
+            value = value.split(" #", 1)[0].rstrip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) and value:
+            out[key] = value
+    return out
+
+
 def load(env_file: str | os.PathLike | None = None) -> Settings:
     """Прочитать .env (если есть) и окружение → Settings."""
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(env_file or os.environ.get("ENV_FILE") or ROOT / ".env", override=False)
-    except ImportError:  # python-dotenv не обязателен, если переменные заданы окружением
-        pass
+    path = Path(env_file or os.environ.get("ENV_FILE") or ROOT / ".env")
+    for key, value in _read_env(path).items():
+        # непустая переменная окружения главнее .env (docker, тесты); пустая — нет: иначе пустой
+        # системный OWNER_ID молча перебил бы вписанный в .env
+        if not os.environ.get(key, "").strip():
+            os.environ[key] = value
+    global LOADED_ENV
+    LOADED_ENV = path if path.is_file() else None
 
     data_dir = _rooted(_get("DATA_DIR", str(ROOT / "data")))
     session = str(_rooted(_get("USERBOT_SESSION", str(data_dir / "userbot"))))
