@@ -1908,14 +1908,17 @@ class MissionPilot(ai_pilot.AIPilot):
         def _put(new: dict) -> bool:
             """План в пилот: та же сторона и дверь думает → на месте (состояние двери живо: её ВОЙТИ не выбрасывается).
             Ревью 5.4.2: срок плана (ts, PLAN_TTL_SEC) — от нового решения; пометка пробития (crossed) — от старого
-            уровня, снимается; ответ двери ЖДАТЬ/ОТМЕНИТЬ/молчание про старый план к обновлённому не применяется
-            (_apply_gate: snap_ts > gate_ts). Возврат: на месте?"""
+            уровня, снимается; ответ двери ЖДАТЬ/ОТМЕНИТЬ/молчание про старый план к обновлённому не применяется —
+            по пометке gate_stale (ставится здесь, снимается новым вопросом у двери и ответом _apply_gate), а не по
+            сравнению времён: снимок перепроверки (snap_ts) берётся ДО раздумий PRO и может быть старше вопроса двери.
+            Запись ответа ссылается на план, о котором спросили (gate_plan_ts), а не на обновлённый. Возврат: на месте?"""
             old = self.plan
             if old is not None and old.get("side") == new["side"] and old.get("gate_busy") and not flip:
                 for k in ("gate_note", "gate_wait_ts", "crossed"):   # пометки прошлого решения — решение свежее
                     old.pop(k, None)
                 old.update(new)
                 old["ts"] = now
+                old["gate_stale"] = True               # дверь думает над прежним планом — её ЖДАТЬ/ОТМЕНИТЬ не про этот
                 return True
             self.plan = dict(new, ts=now)
             return False
@@ -2578,13 +2581,15 @@ class MissionPilot(ai_pilot.AIPilot):
         obj = await ai_v5.money_json(s, u, route="mission_guard")     # v5.4.1: узел у денег — PRO (PYTHIA_MONEY_MODEL)
         if m is not None:
             m.sizes["guard"] = _sizes_rec(len(u), {"situation": situation, **blocks}, _json_len(obj))
-        obj = obj if isinstance(obj, dict) else {}
+        # ревью 5.4.2 (финал): приватные ключи флага кода из ответа ИИ вычищаются — флаг ставит только код
+        obj = ai_pilot.strip_rule_keys(obj) if isinstance(obj, dict) else {}
         # v5.4.2: слово — по словарю троса (CLOSE/EXIT/ВЫЙТИ → СЛИТЬ, HOLD/ДЕРЖАТЬ → ЖДАТЬ); не разобрано — страховка
-        # прежняя (у троса это слив), но это действие кода, а не решение ИИ: rule «НЕ_РАЗОБРАН», сырой ответ сохранён
+        # прежняя (у троса это слив), но это действие кода, а не решение ИИ: флаг «НЕ_РАЗОБРАН», сырой ответ сохранён
         raw = ai_v5.decision_raw(obj)
         tok = ai_v5.decision_of(raw, ai_v5.guard_table())
         if tok is None:
-            return dict(obj, decision="СЛИТЬ", rule="НЕ_РАЗОБРАН", detail=raw[:40] or "пусто", raw=raw[:80])
+            return dict(obj, decision="СЛИТЬ", **{ai_pilot.RULE_KEY: "НЕ_РАЗОБРАН",
+                                                   ai_pilot.RULE_DETAIL: raw[:40] or "пусто", ai_pilot.RULE_RAW: raw[:80]})
         return dict(obj, decision=tok)
 
     def _guards_text(self) -> str:
@@ -2650,13 +2655,14 @@ class MissionPilot(ai_pilot.AIPilot):
         obj = await ai_v5.money_json(s, u, route="mission_take")      # v5.4.1: узел у денег — PRO (PYTHIA_MONEY_MODEL)
         if m is not None:
             m.sizes["take"] = _sizes_rec(len(u), {"situation": situation, **blocks}, _json_len(obj))
-        obj = obj if isinstance(obj, dict) else {}
+        obj = ai_pilot.strip_rule_keys(obj) if isinstance(obj, dict) else {}   # флаг кода ставит только код
         # v5.4.2: слово — по словарю тейка (CLOSE/EXIT/ЗАБРАТЬ → ЗАФИКСИРОВАТЬ, HOLD/ДЕРЖАТЬ → ПОДЕРЖАТЬ); не разобрано —
-        # страховка прежняя (у тейка это фиксация), но это действие кода: rule «НЕ_РАЗОБРАН», сырой ответ сохранён
+        # страховка прежняя (у тейка это фиксация), но это действие кода: флаг «НЕ_РАЗОБРАН», сырой ответ сохранён
         raw = ai_v5.decision_raw(obj)
         tok = ai_v5.decision_of(raw, ai_v5.take_table())
         if tok is None:
-            return dict(obj, decision="ЗАФИКСИРОВАТЬ", rule="НЕ_РАЗОБРАН", detail=raw[:40] or "пусто", raw=raw[:80])
+            return dict(obj, decision="ЗАФИКСИРОВАТЬ", **{ai_pilot.RULE_KEY: "НЕ_РАЗОБРАН",
+                                                           ai_pilot.RULE_DETAIL: raw[:40] or "пусто", ai_pilot.RULE_RAW: raw[:80]})
         return dict(obj, decision=tok)
 
     async def _apply_take(self, r: dict, price: float, pos: dict) -> None:
@@ -2776,7 +2782,7 @@ class MissionPilot(ai_pilot.AIPilot):
         parts = []
         if plan.get("gate_busy"):
             parts.append(f"{mm} сейчас проверяет вход у двери")
-        mine = [g for g in self.gates if g.get("plan_ts") == plan.get("ts")]
+        mine = self._plan_gates(plan)                # ответы «не применено» (про прежний план) — не в счёт
         last = mine[-1] if mine else None
         after = _f(plan.get("gate_after"), 0.0)
         if _f(plan.get("approved_until"), 0.0) > now:
@@ -2792,12 +2798,13 @@ class MissionPilot(ai_pilot.AIPilot):
 
     def _gates_text(self, plan: dict) -> str:
         """Прошлые ответы PRO у двери по ЭТОМУ плану (для промпта проверки входа). v5.4.2: молчание и непонятный
-        ответ — «ответа не было … решения не было» (запись кода), не ответ ИИ «ЖДАТЬ»."""
+        ответ — «ответа не было … решения не было» (запись кода), не ответ ИИ «ЖДАТЬ»; ответы «не применено» (про
+        прежний план, ревью 5.4.2) — не в счёт (_plan_gates)."""
         return "\n".join((f"{ai_v5.fmt_ts(g.get('ts'))} @{g.get('price')}: {g.get('why')}" if g.get("silent") else
                           f"{ai_v5.fmt_ts(g.get('ts'))} @{g.get('price')}: {g.get('decision')} — {g.get('why')}"
                           + (f" (уровень {g.get('entry_kind')} @{g.get('entry')})" if g.get("entry") else "")
                           + (f" (ждать {g.get('wait_minutes')} мин)" if g.get("wait_minutes") else ""))
-                         for g in self.gates if g.get("plan_ts") == plan.get("ts"))
+                         for g in self._plan_gates(plan))
 
     def _plan_text(self, plan: dict, price: float) -> str:
         """Приказ совета + перепроверки + план пилота, по которому он готов войти."""
@@ -2961,6 +2968,8 @@ class MissionPilot(ai_pilot.AIPilot):
         plan["gate_busy"] = True
         plan["gate_ts"] = now
         plan["gate_how"] = self._plan_how(plan)       # с каким планом спросили (план могут обновить на месте)
+        plan["gate_plan_ts"] = plan.get("ts")        # …и какой это был план (запись ответа ссылается на него)
+        plan.pop("gate_stale", None)                  # новый вопрос — о нынешнем плане
         plan.pop("gate_after", None)
         if not topup:
             self.state = "У_ДВЕРИ"
@@ -3106,13 +3115,17 @@ class MissionPilot(ai_pilot.AIPilot):
             decision = ai_v5.decision_of(raw, ai_v5.door_table(side)) or "НЕ_РАЗОБРАН"
         no_answer = decision in ("НЕТ_ОТВЕТА", "НЕ_РАЗОБРАН")
         n_sil = int(plan.get("gate_silent") or 0) + 1 if no_answer else 0
+        # ревью 5.4.2 (финал): запись — о плане, о котором спросили (его ts и вид), а не об обновлённом на месте
+        asked_ts = plan.get("gate_plan_ts", plan.get("ts"))
+        asked_how = plan.get("gate_how") or self._plan_how(plan)
+        stale = bool(plan.pop("gate_stale", None))   # план обновлён свежим решением, пока дверь думала
         if no_answer:
             head = (f"{mm} не ответил у двери ({silent})" if silent else
                     f"{mm} ответил у двери непонятно ({raw[:60] or 'пусто'})")
             why = f"{head} — решения не было, повтор в {self._hhmm(now + retry)}"
             rec = {"ts": now, "decision": decision, "why": why, "note": "", "price": cur, "entry": None,
-                   "entry_kind": None, "wait_minutes": None, "council": False, "plan_ts": plan.get("ts"), "side": side,
-                   "how": self._plan_how(plan), "model": mm, "silent": True, "source": "код",
+                   "entry_kind": None, "wait_minutes": None, "council": False, "plan_ts": asked_ts, "side": side,
+                   "how": asked_how, "model": mm, "silent": True, "source": "код",
                    "raw": raw[:80] or None, "silent_n": n_sil, "applied": ""}
         else:
             e_ai = _f(r.get("entry")) if r.get("entry") not in (None, "", "null") else None
@@ -3120,7 +3133,7 @@ class MissionPilot(ai_pilot.AIPilot):
                    "entry": e_ai if e_ai and e_ai > 0 else None,
                    "entry_kind": (str(r.get("entry_kind") or "").strip().lower() or None),
                    "wait_minutes": _f(r.get("wait_minutes")) or None, "council": bool(r.get("council")),
-                   "plan_ts": plan.get("ts"), "side": side, "how": self._plan_how(plan), "model": mm,
+                   "plan_ts": asked_ts, "side": side, "how": asked_how, "model": mm,
                    "silent": False, "source": "ИИ", "applied": ""}
         self.gates.append(rec)
         del self.gates[:-ai_pilot.GATES_KEEP]
@@ -3130,10 +3143,11 @@ class MissionPilot(ai_pilot.AIPilot):
         if self.plan is not plan:
             rec["applied"] = "план сменился/снят за время ответа — не применено"
             log.info("миссия %s: ответ у двери (%s) выброшен — план сменился", self.base, decision)
-        elif decision != "ВОЙТИ" and _f(plan.get("snap_ts"), 0.0) > _f(plan.get("gate_ts"), 0.0) > 0:
+        elif decision != "ВОЙТИ" and stale:
             # ревью 5.4.2: план обновлён на месте свежим решением (перепроверка), пока дверь думала над прежним: её
             # ЖДАТЬ / ОТМЕНИТЬ / молчание — про старый план, свежее решение ими не отменяется (вход решит тик: свежее
-            # решение бьётся без второго вопроса); ВОЙТИ применяется как обычно
+            # решение бьётся без второго вопроса); ВОЙТИ применяется как обычно. Признак — пометка gate_stale из _put
+            # (снимок перепроверки берётся до раздумий PRO и бывает старше вопроса двери — времена не сравниваем)
             plan["gate_busy"] = False
             plan.pop("gate_after", None)
             rec["applied"] = "план обновлён свежим решением за время ответа — не применено"
@@ -5935,6 +5949,21 @@ if __name__ == "__main__":
         assert p3.position["invalidation"] == 97.0 and abs(p3.broker.stops[-1]["stop"] - p3._hard_of(p3.position)) < 1e-9
         assert any("добор" in x.get("tag", "") or x["lots"] == 5 for x in p3.broker.placed), p3.broker.placed
         assert status("TEST")["phase"] == "in_position" and status("TEST")["pilot"]["position"]["lots"] == 8
+        await stop("TEST")
+        await settle(lambda: not m.pilot_alive())
+        # ревью 5.4.2 (финал): тот же старт с HOLD — приказ пришёл до prepare(): позиция со счёта принята с уровнями
+        # совета (стороны проверены по ней), а не с временным стопом 2 %; добора нет
+        _M.clear()
+        fake_ai.exec_answers[:] = [{"do": "HOLD", "entry": None, "take": 104, "invalidation": 97, "why": "держать"}]
+        r = await start("TEST", "long", reason="позиция на счёте 3")
+        m = _M["TEST"]
+        await m.council_task
+        assert m.error is None and m.exec["do"] == "HOLD", (m.error, m.exec)
+        p3 = m.pilot
+        assert await settle(lambda: p3._prepared and p3.position is not None), (p3.position, p3.last_action)
+        assert p3.position["invalidation"] == 97.0 and p3.position["take"] == 104.0, p3.position
+        assert not p3.position.get("levels_placeholder") and p3._pending_hold is None and p3.plan is None, p3.position
+        assert p3.position["lots"] == 3 and not p3.pending, (p3.position, p3.pending)
         await stop("TEST")
         await settle(lambda: not m.pilot_alive())
         FakeTinkoff.positions = []
