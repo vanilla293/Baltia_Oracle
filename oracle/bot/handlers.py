@@ -40,7 +40,8 @@ from aiogram.filters import Command
 from .. import timeutil
 from ..tools.base import Buttons, OutItem, ToolContext
 from . import keyboards
-from .middleware import finish_turn, release_turn, turn_arrived, turn_pending, wait_turn
+from .middleware import (finish_after, finish_turn, release_turn, take_following, turn_absorbed, turn_arrived,
+                         turn_pending, wait_turn)
 from .notifier import NO_PREVIEW, BotNotifier
 from .render import escape, md_to_html, plain, redact, unlink
 
@@ -182,6 +183,7 @@ BACKUP_KEEP_AGE = 600                  # оставленные на серве�
 TRANSCRIPT_MAX = 3000
 RECORD_MAX = 5000                      # показанное владельцу без агента — в разговор, не длиннее
 QUOTE_MAX = 400                        # цитата сообщения, на которое ответил владелец
+FORWARD_WITH_COMMENT_SEC = 2.0         # пересланное следом за его текстом — в тот же ход (пересылка с комментарием)
 AUDIO_EXT = (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".aac", ".wav", ".flac", ".amr", ".wma", ".weba")
 REMINDER_BUTTONS = 20
 FACT_BUTTONS = 30
@@ -192,7 +194,7 @@ ERR_MAX = 400
 # ── чистые помощники ─────────────────────────────────────────────────────────
 CB_ARITY: dict[tuple[str, str], int | tuple[int, ...]] = {
     ("rem", "done"): 1, ("rem", "snz"): 2, ("rem", "del"): 1,
-    ("wake", "ans"): 2,
+    ("wake", "ans"): (3, 2),                            # <id>:<ответ>:<номер задачки>; старые — без номера
     ("bday", "regen"): 1, ("bday", "send"): (2, 1),     # <id>:<вариант>; старые кнопки — без варианта
     ("idea", "deep"): 1,
     ("draft", "new"): 1, ("draft", "send"): 1, ("draft", "regen"): 1, ("draft", "drop"): 1,
@@ -232,8 +234,10 @@ def make_challenge(rng: random.Random | Any = None) -> tuple[str, int, list[int]
     return f"{a} + {b} = ?", answer, opts
 
 
-def challenge_buttons(rid: int, options: list[int]) -> Buttons:
-    return [[(str(n), f"wake:ans:{int(rid)}:{int(n)}") for n in options]]
+def challenge_buttons(rid: int, options: list[int], qid: int | None = None) -> Buttons:
+    """Варианты ответа; qid — номер задачки: ответ на её старую копию не сравнивается с новой задачкой."""
+    tail = f":{int(qid)}" if qid is not None else ""
+    return [[(str(n), f"wake:ans:{int(rid)}:{int(n)}{tail}") for n in options]]
 
 
 def challenge_key(rid: int) -> str:
@@ -279,6 +283,13 @@ def err_text(e: BaseException) -> str:
         s = f"{type(e).__name__}: {s}" if s else type(e).__name__
     s = s or "неизвестная ошибка"
     return s if len(s) <= ERR_MAX else s[: ERR_MAX - 1] + "…"
+
+
+def _int_or(v: Any, default: int) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
 
 
 def _cut(s: str, n: int) -> str:
@@ -359,6 +370,8 @@ class Handlers:
     def __init__(self, deps: Deps):
         self.d = deps
         self._sending: set[int] = set()
+        self._voice_tail: asyncio.Future | None = None     # озвучка прошлого ответа (голос — по порядку)
+        self._challenge_lock = asyncio.Lock()               # задачка будильника: прочитать-или-создать разом
         self.routes: dict[tuple[str, str], Callable[[Any, _Cb, list[int]], Awaitable[None]]] = {
             ("rem", "done"): self.cb_rem_done, ("rem", "snz"): self.cb_rem_snooze,
             ("rem", "del"): self.cb_rem_delete, ("wake", "ans"): self.cb_wake_answer,
@@ -561,6 +574,8 @@ class Handlers:
             await out.send(self._setup_text())
             return
         noticed = await self._wait_turn(message, out)      # сообщения, пришедшие раньше, — сначала
+        if turn_absorbed():                # пересланное забрал в свой ход комментарий к нему
+            return
         thinking_deep = deep if deep is not None else await self._deep_mode()
         if thinking_deep:
             await out.send(DEEP_NOTE)
@@ -572,10 +587,19 @@ class Handlers:
         if reply_text.strip():
             await out.send(reply_text)
         await self._deliver(out, getattr(reply, "outbox", None))
+        # голос — в порядке ответов: очередь отпускаем сразу, а озвучка ждёт озвучку прошлого ответа
+        prev_voice, my_voice = self._voice_tail, asyncio.get_running_loop().create_future()
+        self._voice_tail = my_voice
         finish_turn()                      # ответ ушёл — следующие сообщения озвучку не ждут
-        await self._speak(message, out, reply_text, via, error=getattr(reply, "error", None))
+        try:
+            await self._speak(message, out, reply_text, via, error=getattr(reply, "error", None), after=prev_voice)
+        finally:
+            finish_after(prev_voice, my_voice)
 
-    async def _speak(self, event: Any, out: Any, text: str, via: str, *, error: Any = None) -> None:
+    async def _speak(self, event: Any, out: Any, text: str, via: str, *, error: Any = None,
+                     after: asyncio.Future | None = None) -> None:
+        """Озвучить ответ. after — озвучка прошлого ответа: синтез идёт параллельно, а отправка — после неё
+        (иначе короткий второй ответ прозвучал бы раньше длинного первого)."""
         tts = self.d.tts
         if tts is None or error or not text.strip():
             return
@@ -587,6 +611,8 @@ class Handlers:
                 return
             async with self._typing(event, ChatAction.RECORD_VOICE):
                 audio = await tts.synth(text)
+            if after is not None and not after.done():
+                await asyncio.shield(after)
             await out.send_voice(audio, "voice.mp3")
         except asyncio.CancelledError:
             raise
@@ -623,41 +649,53 @@ class Handlers:
         return "\n".join(parts + [text]) if parts else text
 
     def _reply_note(self, message: Any) -> str:
-        """«[Ответ на …: «цитата»]» — если владелец ответил (reply) на сообщение или процитировал его."""
+        """«[Ответ на …: «цитата»]» — если владелец ответил (reply) на сообщение или процитировал его.
+        Уведомление userbot «💬 Маша: …» и список /chats — без цитаты: там слова незнакомцев, а ход владельца
+        чужим текстом не помечен; что пишут — tg_read_chat (чужой текст, с пометкой), ответ — tg_draft_reply."""
         rt = getattr(message, "reply_to_message", None)
         ext = getattr(message, "external_reply", None)
         quote = getattr(getattr(message, "quote", None), "text", None)
         if rt is None and ext is None:
             return ""
+        if rt is not None:
+            chats = self._draft_chats(rt)
+            if len(chats) == 1:      # уведомление userbot — в какой чат отвечать
+                return (f"[Ответ на уведомление о личном сообщении (chat_id {next(iter(chats))}); что там — "
+                        f"tg_read_chat, черновик ответа — tg_draft_reply]")
+            if chats:
+                return "[Ответ на список непрочитанных чатов; что там — tg_read_chat, черновик ответа — tg_draft_reply]"
         snippet = quote or (getattr(rt, "text", None) or getattr(rt, "caption", None) if rt is not None else "")
         snippet = _cut(snippet or "", QUOTE_MAX)
-        chat = None
         if rt is not None:
             author = getattr(rt, "from_user", None)
             whose = "твоё сообщение" if getattr(author, "is_bot", False) else "сообщение"
-            chat = self._notify_chat(rt)
-            if chat is not None:     # уведомление userbot «💬 Маша: …» — в какой чат отвечать
-                whose = f"уведомление о личном сообщении (chat_id {chat}; черновик ответа — tg_draft_reply)"
         else:
             whose = f"сообщение {origin_name(getattr(ext, 'origin', None))} из другого чата"
-        if not snippet:
-            return f"[Ответ на {whose}]" if chat is not None else ""
-        return f"[Ответ на {whose}: «{snippet}»]"
+        return f"[Ответ на {whose}: «{snippet}»]" if snippet else ""
 
     @staticmethod
-    def _notify_chat(msg: Any) -> int | None:
-        """chat_id из кнопки «✍️ Предложить ответ» (draft:new:<chat_id>) под уведомлением userbot.
-        Кнопок несколько (список /chats) — непонятно, какой чат: None."""
+    def _draft_chats(msg: Any) -> set[int]:
+        """chat_id из кнопок «✍️ Предложить ответ» (draft:new:<chat_id>) под сообщением бота."""
         chats = set()
         for row in getattr(getattr(msg, "reply_markup", None), "inline_keyboard", None) or []:
             for b in row:
                 parsed = parse_cb(getattr(b, "callback_data", None))
                 if parsed and parsed[:2] == ("draft", "new"):
                     chats.add(parsed[2][0])
-        return chats.pop() if len(chats) == 1 else None
+        return chats
 
     async def on_text(self, message: Any) -> None:
-        await self._answer(message, self._with_context(message, message.text or ""), via="text")
+        text = self._with_context(message, message.text or "")
+        if getattr(message, "forward_origin", None) is None:
+            # пересылка с комментарием: комментарий приходит первым, пересланное — сразу следом; одним ходом,
+            # а не «Чей ДР?» на комментарий и потом ответ на пересланное
+            chat = self._chat_of(message)
+            forwards = await take_following(
+                lambda m: (getattr(m, "forward_origin", None) is not None and bool(getattr(m, "text", None))
+                           and self._chat_of(m) == chat), FORWARD_WITH_COMMENT_SEC)
+            if forwards:
+                text = "\n\n".join([text] + [self._with_context(m, m.text or "") for m in forwards])
+        await self._answer(message, text, via="text")
 
     @staticmethod
     def _voice_file(message: Any) -> tuple[Any, str, str] | None:
@@ -1223,17 +1261,21 @@ class Handlers:
 
     async def _send_challenge(self, query: Any, rid: int, prefix: str = "", *, fresh: bool = False) -> None:
         """Задачка будильника. Уже висит нерешённая — та же самая (сонный двойной «Встал» не делает
-        правильный ответ на первую «мимо»); fresh — новая (после неверного ответа: не перебором)."""
+        правильный ответ на первую «мимо»; два нажатия разом — тоже: чтение и запись под блокировкой);
+        fresh — новая (после неверного ответа: не перебором). У задачки свой номер (id) в кнопках."""
         key = challenge_key(rid)
-        cur = None if fresh else await self.db.kv_get(key)
-        if isinstance(cur, dict) and cur.get("q") and isinstance(cur.get("o"), list) and "a" in cur:
-            question, options = str(cur["q"]), [int(x) for x in cur["o"]]
-        else:
-            question, answer, options = make_challenge()
-            await self.db.kv_set(key, {"q": question, "a": answer, "o": options})
+        async with self._challenge_lock:
+            cur = None if fresh else await self.db.kv_get(key)
+            if isinstance(cur, dict) and cur.get("q") and isinstance(cur.get("o"), list) and "a" in cur:
+                question, options = str(cur["q"]), [int(x) for x in cur["o"]]
+                qid = _int_or(cur.get("id"), 0)
+            else:
+                question, answer, options = make_challenge()
+                qid = random.randint(1, 99999)
+                await self.db.kv_set(key, {"q": question, "a": answer, "o": options, "id": qid})
         woke = "проснулась" if _female(self.cfg) else "проснулся"
         await self._out(query).send(f"{prefix}🧮 Докажи, что {woke}: {question}",
-                                    challenge_buttons(rid, options))
+                                    challenge_buttons(rid, options, qid))
 
     async def _close_task(self, tid: int) -> dict | None:
         """«✅ Готово» под напоминанием о задаче = «сделал задачу»: закрыть её, иначе назавтра она
@@ -1278,6 +1320,15 @@ class Handlers:
             await self._clear_kb(query)
             await cb.answer("Напоминания уже нет")
             return
+        ringing = bool(row.get("nag_active") or row.get("snooze_at"))
+        fired = timeutil.from_iso(row.get("last_fired_at"))
+        fresh = fired is not None and timeutil.now_utc() - fired <= rem.SNOOZE_FRESH
+        # кнопка под старым сообщением: будильник уже снят (решена задачка, «Встал») или напоминание давно
+        # отработало — «💤» завёл бы лишний звонок (у будильника — ещё и с задачкой)
+        if not ringing and (row.get("kind") == "wake" or not fresh):
+            await self._clear_kb(query)
+            await cb.answer("Уже не актуально")
+            return
         row = await rem.snooze_reminder(self.db, rid, minutes)
         await self._clear_kb(query)
         at = timeutil.from_iso((row or {}).get("snooze_at"))
@@ -1302,13 +1353,16 @@ class Handlers:
 
     async def cb_wake_answer(self, query: Any, cb: _Cb, args: list[int]) -> None:
         from ..tools import reminders as rem
-        rid, n = args
+        rid, n = args[0], args[1]
+        qid = args[2] if len(args) > 2 else None                            # старые кнопки — без номера
         key = challenge_key(rid)
         stored = await self.db.kv_get(key)
         correct = stored.get("a") if isinstance(stored, dict) else stored     # число — от старых версий
         row = await rem.get_reminder(self.db, rid)
         await self._clear_kb(query)
-        if correct is None:
+        # ответ на старую копию задачки (её уже сменили после «мимо») — это не «мимо»: вот актуальная
+        stale = qid is not None and isinstance(stored, dict) and _int_or(stored.get("id"), 0) != qid
+        if correct is None or stale:
             if row and rem.ringing_challenge(row):
                 await self._send_challenge(query, rid)
                 await cb.answer("Задачка устарела — вот новая")
@@ -1341,10 +1395,17 @@ class Handlers:
         if await bd.get_birthday(self.db, args[0]) is None:
             await cb.answer("Этого дня рождения уже нет")
             return
+        from ..llm import LLMError
         await cb.answer("Пишу другой вариант…")
         ctx = self.ctx.child()
-        async with self._typing(query):
-            b, text = await bd.regenerate_greeting(ctx, args[0])
+        try:
+            async with self._typing(query):
+                b, text = await bd.regenerate_greeting(ctx, args[0])
+        except LLMError as e:          # модель не ответила — это не поломка бота: сказать по-человечески
+            log.warning("другой вариант поздравления не написан: %s", e)
+            await self._out(query).send(f"⚠️ Другой вариант не написал: {_cut(redact(str(e)), ERR_MAX)}. "
+                                        f"Нажми «🔁 Другой вариант» чуть позже.")
+            return
         await self._drop_button(query, f"bday:send:{b['id']}")   # старый вариант больше не отправить
         await self._out(query).send(text, bd.greeting_buttons(ctx, b))
         await self._record(f"Показал владельцу новый вариант поздравления для {b['name']} (ДР #{b['id']}):\n{text}")
@@ -1430,8 +1491,12 @@ class Handlers:
             log.debug("не записал событие про поздравление", exc_info=True)
 
     async def cb_idea_deep(self, query: Any, cb: _Cb, args: list[int]) -> None:
-        from ..tools import ideas  # noqa: F401  (регистрирует deep_think_idea)
+        from ..tools import ideas  # (и регистрирует deep_think_idea)
         from ..tools.base import dispatch
+        if await ideas.load_idea(self.db, args[0]) is None:     # ошибка инструмента написана для модели
+            await self._drop_button(query, f"idea:deep:{args[0]}")
+            await cb.answer("Этой идеи уже нет")
+            return
         res = json.loads(await dispatch("deep_think_idea", {"id": args[0]}, self.ctx.child()))
         if not res.get("ok"):
             await cb.answer(str(res.get("error") or "не вышло"), alert=True)

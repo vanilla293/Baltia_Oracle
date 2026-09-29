@@ -91,6 +91,13 @@ def main() -> int:
             ("/backup", {"kind": "text", "text": "/backup"}, lambda out: any(m["method"] == "sendDocument" for m in out)),
             ("bad callback", {"kind": "callback", "data": "rem:done:abc"}, lambda out: any(m["method"] == "answerCallbackQuery" for m in out)),
             ("/idea no arg", {"kind": "text", "text": "/idea"}, lambda out: len(out) >= 1),
+            # пересылка с комментарием: Telegram шлёт комментарий и пересланное двумя сообщениями подряд —
+            # один ход агента (без «Чей ДР?» на комментарий)
+            ("forward with comment", {"kind": "batch", "items": [
+                {"kind": "text", "text": "запиши его др"},
+                {"kind": "text", "text": "у меня ДР 14 марта, жду в гости", "forward_from": "Лёха"}]},
+             lambda out: any("Сделал" in m["text"] and "Лёха" in m["text"] for m in out)
+             and not any("Я тут" in m["text"] for m in out)),
             ("/forget junk", {"kind": "text", "text": "/forget abc"}, lambda out: len(out) >= 1),
         ]
         for name, upd, check in steps:

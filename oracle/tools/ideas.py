@@ -256,6 +256,9 @@ def parse_verdict(text: str) -> str | None:
     return _snippet(v, 200) or None
 
 
+_STARTING: set[int] = set()     # идеи, для которых разбор сейчас запускается (между проверкой и пометкой)
+
+
 async def _begin_deep(db, row: dict) -> str:
     """Пометить идею «обдумывается», запомнив прежний статус. → прежний статус."""
     key = DEEP_KEY.format(row["id"])
@@ -599,10 +602,18 @@ async def t_delete_idea(ctx: ToolContext, *, id: Any) -> dict:
       {"id": {"type": "integer"}}, required=["id"])
 async def t_deep_think_idea(ctx: ToolContext, *, id: Any) -> dict:
     row = await _idea_or_fail(ctx.db, id)
-    if await deep_busy(ctx, row["id"]):
-        return {"ok": True, "started": False, "id": row["id"], "title": row["title"],
-                "note": "Уже думаю над ней — разбор придёт отдельным сообщением. Скажи ему об этом одной фразой."}
-    await _begin_deep(ctx.db, row)           # сразу «обдумывается» — повторный вызов не запустит второй разбор
+    busy = {"ok": True, "started": False, "id": row["id"], "title": row["title"],
+            "note": "Уже думаю над ней — разбор придёт отдельным сообщением. Скажи ему об этом одной фразой."}
+    # проверка и пометка — не атомарны (два await): два нажатия «Додумать» разом прошли бы оба
+    if row["id"] in _STARTING:
+        return busy
+    _STARTING.add(row["id"])
+    try:
+        if await deep_busy(ctx, row["id"]):
+            return busy
+        await _begin_deep(ctx.db, row)       # сразу «обдумывается» — повторный вызов не запустит второй разбор
+    finally:
+        _STARTING.discard(row["id"])
     ctx.services.spawn(deep_evaluate(ctx.child(), row["id"]), name="deep_idea")
     return {"ok": True, "started": True, "id": row["id"], "title": row["title"],
             "note": "Думаю в фоне — пришлю разбор отдельным сообщением. Скажи ему об этом одной фразой."}

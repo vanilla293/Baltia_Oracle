@@ -122,6 +122,9 @@ async def llm(request: web.Request) -> web.Response:
     low = text.lower()
     if body.get("response_format", {}).get("type") == "json_object":
         return web.json_response(_completion('{"journal": "день как день", "facts": [], "opinions": [], "followups": []}'))
+    if "запиши его др" in low and "переслано от" in low and body.get("tools"):
+        # пересылка с комментарием дошла одним ходом: комментарий и пересланное — вместе
+        return web.json_response(_completion("", [("add_birthday", {"name": "Лёха", "date": "14 марта"})]))
     if "напомни" in low and body.get("tools"):
         return web.json_response(_completion("", [("create_reminder", {"text": "позвонить маме", "when": "2026-12-30 07:00"})]))
     if "идея" in low and body.get("tools"):
@@ -134,12 +137,22 @@ async def llm(request: web.Request) -> web.Response:
 
 
 async def control(request: web.Request) -> web.Response:
-    """POST /ctl/update {kind, from, text|data} — положить апдейт; GET /ctl/state — что бот отправил."""
-    global _uid
+    """POST /ctl/update {kind, from, text|data} — положить апдейт ({kind: "batch", items: […]} — несколько сразу,
+    одним ответом getUpdates); GET /ctl/state — что бот отправил."""
     if request.method == "GET":
         return web.json_response({"sent": sent, "llm_calls": len(llm_calls),
                                   "llm_last": llm_calls[-1] if llm_calls else None})
     d = await request.json()
+    if d["kind"] == "batch":            # несколько апдейтов сразу — одним ответом getUpdates
+        ids = []
+        for item in d["items"]:
+            ids.append(_add_update(item))
+        return web.json_response({"ok": True, "update_ids": ids})
+    return web.json_response({"ok": True, "update_id": _add_update(d)})
+
+
+def _add_update(d: dict) -> int:
+    global _uid
     _uid += 1
     user = {"id": d.get("from", OWNER), "is_bot": False, "first_name": "Тест"}
     chat = {"id": d.get("from", OWNER), "type": "private"}
@@ -148,6 +161,9 @@ async def control(request: web.Request) -> web.Response:
         if d["text"].startswith("/"):
             cmd = d["text"].split()[0]
             m["entities"] = [{"type": "bot_command", "offset": 0, "length": len(cmd)}]
+        if d.get("forward_from"):       # пересланное от другого человека
+            m["forward_origin"] = {"type": "user", "date": int(time.time()) - 3600,
+                                   "sender_user": {"id": 555, "is_bot": False, "first_name": d["forward_from"]}}
         updates.append({"update_id": _uid, "message": m})
     elif d["kind"] == "voice":
         m = {"message_id": 10 + _uid, "date": int(time.time()), "chat": chat, "from": user,
@@ -157,7 +173,7 @@ async def control(request: web.Request) -> web.Response:
         updates.append({"update_id": _uid, "callback_query": {
             "id": f"cb{_uid}", "from": user, "chat_instance": "ci", "data": d["data"],
             "message": {"message_id": 5, "date": int(time.time()), "chat": chat, "from": BOT, "text": "x"}}})
-    return web.json_response({"ok": True, "update_id": _uid})
+    return _uid
 
 
 def main() -> None:

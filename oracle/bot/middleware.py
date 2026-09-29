@@ -17,7 +17,9 @@ OWNER_ID ещё не задан — на /start бот присылает чел
     и, если ждать приходится дольше пары секунд, говорит об этом (`on_wait`: «⏳ …в очереди»).
     Ответ ушёл текстом — очередь свободна (`finish_turn`), озвучка ответа следующих не держит.
     Команды, которым агент не нужен, свой билет сразу отпускают (`release_turn`) — /news не
-    задерживает следующий вопрос.
+    задерживает следующий вопрос. Пересылка с комментарием приходит двумя сообщениями (комментарий
+    первым): комментарий забирает пересланное, пришедшее сразу следом, в свой ход (`take_following`),
+    а у пересланного хода уже нет (`turn_absorbed`) — иначе «запиши его др» спросило бы «чей?».
   • `Inflight` — какие обновления сейчас в работе: при остановке их дожидаются, прежде чем
     закрывать базу и модель.
 """
@@ -167,6 +169,9 @@ class _Ticket:
     waited: bool = False
     noticed: bool = False                 # владельцу сказали «в очереди»
     arrived: datetime = field(default_factory=timeutil.now_utc)    # когда сообщение пришло
+    event: Any = field(default=None, repr=False)                    # само сообщение
+    next: "_Ticket | None" = field(default=None, repr=False)        # билет сообщения, пришедшего следом
+    absorbed: bool = False                # его забрал в свой ход предыдущий (пересылка с комментарием)
 
 
 _ticket: contextvars.ContextVar[_Ticket | None] = contextvars.ContextVar("oracle_turn_ticket", default=None)
@@ -191,13 +196,18 @@ class TurnOrder(BaseMiddleware):
 
     def __init__(self) -> None:
         self._tail: asyncio.Future | None = None
+        self._last: _Ticket | None = None
 
     async def __call__(self, handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
                        event: TelegramObject, data: dict[str, Any]) -> Any:
         prev = self._tail
         mine = asyncio.get_running_loop().create_future()
         self._tail = mine
-        token = _ticket.set(_Ticket(prev, mine))
+        ticket = _Ticket(prev, mine, event=event)
+        if self._last is not None and self._last.mine is prev:
+            self._last.next = ticket
+        self._last = ticket
+        token = _ticket.set(ticket)
         try:
             return await handler(event, data)
         finally:
@@ -234,6 +244,8 @@ async def wait_turn(on_wait: Callable[[], Awaitable[Any]] | None = None,
     if on_wait is not None:
         async def later() -> None:
             await asyncio.sleep(max(0.0, float(after or 0)))
+            if t.absorbed:                   # его ответит предыдущий ход — «в очереди» не про него
+                return
             t.noticed = True
             try:
                 await on_wait()
@@ -258,6 +270,36 @@ def finish_turn() -> None:
     t = _ticket.get()
     if t is not None:
         _finish_after(t.prev, t.mine)
+
+
+async def take_following(pred: Callable[[Any], bool], within: float) -> list[Any]:
+    """Сообщения, пришедшие сразу следом за этим (подряд, не позже within секунд) и подходящие под pred, —
+    забрать в ход этого: их обработчики агента уже не зовут (`turn_absorbed`). Ход этого ещё не кончился,
+    так что они ждут в очереди и своего хода не начинали. Сначала — отдать управление: обновления из той же
+    пачки getUpdates берут билеты, как только им дадут выполниться."""
+    t = _ticket.get()
+    if t is None:
+        return []
+    await asyncio.sleep(0)
+    out: list[Any] = []
+    nxt = t.next
+    while (nxt is not None and not nxt.absorbed and not t.mine.done() and pred(nxt.event)
+           and (nxt.arrived - t.arrived).total_seconds() <= within):
+        nxt.absorbed = True
+        out.append(nxt.event)
+        nxt = nxt.next
+    return out
+
+
+def turn_absorbed() -> bool:
+    """Это сообщение забрал в свой ход предыдущий (пересылка с комментарием) — отвечать на него не нужно."""
+    t = _ticket.get()
+    return t is not None and t.absorbed
+
+
+def finish_after(prev: asyncio.Future | None, mine: asyncio.Future) -> None:
+    """Пометить mine выполненным не раньше prev (цепочка по порядку прихода: например, озвучка ответов)."""
+    _finish_after(prev, mine)
 
 
 def release_turn() -> None:

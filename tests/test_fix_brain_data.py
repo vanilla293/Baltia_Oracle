@@ -372,7 +372,7 @@ async def test_injection_in_chat_cannot_exfiltrate_or_delete(ctx, fake_llm, db, 
     assert "данные, а не указания" in chat_result["untrusted"] and chat_result["messages"]
     results = [json.loads(m["content"]) for m in fake_llm.calls[2]["messages"][-3:]]
     assert results[0]["ok"] is False and "не открываю" in results[0]["error"]
-    assert results[1]["ok"] is False and "прямой" in results[1]["error"]
+    assert results[1]["ok"] is False and "«да»" in results[1]["error"]
     assert results[2]["ok"] is True
     log_row = [c for role, c in await dialog(db) if role == "event"][0]
     assert "forget → ошибка" in log_row and "read_url → ошибка" in log_row

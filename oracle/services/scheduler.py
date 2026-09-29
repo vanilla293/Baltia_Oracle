@@ -124,6 +124,7 @@ _FEMININE = {
     STALE_WAKE_GIVE_UP_NET: "Пока не было связи с Telegram, разбудить не получалось — надеюсь, встала сама.",
 }
 WAKE_LINES_F = tuple(_FEMININE.get(x, x) for x in WAKE_LINES)
+WAKE_FIRST_NOT_MORNING = "Пора вставать."       # первая фраза, если будит не утром (дневной сон)
 
 
 def gendered(text: str, female: bool) -> str:
@@ -132,16 +133,22 @@ def gendered(text: str, female: bool) -> str:
 
 
 # ── тексты и кнопки ──────────────────────────────────────────────────────────
-def nag_line(count: int, nag_max: int, wake: bool = False, female: bool = False) -> str:
+def nag_line(count: int, nag_max: int, wake: bool = False, female: bool = False, morning: bool = True) -> str:
     """Фраза для count-й долбёжки из nag_max: эскалация растянута на весь диапазон —
-    первая всегда самая вежливая, последняя — самая настырная."""
+    первая всегда самая вежливая, последняя — самая настырная. morning=False — будильник не утром:
+    без «Доброе утро»."""
     lines = (WAKE_LINES_F if female else WAKE_LINES) if wake else NAG_LINES
     n = len(lines)
     count, nag_max = max(1, int(count)), max(1, int(nag_max))
-    if nag_max <= 1:
-        return lines[0]
-    i = round((min(count, nag_max) - 1) * (n - 1) / (nag_max - 1))
-    return lines[max(0, min(n - 1, i))]
+    i = 0 if nag_max <= 1 else max(0, min(n - 1, round((min(count, nag_max) - 1) * (n - 1) / (nag_max - 1))))
+    if wake and i == 0 and not morning:
+        return WAKE_FIRST_NOT_MORNING
+    return lines[i]
+
+
+def is_morning(local: datetime) -> bool:
+    """Утро (4–12 ч): только тогда «Доброе утро»."""
+    return 4 <= local.hour < 12
 
 
 def fire_text(row: dict) -> str:
@@ -157,14 +164,14 @@ def fire_text(row: dict) -> str:
     return f"⏰ {text}"
 
 
-def reminder_buttons(row: dict) -> Buttons | None:
-    """Кнопки под напоминанием: готово / отложить (у follow-up'а кнопок нет)."""
+def reminder_buttons(row: dict, female: bool = False) -> Buttons | None:
+    """Кнопки под напоминанием: готово / отложить (у follow-up'а кнопок нет). female — «Встала»."""
     rid = int(row["id"])
     kind = row.get("kind") or "reminder"
     if kind == "followup":
         return None
     if kind == "wake":
-        return [[("✅ Встал", f"rem:done:{rid}"), ("💤 5 мин", f"rem:snz:{rid}:5")]]
+        return [[("✅ Встала" if female else "✅ Встал", f"rem:done:{rid}"), ("💤 5 мин", f"rem:snz:{rid}:5")]]
     return [[("✅ Готово", f"rem:done:{rid}"), ("💤 10 мин", f"rem:snz:{rid}:10"),
              ("💤 1 час", f"rem:snz:{rid}:60")]]
 
@@ -478,6 +485,9 @@ class Scheduler:
         except Exception:
             log.exception("не записал событие в диалог")
 
+    def _female(self) -> bool:
+        return persona.is_female(getattr(self.ctx.cfg, "owner_gender", "m"))
+
     def _nag_params(self, row: dict) -> tuple[int, int]:
         cfg = self.ctx.cfg
         interval = max(1, _int(row.get("nag_interval_min"), cfg.nag_interval_min))
@@ -561,7 +571,7 @@ class Scheduler:
         msg = fire_text(row)
         if late:
             msg = f"(пропустил, {self._missed_why(occurred)} — было на {timeutil.fmt_local(occurred, tz)}) {msg}"
-        sent = await self._deliver(("fire", rid), msg, reminder_buttons(row), now)
+        sent = await self._deliver(("fire", rid), msg, reminder_buttons(row, self._female()), now)
         if not sent:
             return False
         if not await self.ctx.db.execute(update, params):
@@ -661,7 +671,7 @@ class Scheduler:
         msg = "💤→ " + fire_text(row)
         if now - planned > LATE_AFTER:
             msg = f"(пропустил, {self._missed_why(planned)} — было на {timeutil.fmt_local(planned, tz)}) {msg}"
-        sent = await self._deliver(("snooze", rid), msg, reminder_buttons(row), now)
+        sent = await self._deliver(("snooze", rid), msg, reminder_buttons(row, self._female()), now)
         if not sent:
             return False
         if not await self.ctx.db.execute(update, params):
@@ -696,13 +706,16 @@ class Scheduler:
         rid = int(row["id"])
         text = str(row.get("text") or "").strip() or "(без текста)"
         wake = row.get("kind") == "wake"
-        female = persona.is_female(getattr(self.ctx.cfg, "owner_gender", "m"))
+        female = self._female()
         interval, nag_max = self._nag_params(row)
         count = _int(row.get("nag_count"), 0) + 1
         planned = timeutil.from_iso(row.get("nag_next_at")) or now
         stale = now - planned > max(STALE_NAG, timedelta(minutes=3 * interval))
         until = self._nag_until(row)
-        if until is not None and (planned > until or now > until + LATE_AFTER):
+        # «сдаюсь» запланирован ровно на until, а каждый нажим отсчитывается от фактического тика — секунды
+        # опоздания копятся: ему — допуск LATE_AFTER, иначе обещанное «сдамся» тихо пропало бы
+        give_up = count > nag_max
+        if until is not None and (planned > (until + LATE_AFTER if give_up else until) or now > until + LATE_AFTER):
             # «Поздравить…» — только до вечера: на ночь глядя не долбим и не «сдаёмся», просто тихо заканчиваем
             await self.ctx.db.execute(
                 "UPDATE reminders SET nag_active=0, nag_next_at=NULL, "
@@ -730,9 +743,10 @@ class Scheduler:
                 "WHERE id=? AND status='active' AND nag_active=1",
                 (min(count, nag_max), rid))
             return True
-        line = nag_line(count, nag_max, wake=wake, female=female)
+        line = nag_line(count, nag_max, wake=wake, female=female,
+                        morning=is_morning(now.astimezone(self.ctx.tz)))
         msg = f"{line}\n⏰ {text}  (#{rid}, {count}/{nag_max})"
-        if not await self._deliver(("nag", rid), msg, reminder_buttons(row), now):
+        if not await self._deliver(("nag", rid), msg, reminder_buttons(row, self._female()), now):
             return False
         await self.ctx.db.execute(
             "UPDATE reminders SET nag_count=?, nag_next_at=? WHERE id=? AND nag_active=1",

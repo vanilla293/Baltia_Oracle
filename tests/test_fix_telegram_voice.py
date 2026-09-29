@@ -158,7 +158,8 @@ async def test_reply_to_bot_card_and_notification(h, deps, bot):
     await h.on_text(msg(bot, "ответь ей, что буду через 10 минут", reply_to_message=note,
                         quote=TextQuote(text="ты где?", position=10)))
     text = deps.agent.calls[-1][0]
-    assert "chat_id 555" in text and "tg_draft_reply" in text and "«ты где?»" in text
+    # слова незнакомца в ход владельца не идут (там нет пометки «чужой текст»): что пишут — tg_read_chat
+    assert "chat_id 555" in text and "tg_draft_reply" in text and "ты где?" not in text
 
 
 async def test_text_link_urls_reach_agent(h, deps, bot):

@@ -992,7 +992,8 @@ async def test_wake_challenge_flow(h, ctx, db, notifier, bot, monkeypatch):
     await h.on_callback(cbq(bot, f"rem:done:{rid}"))
     assert (await db.kv_get(f"challenge:{rid}"))["a"] == 42
     assert notifier.texts()[-1] == "🧮 Докажи, что проснулся: 20 + 22 = ?"
-    assert notifier.sent[-1]["buttons"] == challenge_buttons(rid, [41, 42, 52, 32])
+    qid = (await db.kv_get(f"challenge:{rid}"))["id"]                 # номер задачки — в кнопках
+    assert notifier.sent[-1]["buttons"] == challenge_buttons(rid, [41, 42, 52, 32], qid)
     assert (await rem.get_reminder(db, rid))["nag_active"] == 1
     assert cb_answers(bot)[-1].text == "Сначала реши задачку"
 
@@ -1027,6 +1028,8 @@ async def test_wake_answer_without_stored_challenge_issues_new_one(h, ctx, db, n
 async def test_rem_snooze_and_delete(h, ctx, db, bot):
     rem = importlib.import_module("oracle.tools.reminders")
     row = await rem.create_reminder(ctx, text="Чайник", when="2026-09-28 10:00")
+    await db.execute("UPDATE reminders SET last_fired_at=? WHERE id=?",   # «💤» — под сработавшим
+                     ("2026-09-28T06:00:00+00:00", row["id"]))
     await h.on_callback(cbq(bot, f"rem:snz:{row['id']}:10"))
     new = await rem.get_reminder(db, row["id"])
     assert new["snooze_at"] == "2026-09-28T06:10:00+00:00"
@@ -1048,6 +1051,7 @@ async def test_rem_snooze_across_midnight_shows_date(h, ctx, db, bot, clock):
     rem = importlib.import_module("oracle.tools.reminders")
     row = await rem.create_reminder(ctx, text="Спать", when="2026-09-28 23:50")
     clock.set(datetime(2026, 9, 28, 20, 55, tzinfo=UTC))      # 23:55 МСК
+    await db.execute("UPDATE reminders SET last_fired_at=? WHERE id=?", ("2026-09-28T20:50:00+00:00", row["id"]))
     await h.on_callback(cbq(bot, f"rem:snz:{row['id']}:60"))
     assert cb_answers(bot)[-1].text == "💤 Напомню 29.09 в 00:55"
 
@@ -1113,7 +1117,7 @@ async def test_idea_deep_button(h, ctx, db, notifier, bot, fake_llm):
     assert any("Додумал идею" in t for t in notifier.texts())
     assert (await ideas.load_idea(db, iid))["score"] == 5
     await h.on_callback(cbq(bot, "idea:deep:999"))
-    assert cb_answers(bot)[-1].show_alert is True and "999" in cb_answers(bot)[-1].text
+    assert cb_answers(bot)[-1].text == "Этой идеи уже нет"                 # без имён инструментов
 
 
 async def test_draft_buttons(h, deps, ctx, db, notifier, bot, fake_llm):

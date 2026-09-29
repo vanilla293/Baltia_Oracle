@@ -334,9 +334,10 @@ def test_url_error_suggests_search_only_when_it_exists():
 # ── R9/R28: закрыть задачу/проект и «отметить» заранее — та же отмена ──────────
 def test_destructive_near_equivalents_are_gated():
     g = TurnGuard(tainted=True)
-    for name in ("update_task", "update_project", "ack_reminder"):
-        assert name in GATED_TOOLS and g.check(name, {"id": 1}) is not None
-    assert TurnGuard().check("update_task", {"id": 1}) is None               # чистый ход — можно
+    for name, args in (("update_task", {"id": 1, "status": "done"}), ("update_project", {"project": "1", "status": "dropped"}),
+                       ("ack_reminder", {"id": 1})):
+        assert name in GATED_TOOLS and g.check(name, args) is not None
+    assert TurnGuard().check("update_task", {"id": 1, "status": "done"}) is None     # чистый ход — можно
 
 
 # ── R7/R33: only_next у разового — не молчаливый ok ─────────────────────────

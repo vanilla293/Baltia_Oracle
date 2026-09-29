@@ -784,6 +784,13 @@ async def t_get_agenda(ctx: ToolContext, **kw: Any) -> dict:
         out["note"] = "в этот период ничего нет — свободен"
     elif len(d["reminders"]) >= brief.REMINDERS_MAX:
         out["note"] = f"напоминаний в периоде больше {brief.REMINDERS_MAX} — показаны первые; сузь период"
+    cut = [x for x in d["reminders"] if x.get("more")]
+    if cut:                          # частый повтор показан не весь — иначе «с пятницы ничего» было бы враньём
+        more = "; ".join(f"«{x['text']}» ({x.get('repeat') or 'повтор'}) — показаны первые "
+                         f"{brief.REMINDER_TIMES_MAX}, до {x.get('date', '')} {x['time']}".replace("  ", " ")
+                         for x in cut)
+        out["note"] = "; ".join(filter(None, [out.get("note"), f"{more}; дальше идут так же — не говори, "
+                                                               f"что их нет"]))
     return out
 
 

@@ -122,9 +122,9 @@ REMINDERS_MAX = 200             # и всех вместе
 
 
 def _times_in(r: dict, s: datetime, e: datetime, fallback: ZoneInfo) -> list[datetime]:
-    """Все срабатывания напоминания в окне [s, e) (UTC), по порядку. У повторяющегося next_at — только
-    ближайшее срабатывание, а окно может быть и на неделю — дальше раскрываем правило. Раньше next_at
-    не показываем: там мог быть пропуск (only_next)."""
+    """Срабатывания напоминания в окне [s, e) (UTC), по порядку, — не больше REMINDER_TIMES_MAX + 1 (лишнее
+    значит «дальше ещё есть»). У повторяющегося next_at — только ближайшее срабатывание, а окно может быть
+    и на неделю — дальше раскрываем правило. Раньше next_at не показываем: там мог быть пропуск (only_next)."""
     out: set[datetime] = set()
     snz = timeutil.from_iso(r.get("snooze_at"))
     if snz is not None and s <= snz < e:
@@ -141,7 +141,7 @@ def _times_in(r: dict, s: datetime, e: datetime, fallback: ZoneInfo) -> list[dat
         from .scheduler import next_after
         tz = _zone(r.get("tz") or fallback)
         try:
-            for _ in range(REMINDER_TIMES_MAX):
+            for _ in range(REMINDER_TIMES_MAX + 1):
                 occ = next_after(r["rrule"], r["local_start"], tz, cursor)
                 if occ is None or occ >= e:
                     break
@@ -149,7 +149,7 @@ def _times_in(r: dict, s: datetime, e: datetime, fallback: ZoneInfo) -> list[dat
                 cursor = occ
         except Exception as ex:     # кривое правило в базе — показываем, что успели
             log.debug("повестка: правило #%s не раскрылось: %s", r.get("id"), ex)
-    return sorted(out)[:REMINDER_TIMES_MAX]
+    return sorted(out)[:REMINDER_TIMES_MAX + 1]
 
 
 async def _reminders(ctx: ToolContext, s: datetime, e: datetime) -> list[dict]:
@@ -161,12 +161,14 @@ async def _reminders(ctx: ToolContext, s: datetime, e: datetime) -> list[dict]:
         # сами события и задачи (срок задачи — в её же день)
         if r.get("kind") in ("followup", "event", "task"):
             continue
-        for at in _times_in(r, s, e, tz):
+        times = _times_in(r, s, e, tz)
+        more = len(times) > REMINDER_TIMES_MAX         # частый повтор: дальше в окне ещё есть — не молчать
+        for i, at in enumerate(times[:REMINDER_TIMES_MAX]):
             loc = at.astimezone(tz)
             out.append({"time": loc.strftime("%H:%M"), "date": _day(loc.date()), "at": timeutil.iso(at),
                         "text": _cut(r.get("text")), "kind": r.get("kind") or "reminder",
                         "repeat": timeutil.describe_rrule(r["rrule"]) if r.get("rrule") else "",
-                        "nag": bool(r.get("nag"))})
+                        "nag": bool(r.get("nag")), **({"more": True} if more and i == REMINDER_TIMES_MAX - 1 else {})})
     out.sort(key=lambda x: x["at"])
     return out[:REMINDERS_MAX]
 
