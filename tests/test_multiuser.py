@@ -50,7 +50,8 @@ async def multi(cfg, db, ctx, fake_llm):
     from aiogram import Bot
     from aiogram.types import Update
 
-    quiet = dict(morning_brief_time="", news_digest_time="", reflection_time="", birthday_time="")
+    quiet = dict(morning_brief_time="", news_digest_time="", reflection_time="", birthday_time="",
+                 allow_requests=True)
     cfg = replace(cfg, **quiet)
     ctx.cfg = cfg
     session = RecordingSession()
@@ -189,3 +190,20 @@ async def test_idea_deep_button_works_for_owner_and_second(multi, fake_llm):
         await t.ctx.services.drain(5)
         row = await t.db.fetchone("SELECT deep_evaluation FROM ideas WHERE id=?", (idea["id"],))
         assert "Оценка: 6/10" in row["deep_evaluation"]
+
+
+async def test_requests_off_by_default(cfg, db, ctx, fake_llm):
+    """По умолчанию (ALLOW_REQUESTS=0) чужой /start — «Это личный бот», главного не дёргаем."""
+    from aiogram import Bot
+    from aiogram.types import Update
+    c = replace(cfg, morning_brief_time="", news_digest_time="", reflection_time="", birthday_time="")
+    assert c.allow_requests is False
+    ctx.cfg = c
+    session = RecordingSession()
+    bot = Bot("123456:TEST-token", session=session)
+    agent = Agent(ctx)
+    deps = Deps(cfg=c, db=db, llm=fake_llm, ctx=ctx, agent=agent, notifier=BotNotifier(bot, MAIN))
+    dp = app.build_dispatcher(c, deps)                    # один человек: без пространств
+    await dp.feed_update(bot, Update(update_id=1, message=_msg("/start", SECOND)))
+    assert _sent(session.requests, SECOND) == [STRANGER_TEXT]
+    assert not [r for r in session.requests if getattr(r, "chat_id", None) == MAIN]

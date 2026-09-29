@@ -1338,10 +1338,10 @@ async def test_app_main_full_wiring_without_network(monkeypatch, cfg):
 
     async def fake_polling(self: Any, *bots: Any, **kw: Any) -> None:
         seen["allowed"] = kw.get("allowed_updates")
-        # впереди — роутер управления людьми (главный), дальше — пространство владельца
+        # по умолчанию бот — для одного: один роутер, без управления людьми
         names = [r.name for r in self.sub_routers]
-        assert names[0] == "oracle-admin" and "oracle" in names
-        seen["handlers"] = len(self.sub_routers[names.index("oracle")].message.handlers)
+        assert names == ["oracle"]
+        seen["handlers"] = len(self.sub_routers[0].message.handlers)
         await asyncio.sleep(0.05)                   # планировщик успевает сделать тик
 
     monkeypatch.setattr(Bot, "get_me", fake_get_me)

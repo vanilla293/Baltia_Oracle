@@ -177,6 +177,7 @@ class Settings:
     bot_token: str = ""
     owner_id: int = 0                          # главный (первый в OWNER_ID)
     owner_ids: tuple[int, ...] = ()            # все из OWNER_ID=id1,id2 — у каждого своё пространство
+    allow_requests: bool = False               # чужой /start спрашивает главного «Пустить?» (по умолчанию — нет)
     telegram_api_url: str = ""                 # свой Bot API сервер; пусто — api.telegram.org
     bot_name: str = "Оракул"
     owner_name: str = ""
@@ -359,6 +360,7 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
         bot_token=_get("BOT_TOKEN"),
         owner_id=owner_ids[0] if owner_ids else 0,
         owner_ids=owner_ids,
+        allow_requests=_bool("ALLOW_REQUESTS", False),
         telegram_api_url=_get("TELEGRAM_API_URL", "").rstrip("/"),
         bot_name=_get("BOT_NAME", "Оракул"),
         owner_name=_get("OWNER_NAME", ""),

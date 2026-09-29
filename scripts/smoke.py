@@ -3,7 +3,7 @@
 Запуск из корня проекта:  python scripts/smoke.py
 Поднимает scripts/smoke_fake_servers.py (порты 18081/18082), запускает бота с TELEGRAM_API_URL и
 LLM_BASE_URL на них, шлёт сценарий апдейтов (команды, текст, голосовое, кнопки, чужой пользователь)
-и проверяет, что бот ответил. В конце — второй человек: просится, главный пускает, второй пишет. Данные — во временной папке, .env проекта не читается.
+и проверяет, что бот ответил. Данные — во временной папке, .env проекта не читается.
 """
 from __future__ import annotations
 
@@ -99,18 +99,9 @@ def main() -> int:
              lambda out: any("Сделал" in m["text"] and "Лёха" in m["text"] for m in out)
              and not any("Я тут" in m["text"] for m in out)),
             ("/forget junk", {"kind": "text", "text": "/forget abc"}, lambda out: len(out) >= 1),
-            # второй человек: просится → главный пускает → у второго своё пространство
-            ("second asks access", {"kind": "text", "text": "/start", "from": 99},
-             lambda out: any(m.get("chat_id") == 99 and "Спросил хозяина" in m["text"] for m in out)
-             and any(m.get("chat_id") == 42 and "user:add:99" in json.dumps(m.get("reply_markup")) for m in out)),
-            ("owner approves", {"kind": "callback", "data": "user:add:99"},
-             lambda out: any(m.get("chat_id") == 99 and "Тебя пустили" in m["text"] for m in out)),
-            ("second talks", {"kind": "text", "text": "привет", "from": 99},
-             lambda out: any(m.get("chat_id") == 99 and "Я тут" in m["text"] for m in out)),
-            ("second has own memory", {"kind": "text", "text": "/memory", "from": 99},
-             lambda out: any(m.get("chat_id") == 99 for m in out)),
-            ("owner /users", {"kind": "text", "text": "/users"},
-             lambda out: any("Кто пользуется ботом" in m["text"] and "99" in m["text"] for m in out)),
+            # бот — для одного: чужой /start получает «Это личный бот», хозяина не дёргают
+            ("stranger /start", {"kind": "text", "text": "/start", "from": 99},
+             lambda out: all(m.get("chat_id") != 42 for m in out)),
         ]
         for name, upd, check in steps:
             n = len(state()["sent"])

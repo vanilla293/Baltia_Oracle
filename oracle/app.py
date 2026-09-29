@@ -56,24 +56,36 @@ def _secrets(cfg: Any) -> tuple[str, ...]:
 
 
 class TwinHint(logging.Filter):
-    """Telegram отвечает Conflict на getUpdates — значит, этого бота опрашивает ещё одна копия
-    (второе окно, второй компьютер, сервер). Сообщения тогда достаются то одной, то другой. Подсказка
-    по-русски — не чаще раза в 10 минут; сама запись aiogram не глушится."""
+    """Telegram отвечает Conflict на getUpdates — значит, этого бота опрашивает ещё одна программа с тем же
+    токеном (второе окно, Pythia, другой компьютер). aiogram на это пишет две строки каждые несколько секунд,
+    бесконечно. Здесь они глушатся: вместо них — одна подсказка по-русски раз в 10 минут, пока конфликт идёт."""
 
-    def __init__(self) -> None:
+    HINT_EVERY = 600.0          # подсказка — не чаще
+    QUIET_AFTER = 60.0          # «Sleep for …» глушим, пока конфликт был не раньше минуты назад
+
+    def __init__(self, clock: Any = None) -> None:
         super().__init__()
+        import time
+        self._clock = clock or time.monotonic
         self._last: float | None = None
+        self._conflict_at: float | None = None
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args if isinstance(record.args, tuple) else ()
+        now = self._clock()
         if args and "Conflict" in str(args[0]):
-            import time
-            now = time.monotonic()
-            if self._last is None or now - self._last > 600:
+            self._conflict_at = now
+            if self._last is None or now - self._last > self.HINT_EVERY:
                 self._last = now
-                log.warning("Похоже, бот запущен дважды: другая копия тоже забирает сообщения (второе окно, "
-                            "другой компьютер или сервер). Закрой лишнюю — иначе ответы будут то от одной, "
-                            "то от другой, а та, что без OWNER_ID, скажет «я ещё не настроен».")
+                log.warning("Бот запущен дважды: с этим токеном работает ещё одна программа (старое окно бота, "
+                            "Pythia, другой компьютер). Пока она работает, часть сообщений и кнопок уходит ей. "
+                            "Закрой её — или в @BotFather /revoke и новый токен в BOT_TOKEN. "
+                            "(Повторы этой ошибки скрыты, напомню через 10 минут, если не пройдёт.)")
+            return False
+        msg = record.msg if isinstance(record.msg, str) else ""
+        if msg.startswith("Sleep for") and self._conflict_at is not None \
+                and now - self._conflict_at < self.QUIET_AFTER:
+            return False
         return True
 
 
@@ -144,7 +156,8 @@ def build_dispatcher(cfg: config.Settings, deps: Any, tenants: Any = None) -> An
     inflight = Inflight()
     dp.update.outer_middleware(inflight)
     if tenants is not None:
-        guard = OwnerOnly(cfg, allowed=tenants.allowed, on_request=tenants.request_access)
+        guard = OwnerOnly(cfg, allowed=tenants.allowed,
+                          on_request=tenants.request_access if getattr(cfg, "allow_requests", False) else None)
     else:
         guard = OwnerOnly(cfg)
     dp.message.outer_middleware(guard)
@@ -356,7 +369,8 @@ async def main() -> int:
                     log.warning("не сказал о прерванных разборах: %s", e)
         deps = Deps(cfg=cfg, db=db, llm=llm, ctx=ctx, agent=agent, stt=stt, tts=tts, userbot=userbot,
                     news=news, notifier=notifier, scheduler=scheduler)
-        if not setup:                           # несколько людей: у каждого своё пространство
+        # по умолчанию бот — для одного человека; несколько — если в OWNER_ID их несколько или ALLOW_REQUESTS=1
+        if not setup and (len(cfg.owners) > 1 or getattr(cfg, "allow_requests", False)):
             from .tenants import Tenant, Tenants
             tenants = Tenants(cfg, bot, llm=llm, stt=stt, tts=tts,
                               primary=Tenant(uid=int(cfg.owner_id), cfg=cfg, db=db, ctx=ctx, deps=deps,

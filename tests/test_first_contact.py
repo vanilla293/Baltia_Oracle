@@ -26,13 +26,27 @@ async def test_fresh_db_without_owner_stays_in_setup(cfg, db):
 
 
 def test_twin_hint_on_conflict(caplog):
-    f = TwinHint()
-    rec = logging.LogRecord("aiogram.dispatcher", logging.ERROR, __file__, 1,
+    """Конфликт двух копий: английские строки aiogram скрыты, подсказка по-русски — раз в 10 минут."""
+    now = [1000.0]
+    f = TwinHint(clock=lambda: now[0])
+    err = logging.LogRecord("aiogram.dispatcher", logging.ERROR, __file__, 1,
                             "Failed to fetch updates - %s: %s", ("TelegramConflictError", "terminated by other"), None)
+    sleep = logging.LogRecord("aiogram.dispatcher", logging.WARNING, __file__, 1,
+                              "Sleep for %f seconds and try again... (tryings = %d, bot id = %d)", (1.0, 0, 1), None)
     with caplog.at_level(logging.WARNING, logger="oracle"):
-        assert f.filter(rec) is True and f.filter(rec) is True
+        for _ in range(5):
+            assert f.filter(err) is False and f.filter(sleep) is False
+            now[0] += 10
+        now[0] += 700                                     # через 10+ минут — одно напоминание
+        assert f.filter(err) is False
     hints = [r for r in caplog.records if "запущен дважды" in r.getMessage()]
-    assert len(hints) == 1                                # не чаще раза в 10 минут
+    assert len(hints) == 2
+    # конфликт давно прошёл — обычные сетевые «Sleep for» снова видны
+    now[0] += 120
+    assert f.filter(sleep) is True
+    other = logging.LogRecord("aiogram.dispatcher", logging.ERROR, __file__, 1,
+                              "Failed to fetch updates - %s: %s", ("TelegramNetworkError", "timeout"), None)
+    assert f.filter(other) is True
 
 
 def test_voice_replies_off_by_default():
@@ -77,3 +91,14 @@ async def test_unconfigured_copy_says_so_on_buttons():
         raise AssertionError("не должен дойти до обработчика")
     await guard(handler, cb, {})
     assert answered == [(SETUP_BUTTON, True)]
+
+
+def test_env_example_has_each_setting_once():
+    """Каждая настройка в .env.example — ровно одной строкой (дубль молча перебил бы первую)."""
+    import collections
+    import re
+    from pathlib import Path
+    s = (Path(__file__).resolve().parent.parent / ".env.example").read_text(encoding="utf-8")
+    keys = re.findall(r"(?m)^([A-Z][A-Z0-9_]*)=", s)
+    assert [k for k, n in collections.Counter(keys).items() if n > 1] == []
+    assert [ln for ln in s.splitlines() if ln and not ln.startswith("#") and "=" not in ln] == []
