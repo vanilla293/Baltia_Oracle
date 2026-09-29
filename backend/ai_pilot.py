@@ -1186,6 +1186,11 @@ class AIPilot:
         # стоп прежний (null или то же число), а цена уже за ним: трос спрашивает (или спросит) — счётчик «ждать» живёт
         past_stop = ((inv is None or abs(inv - old_inv) <= 1e-9) and cur > 0 and old_inv > 0
                      and ((side == "long" and cur <= old_inv) or (side == "short" and cur >= old_inv)))
+        # то же у тейка: тейк прежний, а цена уже у него — счётчик «подержать» живёт (PYTHIA_SOFT_TAKE_MAX_HOLDS
+        # ограничивает круг «тейк держит → совет HOLD → тейк держит»)
+        old_take = _f(pos.get("take"))
+        past_take = ((take is None or abs(take - old_take) <= 1e-9) and cur > 0 and old_take > 0
+                     and ((side == "long" and cur >= old_take) or (side == "short" and cur <= old_take)))
         self._close_pending = None             # свежий приказ «держать» важнее старого CLOSE
         locked = int(pos.get("take_holds") or 0) > 0 or bool(pos.get("profit_lock"))
         self._set_levels(pos, take, inv)       # None — прежний уровень
@@ -1197,8 +1202,9 @@ class AIPilot:
             pos["profit_lock"] = True          # стоп прежний = запертая прибыль: трос не уходит за вход
         if not past_stop:
             pos["holds"] = 0
-        pos["take_holds"] = 0                  # новый приказ — счётчик «подержать» у тейка заново
-        pos.pop("take_next", None)
+        if not past_take:
+            pos["take_holds"] = 0              # новый приказ — счётчик «подержать» у тейка заново
+            pos.pop("take_next", None)
         pos["topup_left"] = 0                  # «держать» — не добор: остаток авто-добора прошлого входа снят
         if self.pending and self.pending.get("topup"):
             self._cancel_entry = True          # заявка добора в полёте — снять ближайшим тиком (частичка — в позицию)

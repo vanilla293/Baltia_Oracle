@@ -1008,6 +1008,14 @@ def test_hold_keeps_holds_when_price_past_old_stop(free, monkeypatch):
         pos2 = await open_long(p2, fake, inv=98.0, take=110.0)
         pos2["holds"] = 1
         assert p2.adopt_forecast({"exec": {"do": "HOLD", "invalidation": None, "take": None}}) and pos2["holds"] == 0
+        # то же у тейка: цена у прежнего тейка — счётчик «подержать» не обнуляется HOLD без нового тейка
+        m3, p3 = make_pilot()
+        pos3 = await open_long(p3, fake, inv=98.0, take=101.0)
+        pos3["take_holds"] = 1
+        p3.prices.append(101.2)
+        assert p3.adopt_forecast({"exec": {"do": "HOLD", "invalidation": None, "take": None}}) and pos3["take_holds"] == 1
+        assert p3.adopt_forecast({"exec": {"do": "HOLD", "invalidation": None, "take": 105.0}}) and pos3["take_holds"] == 0, \
+            "новый тейк — счётчик заново"
 
     asyncio.run(scenario())
 
