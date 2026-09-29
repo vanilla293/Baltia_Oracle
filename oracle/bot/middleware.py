@@ -49,6 +49,8 @@ ACCESS_TEXT = {        # ответ чужому на /start, когда мож�
     "full": STRANGER_TEXT,
 }
 NO_ACCESS = "Нет доступа"
+SETUP_BUTTON = ("Эта копия бота не настроена: в её .env нет OWNER_ID, поэтому кнопки не работают. "
+                "Закрой её (или впиши OWNER_ID) — отвечать должна одна копия.")
 SETUP_HINT = "Я ещё не настроен. Пришли /start — скажу твой Telegram id, его нужно вписать в .env."
 REPLY_EVERY = 3600.0              # чужому — не чаще раза в час
 _START = re.compile(r"^/start(?:@\w+)?(?:\s|$)", re.I)
@@ -137,7 +139,8 @@ class OwnerOnly(BaseMiddleware):
             return None
         try:
             if isinstance(event, CallbackQuery):
-                await event.answer(NO_ACCESS, show_alert=True)
+                owner_set = bool(int(getattr(self.cfg, "owner_id", 0) or 0))
+                await event.answer(NO_ACCESS if owner_set else SETUP_BUTTON, show_alert=True)
             elif isinstance(event, Message):
                 await self._stranger_message(event, uid, user)
         except Exception as e:   # ответ чужому — не повод падать

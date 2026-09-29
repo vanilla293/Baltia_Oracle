@@ -171,3 +171,21 @@ def test_parse_and_render_helpers():
     text, buttons = users_text([{"uid": 42, "name": "Я", "primary": True, "static": True},
                                 {"uid": 77, "name": "Маша <b>", "primary": False, "static": False}])
     assert "&lt;b&gt;" in text and buttons == [[("✖️ Убрать Маша <b>", "user:del:77")]]
+
+
+async def test_idea_deep_button_works_for_owner_and_second(multi, fake_llm):
+    """«🧠 Додумать глубоко» у главного и у второго — свой разбор, а не «Нет доступа»."""
+    from oracle.bot.middleware import NO_ACCESS
+    from oracle.tools import ideas
+    await multi.tenants.approve(SECOND)
+    for uid in (MAIN, SECOND):
+        t = multi.tenants.tenant(uid)
+        idea = await ideas.t_save_idea(t.ctx, title=f"Идея {uid}", content="кофейня у вокзала",
+                                     evaluation="норм", score=5)
+        fake_llm.script = ["Разбор. Оценка: 6/10"]
+        reqs = await multi.feed(callback_query=_cb(f"idea:deep:{idea['id']}", uid))
+        answers = [r.text for r in reqs if type(r).__name__ == "AnswerCallbackQuery"]
+        assert answers and NO_ACCESS not in answers, answers
+        await t.ctx.services.drain(5)
+        row = await t.db.fetchone("SELECT deep_evaluation FROM ideas WHERE id=?", (idea["id"],))
+        assert "Оценка: 6/10" in row["deep_evaluation"]

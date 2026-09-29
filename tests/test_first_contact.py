@@ -57,3 +57,23 @@ async def test_agent_marks_new_owner_until_it_knows_him(ctx, fake_llm):
     fake_llm.script = ["Ага."]
     await Agent(ctx).handle("как дела")
     assert persona.ACQUAINTANCE_NOTE not in fake_llm.calls[-1]["messages"][0]["content"]
+
+
+async def test_unconfigured_copy_says_so_on_buttons():
+    """Копия без OWNER_ID на нажатие кнопки говорит, что она не настроена, — не безликое «Нет доступа»."""
+    from types import SimpleNamespace
+    from aiogram.types import CallbackQuery
+    from oracle.bot.middleware import SETUP_BUTTON, OwnerOnly
+    answered = []
+
+    class CB(CallbackQuery):
+        async def answer(self, text=None, show_alert=None, **kw):   # type: ignore[override]
+            answered.append((text, show_alert))
+
+    from aiogram.types import User
+    cb = CB(id="1", from_user=User(id=5, is_bot=False, first_name="x"), chat_instance="c", data="idea:deep:1")
+    guard = OwnerOnly(Settings(owner_id=0))
+    async def handler(e, d):
+        raise AssertionError("не должен дойти до обработчика")
+    await guard(handler, cb, {})
+    assert answered == [(SETUP_BUTTON, True)]
