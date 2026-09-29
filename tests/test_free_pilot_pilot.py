@@ -363,6 +363,32 @@ def test_breakout_not_dead_before_level_then_dead_after():
     asyncio.run(scenario())
 
 
+def test_breakout_crossing_mark_is_tied_to_level():
+    """Ревью 5.4.2: пометка пробития — уровень, который пробит; уровень сменился (дверь/перепроверка) — пробитие старого
+    новый не хоронит, пока цена не пройдёт новый; старая пометка True из state — пробитие текущего уровня, как было."""
+    async def scenario():
+        p = make(cls=BreakPilot)
+        p.ready = False
+        assert p.adopt_forecast(ex("BUY", entry=101.0, inv=100.5, take=106.0))
+        p.plan["kind"] = "прорыв"
+        await p.tick(101.1, BOOK)
+        assert p.plan and p.plan["crossed"] == 101.0
+        p.plan["entry"], p.plan["invalidation"] = 102.0, 101.3        # новый уровень пробоя, стоп между ценой и им
+        await p.tick(101.1, BOOK)
+        assert p.plan and "мертва" not in p.last_action, p.last_action
+        await p.tick(102.05, BOOK)
+        assert p.plan["crossed"] == 102.0
+        await p.tick(101.2, BOOK)                                     # после пробития нового — откат за стоп: мертва
+        assert p.plan is None and "мертва ДО входа" in p.last_action
+        p2 = make(cls=BreakPilot)
+        assert p2.adopt_forecast(ex("BUY", entry=101.0, inv=100.5, take=106.0))
+        p2.plan["kind"], p2.plan["crossed"] = "прорыв", True
+        await p2.tick(100.4, BOOK)
+        assert p2.plan is None, "пометка True (старый state) — пробитие текущего уровня"
+
+    asyncio.run(scenario())
+
+
 def test_breakout_sell_and_crossing_goes_to_door():
     async def scenario():
         p = make(cls=BreakPilot)

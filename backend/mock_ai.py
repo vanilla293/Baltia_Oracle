@@ -356,7 +356,8 @@ def _impact(user: str) -> dict:
 
 
 def _exec(system: str, user: str) -> dict:
-    """Приказ (v5.4.2): чаще BUY/SELL по режиму, каждый третий вызов без позиции — WAIT с wait_for и уровнями."""
+    """Приказ (v5.4.2): чаще BUY/SELL по режиму, каждый третий вызов без позиции — WAIT с wait_for и уровнями, при
+    открытой позиции — HOLD (держать как есть, без добора; уровни — по стороне позиции)."""
     n = _turn("exec")
     price = _price_from(system, 0.0) or _price_from(user, 100.0)
     sell_only = "только SELL" in system
@@ -369,6 +370,14 @@ def _exec(system: str, user: str) -> dict:
                 "plan": f"Вне рынка до события: {edge}.\nДежурный смотрит на край коридора на перепроверке.",
                 "confidence": 50, "news_ids": ids, "levels": [lo, round(price, 4), hi],
                 "time_note": "край коридора вероятнее к 14:00 МСК (данные по инфляции)"}
+    if n % 3 == 0:                                              # позиция открыта: держать как есть (ревью 5.4.2)
+        side = _pos_side(user) or ("short" if sell_only else "long")
+        up = side == "long"
+        take, inv = round(price * (1.02 if up else 0.98), 4), round(price * (0.99 if up else 1.01), 4)
+        return {"do": "HOLD", "entry": None, "entry_kind": "сейчас", "take": take, "invalidation": inv, "wait_for": "",
+                "why": f"мок: позиция {side} у {price:g} идёт по плану — держим как есть, без добора",
+                "plan": f"Держим позицию.\nТейк {take}, стоп {inv}.\nДобора нет.", "confidence": 58, "news_ids": ids,
+                "levels": [inv, round(price, 4), take], "time_note": "перепроверка по расписанию"}
     if sell_only:
         do, take, inv = "SELL", round(price * 0.98, 4), round(price * 1.01, 4)
     else:
@@ -1239,9 +1248,14 @@ if __name__ == "__main__":
         assert "BUY" in ex_do and "WAIT" in ex_do and ex_do.count("BUY") >= 2, ex_do
         for _ in range(3):
             check_exec(await ai.ask_json("Цена 100. Режим: только SELL", "x", route="mission_exec"), 100.0, True)
-        for _ in range(3):                           # открытая позиция — WAIT нельзя (только без позиции)
+        pos_do = []
+        for _ in range(3):                           # открытая позиция — WAIT нельзя (только без позиции); HOLD — можно
             e = await ai.ask_json("… Цена 100.\n…", "═══ ОТКРЫТАЯ ПОЗИЦИЯ ═══\nlong 8 лот", route="mission_exec")
-            assert e["do"] == "BUY", e
+            assert e["do"] in ("BUY", "HOLD"), e
+            if e["do"] == "HOLD":
+                assert e["entry"] is None and e["invalidation"] < 100 < e["take"], e
+            pos_do.append(e["do"])
+        assert "HOLD" in pos_do and "BUY" in pos_do, pos_do
         # перепроверка (v5.4.2): ротация, вне рынка ЖДЁМ / КУПИТЬ_СЕЙЧАС (invalidation ≈ цена·0.99) / НОВЫЙ_АНАЛИЗ
         rv_u = "ОБЪЕКТ: SBER. ДОПУСТИМЫЕ choice: КУПИТЬ_СЕЙЧАС | ЖДЁМ | ПРОДАТЬ_СЕЙЧАС | НОВЫЙ_АНАЛИЗ\n\n" \
                "═══ СИТУАЦИЯ ПИЛОТА ═══\nЦена сейчас: 285.4\nПозиции нет, засады нет — полностью вне рынка"

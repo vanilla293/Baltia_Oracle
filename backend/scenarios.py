@@ -621,6 +621,9 @@ class Scene:
 
     async def __aenter__(self) -> "Scene":
         install()
+        # ревью 5.4.2: ручки «свободного пилота» — на умолчаниях на время сцены (возврат в __aexit__): настройки
+        # владельца (data/config_user.json, окружение) не роняют стенд
+        config.pin_free_pilot_defaults(lambda k, v: self.patch(config, k, v))
         fake_ai.reset()
         FakeTinkoff.price, FakeTinkoff.book_fail, FakeTinkoff.positions = PRICE0, False, []
         FakeClock.open, FakeClock.session, FakeClock.calls = True, "основная", 0
@@ -831,9 +834,9 @@ async def s02_gap_trigger(sc: Scene) -> None:
     await sc.settle_ai()
     assert any(f"{MM()} у троса: ЖДАТЬ" in e["title"] for e in sc.xevents("guard"))
     assert any("CLOSE" in e["title"] for e in sc.xevents("council")), [e["title"] for e in sc.xevents()]
-    # вторая сцена: совет говорит держать (BUY той же стороны, новые уровни) — позиция цела
+    # вторая сцена: совет говорит держать (ревью 5.4.2: HOLD — без добора, новые уровни) — позиция цела
     fake_ai.queue("mission_guard", {"decision": "ЖДАТЬ", "why": "прокол", "hold_minutes": 5})
-    fake_ai.queue("mission_exec", {"do": "BUY", "entry": None, "take": 112.0, "invalidation": 96.0, "why": "держать"})
+    fake_ai.queue("mission_exec", {"do": "HOLD", "entry": None, "take": 112.0, "invalidation": 96.0, "why": "держать"})
     sc.p.pnls, sc.p.session_risk = [], trader_risk.SessionRisk(DEPOSIT)
     pos2 = await sc.open_position("long", inv=98.0)
     await sc.tick(97.6)
@@ -843,7 +846,8 @@ async def s02_gap_trigger(sc: Scene) -> None:
     assert pos2["holds"] == 0, "новый приказ совета — счётчик «ждать» заново"
     await sc.tick(97.6)
     assert sc.p.position is pos2 and sc.p.state == "В_ПОЗИЦИИ", sc.p.last_action
-    sc.note = "FLASH ЖДАТЬ → совет: CLOSE закрыл; BUY — позиция держится с уровнями совета"
+    assert sc.m.exec["do"] == "HOLD", sc.m.exec
+    sc.note = "FLASH ЖДАТЬ → совет: CLOSE закрыл; HOLD — позиция держится с уровнями совета"
 
 
 async def s03_dead_market(sc: Scene) -> None:
@@ -1231,13 +1235,18 @@ async def s13_flash_silent(sc: Scene) -> None:
     await sc.wait_guard()
     assert sc.p.position is None and "стоп по правилу" in store_v5.trades(TICKER)[0]["why"], sc.p.last_action
     g = sc.p.guards[-1]
-    assert g["decision"] == "СЛИТЬ" and f"{MM()} не ответил" in g["why"], g
+    # ревью 5.4.2: выход по правилу — действие кода, не решение ИИ «СЛИТЬ»
+    assert g["decision"] == "НЕТ_ОТВЕТА" and g["silent"] and g["source"] == "код" and g["applied"] == "по правилу: СЛИТЬ" \
+        and f"{MM()} не ответил" in g["why"], g
     assert fake_ai.count("mission_guard") == 1
     await sc.settle_ai()
-    assert any(f"{MM()} у троса: СЛИТЬ" in e["title"] and "не ответил" in e["detail"] for e in sc.xevents("guard")), sc.xevents()
+    assert any(f"{MM()} у троса: не ответил — слито по правилу" in e["title"] and "не ответил" in e["detail"]
+               for e in sc.xevents("guard")), sc.xevents()
     assert any("Позиция закрыта" in e["title"] for e in sc.xevents("close"))
-    assert "не ответил" in store_v5.trades(TICKER)[0]["why"]
-    sc.note = "таймаут FLASH → СЛИТЬ по правилу, толмач объяснил"
+    tw = store_v5.trades(TICKER)[0]["why"]
+    assert tw.startswith(f"мягкий стоп по правилу: {MM()} не ответил") and "решил слить" not in tw, tw
+    assert "ответа не было — выход по правилу" in sc.p._guards_text() and "трос: НЕТ_ОТВЕТА" not in sc.p._guards_text()
+    sc.note = "таймаут FLASH → слив по правилу (запись кода, не решение ИИ), толмач объяснил"
 
 
 async def s14_pro_silent(sc: Scene) -> None:
@@ -1387,7 +1396,7 @@ async def s19_take_hold_council(sc: Scene) -> None:
     sc.m.council_ts = time.time()
     fake_ai.queue("mission_take", {"decision": "ПОДЕРЖАТЬ", "why": "импульс не выдохся, лента за нас",
                                    "lock_price": 100.5, "tp_next": 106.0, "hold_minutes": 10})
-    fake_ai.queue("mission_exec", {"do": "BUY", "entry": None, "take": 107.0, "invalidation": 101.0, "why": "держать выше"})
+    fake_ai.queue("mission_exec", {"do": "HOLD", "entry": None, "take": 107.0, "invalidation": 101.0, "why": "держать выше"})
     fake_ai.gate = asyncio.Event()                # совет придержан: сначала проверяем, что сделал FLASH
     await sc.tick(103.4)
     await sc.wait_guard()
@@ -1432,7 +1441,7 @@ async def s19_take_hold_council(sc: Scene) -> None:
     n_take = fake_ai.count("mission_take")
     await sc.tick(103.4)
     assert sc.p.position is None and fake_ai.count("mission_take") == n_take and "предел" in store_v5.trades(TICKER)[0]["why"]
-    sc.note = "ПОДЕРЖАТЬ → триггер на полу прибыли, трос за ним, тейк 106 → совет BUY держит; CLOSE закрыл в плюс; предел"
+    sc.note = "ПОДЕРЖАТЬ → триггер на полу прибыли, трос за ним, тейк 106 → совет HOLD держит; CLOSE закрыл в плюс; предел"
 
 
 async def s20_take_flash_silent(sc: Scene) -> None:
@@ -1446,12 +1455,14 @@ async def s20_take_flash_silent(sc: Scene) -> None:
     assert sc.p.position is None and "фиксация по правилу" in store_v5.trades(TICKER)[0]["why"], sc.p.last_action
     assert sc.p.pnls[-1] > 0 and "ПОБЕДА: тейк" in store_v5.trades(TICKER)[0]["why"]
     g = sc.p.guards[-1]
-    assert g["side"] == "take" and g["decision"] == "ЗАФИКСИРОВАТЬ" and f"{MM()} не ответил" in g["why"], g
+    assert g["side"] == "take" and g["decision"] == "НЕТ_ОТВЕТА" and g["silent"] and g["source"] == "код" \
+        and g["applied"] == "по правилу: ЗАФИКСИРОВАТЬ" and f"{MM()} не ответил" in g["why"], g
     assert fake_ai.count("mission_take") == 1 and fake_ai.count("mission_review") == 0
     await sc.settle_ai()
-    assert any(f"{MM()} у тейка: ЗАФИКСИРОВАТЬ" in e["title"] and "не ответил" in e["detail"] for e in sc.xevents("take")), sc.xevents()
+    assert any(f"{MM()} у тейка: не ответил — зафиксировано по правилу" in e["title"] and "не ответил" in e["detail"]
+               for e in sc.xevents("take")), sc.xevents()
     assert any("Позиция закрыта" in e["title"] for e in sc.xevents("close"))
-    sc.note = "таймаут FLASH у тейка → ЗАФИКСИРОВАТЬ по правилу, прибыль в кассе, толмач объяснил"
+    sc.note = "таймаут FLASH у тейка → фиксация по правилу (запись кода), прибыль в кассе, толмач объяснил"
 
 
 async def s21_take_lock_pullback(sc: Scene) -> None:
@@ -2314,7 +2325,7 @@ async def s36_profit_reenter(sc: Scene) -> None:
 
 async def s37_profit_council(sc: Scene) -> None:
     """СОВЕТ из мысли о прибыли: триггер подтянут к lock_price (прибыль заперта, трос от него не ниже входа), тейк → цель,
-    полный совет без очереди (handoff kind profit) → совет BUY держит с новыми уровнями; ДЕРЖАТЬ с lock ниже входа —
+    полный совет без очереди (handoff kind profit) → совет HOLD держит с новыми уровнями; ДЕРЖАТЬ с lock ниже входа —
     не принят; молчание PRO → v5.4.2: НЕТ_ОТВЕТА (запись кода, не «ДЕРЖАТЬ» за ИИ), позиция как есть, скорый повтор,
     ошибка в панель."""
     pos = await sc.open_position("long", inv=98.0, take=110.0)
@@ -2323,7 +2334,7 @@ async def s37_profit_council(sc: Scene) -> None:
     sc.m.council_ts = time.time()
     fake_ai.queue("mission_profit", {"decision": "СОВЕТ", "why": "картина спорная: рывок на новости, объёмы падают",
                                      "lock_price": 104.0, "take": 111.0})
-    fake_ai.queue("mission_exec", {"do": "BUY", "entry": None, "take": 112.0, "invalidation": 105.0, "why": "держать выше"})
+    fake_ai.queue("mission_exec", {"do": "HOLD", "entry": None, "take": 112.0, "invalidation": 105.0, "why": "держать выше"})
     fake_ai.gate = asyncio.Event()
     await sc.tick(106.5)
     await sc.wait_profit()
@@ -2361,7 +2372,7 @@ async def s37_profit_council(sc: Scene) -> None:
     assert pos["profit_next"] - time.time() <= retry + 1, "скорый повтор, а не полный кулдаун"
     assert fake_ai.errors and fake_ai.errors[-1][0] == "mission_profit", fake_ai.errors
     assert "ДЕРЖАТЬ" not in sc.p._profits_text(pos).splitlines()[-1], "в промпт молчание идёт как «ответа не было»"
-    sc.note = "СОВЕТ → триггер 104 (трос не ниже входа), цель 111, совет BUY 105/112; lock ниже входа не принят; молчание → НЕТ_ОТВЕТА, повтор"
+    sc.note = "СОВЕТ → триггер 104 (трос не ниже входа), цель 111, совет HOLD 105/112; lock ниже входа не принят; молчание → НЕТ_ОТВЕТА, повтор"
 
 
 async def s38_shock_profit(sc: Scene) -> None:
@@ -2531,6 +2542,41 @@ async def s40_program_stops(sc: Scene) -> None:
     sc.note = "ни одной стоп-заявки; гэп за виртуальный трос → рынок; флаг в бою: 1 → трос лёг, 0 → снят один раз; рестарт → старый стоп снят; висящий запрос стопа не повторён"
 
 
+async def s41_council_hold(sc: Scene) -> None:
+    """Совет «держать» (ревью 5.4.2): позиция по размеру биржи, у тейка PRO ПОДЕРЖАТЬ → совет → приказ HOLD — стоп и тейк
+    позиции обновлены, добора нет (биржа снова даёт лоты — aip-topup не шлётся), дверь не спрашивается; раньше «держать»
+    шифровалось как BUY той же стороны, и код добирал до максимума без вопроса."""
+    b = sc.broker
+    b.mx = {"buy": 3, "sell": 3}
+    sc.p.deposit_override = None
+    pos = await sc.open_position("long", inv=98.0, take=103.0)
+    assert sc.p._sized_by_broker and pos["lots"] == 3, pos
+    pos["topup_left"] = 0                         # добор самого входа исчерпан
+    b.mx = {"buy": 4, "sell": 4}                  # биржа снова даёт лоты
+    sc.p._mx = None
+    sc.p._last_reanalyze_ts = time.time()         # тейк зовёт совет без очереди
+    sc.m.council_ts = time.time()
+    n_entry = fake_ai.count("mission_entry")
+    fake_ai.queue("mission_take", {"decision": "ПОДЕРЖАТЬ", "why": "импульс жив, лента за нас", "tp_next": 106.0})
+    fake_ai.queue("mission_exec", {"do": "ДЕРЖАТЬ", "entry": None, "take": 107.0, "invalidation": 101.0,
+                                   "why": "держать, стоп подтянуть к 101"})
+    await sc.tick(103.4)
+    await sc.wait_guard()
+    await sc.wait_council()
+    assert sc.m.exec["do"] == "HOLD" and sc.m.exec["entry"] is None and sc.m.exec["invalidation"] == 101.0, sc.m.exec
+    assert sc.p.position is pos and pos["invalidation"] == 101.0 and pos["take"] == 107.0 and pos["lots"] == 3, pos
+    assert not pos.get("topup_left") and sc.p.plan is None and "без добора" in sc.p.last_action, sc.p.last_action
+    n_o = len(b.placed)
+    pos["last_fill_ts"] = 0.0
+    await sc.tick(103.5, n=13)                    # тик §2 проверяет добор раз в 6 тиков — окна прошли
+    assert len(b.placed) == n_o and not [o for o in b.placed if o["tag"] == "aip-topup"] and pos["lots"] == 3, b.placed
+    assert fake_ai.count("mission_entry") == n_entry, "HOLD — не вход и не добор: дверь не спрашивается"
+    assert mission.status(TICKER)["phase"] == "in_position" and "HOLD — держать позицию как есть" in mission._exec_text(sc.m)
+    await sc.settle_ai()
+    assert any("Совет решил держать позицию (HOLD" in e["title"] for e in sc.xevents("council")), [e["title"] for e in sc.xevents()]
+    sc.note = "ПОДЕРЖАТЬ → совет HOLD: стоп 101 / тейк 107, 3 лота как были — биржа давала 4, добора нет"
+
+
 SCENARIOS: list[tuple[str, Callable[[Scene], Awaitable[None]]]] = [
     ("гэп_за_трос", s01_gap_hard), ("гэп_за_триггер", s02_gap_trigger), ("мёртвый_рынок", s03_dead_market),
     ("рынок_закрыт", s04_market_closed), ("частичка_30042", s05_partial_then_30042),
@@ -2550,6 +2596,8 @@ SCENARIOS: list[tuple[str, Callable[[Scene], Awaitable[None]]]] = [
     ("вход_проверка_ждать", s32_gate_wait), ("вход_проверка_отмена", s33_gate_cancel), ("вход_pro_молчит", s34_gate_silent),
     ("прибыль_выйти", s35_profit_exit), ("прибыль_перезайти", s36_profit_reenter), ("прибыль_совет", s37_profit_council),
     ("рывок_в_плюсе", s38_shock_profit), ("совет_вне_рынка", s39_council_wait), ("стопы_в_программе", s40_program_stops),
+    # ревью 5.4.2: совет «держать» — HOLD без добора
+    ("совет_держать", s41_council_hold),
 ]
 
 
@@ -2624,4 +2672,4 @@ if __name__ == "__main__":
           "W4: запрос стопа завис → список стопов решает, стопа нет в списке → отмена подтверждена, база/state не читаются → "
           "паника всё равно, GetStopOrders недоступен → force, продажа владельца во время выхода, паника не липнет к тикеру; "
           "v5.4.1: PRO у двери ЖДАТЬ/ОТМЕНИТЬ/молчит, мысль о прибыли ВЫЙТИ/ПЕРЕЗАЙТИ/СОВЕТ, рывок в плюсе, приказ WAIT, "
-          "стопы только в программе)")
+          "стопы только в программе; ревью 5.4.2: совет «держать» — HOLD без добора, молчание у троса/тейка — запись кода)")

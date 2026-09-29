@@ -978,6 +978,8 @@ class AIPilot:
                                 f"перепроверка через {mins} мин")
             log.info("ИИ-пилот %s: %s", self.base, self.last_action)
             return True
+        if do == "HOLD":
+            return self._adopt_hold(ex)
         if do in ("CLOSE", "ЗАКРЫТЬ", "FLAT", "EXIT"):
             # приказ CLOSE (v5.2): закрыть позицию и стоять вне рынка до следующего решения
             self.plan = None
@@ -1064,6 +1066,67 @@ class AIPilot:
                               f"стоп {self.plan['invalidation']}")
         log.info("ИИ-пилот %s: %s (%s)", self.base, self.last_action,
                  self.plan["why"])
+        return True
+
+    def _adopt_hold(self, ex: dict) -> bool:
+        """v5.4.2 (ревью): приказ HOLD — совет сказал «держать». Позиция как есть, БЕЗ добора: обновляются только
+        стоп/тейк (null — прежний уровень), стороны проверяются по позиции и цене (не с той стороны — приказ
+        отклонён, позиция не тронута); счётчики и сбросы — как у свежего вердикта той же стороны, но topup_left
+        HOLD не ставит (добор до максимума — только явный BUY/SELL той же стороны). Позиции нет — держать нечего."""
+        pos = self.position
+        now = time.time()
+        if not pos:
+            if self.adopt_account and not self._prepared:
+                # приказ пришёл до prepare(): позицию со счёта приму при подготовке (уровни — временные, до PRO)
+                self.last_action = "приказ HOLD принят — позицию со счёта приму при подготовке, уровни назовёт дежурный PRO"
+                log.info("ИИ-пилот %s: %s", self.base, self.last_action)
+                return True
+            if not self.plan and not self.pending:
+                self.state = "ЖДУ_ПЛАН"
+            self.review_ts = min(self.review_ts, now + 300)
+            self.last_action = "приказ HOLD, а позиции уже нет — держать нечего; дежурный PRO решит через 5 мин"
+            log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
+            return False
+        side = pos["side"]
+        inv = _f(ex.get("invalidation")) if ex.get("invalidation") not in (None, "", "null") else 0.0
+        take = _f(ex.get("take")) if ex.get("take") not in (None, "", "null") else 0.0
+        inv = inv if inv > 0 else None
+        take = take if take > 0 else None
+        cur = self.prices[-1] if self.prices else 0.0
+        bad = None
+        if cur > 0 and inv is not None and ((side == "long" and inv >= cur) or (side == "short" and inv <= cur)):
+            bad = f"HOLD: стоп {inv:g} не с той стороны цены {cur:g} для {side}"
+        elif cur > 0 and take is not None and ((side == "long" and take <= cur) or (side == "short" and take >= cur)):
+            bad = f"HOLD: тейк {take:g} не с той стороны цены {cur:g} для {side}"
+        else:
+            inv_eff = inv if inv is not None else pos.get("invalidation")
+            take_eff = take if take is not None else pos.get("take")
+            if _f(inv_eff) > 0:
+                bad = self._plan_valid(side, None, take_eff, inv_eff)
+        if bad:
+            self.last_action = f"приказ HOLD отклонён ({bad}) — позиция как есть, уровни прежние"
+            self.review_ts = min(self.review_ts, now + 300)
+            log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
+            return False
+        self._close_pending = None             # свежий приказ «держать» важнее старого CLOSE
+        locked = int(pos.get("take_holds") or 0) > 0 or bool(pos.get("profit_lock"))
+        self._set_levels(pos, take, inv)       # None — прежний уровень
+        pos["restop"] = True                   # перевыставить трос тиком
+        if inv is not None:
+            pos.pop("levels_placeholder", None)
+            pos.pop("profit_lock", None)       # стоп совета главнее запертой прибыли (как у вердикта той же стороны)
+        elif locked:
+            pos["profit_lock"] = True          # стоп прежний = запертая прибыль: трос не уходит за вход
+        pos["holds"] = 0
+        pos["take_holds"] = 0                  # новый приказ — счётчик «подержать» у тейка заново
+        pos.pop("take_next", None)
+        pos["hard_stop"] = self._hard_of(pos)
+        self.plan = None                       # план добора / переворота снят: совет сказал держать как есть
+        self._save_state()
+        self.last_action = (f"приказ HOLD: держу {side} {pos['lots']} лот как есть, без добора — стоп "
+                            f"{pos['invalidation']}{'' if inv is not None else ' (прежний)'} / тейк "
+                            f"{pos['take']}{'' if take is not None else ' (прежний)'}")
+        log.info("ИИ-пилот %s: %s", self.base, self.last_action)
         return True
 
     # ── рыночный гейт: стакан жив и двусторонний? ───────────────────────────
@@ -1552,15 +1615,23 @@ class AIPilot:
         """v5.4.2: план «прорыв» (kind от наследника; вход ЗА ценой по ходу сделки: BUY выше, SELL ниже), уровень
         которого цена ещё ни разу не пробила? Пока нет — идея не в рынке, и invalidation (стоп под уровнем пробоя)
         её не хоронит. Пробитие помечается в плане (crossed): откат обратно за invalidation после пробоя — идея
-        мертва, как у любого плана. Не «прорыв» или нет уровня — False (проверка как была)."""
+        мертва, как у любого плана. Не «прорыв» или нет уровня — False (проверка как была).
+        Ревью 5.4.2: пометка привязана к уровню (plan["crossed"] = пробитый уровень): дверь (ЖДАТЬ с новым уровнем) или
+        перепроверка сменили уровень — пробитие старого уровня новый не хоронит, пока цена не пройдёт новый.
+        Старая пометка True (state до правки) — пробитие текущего уровня, как было."""
         plan = self.plan or {}
         lvl = plan.get("entry")
         if plan.get("kind") != "прорыв" or lvl is None or not price:
             return False
         lvl = _f(lvl)
         if (price >= lvl) if plan.get("side") == "long" else (price <= lvl):
-            plan["crossed"] = True
-        return not plan.get("crossed")
+            plan["crossed"] = lvl
+        c = plan.get("crossed")
+        if c is None or c is False:
+            return True
+        if c is True:
+            return False
+        return abs(_f(c) - lvl) > max(1e-9, abs(lvl) * 1e-9)
 
     # ── момент входа по уровню (наследник добавляет свои виды входа, напр. прорыв) ─
     def _entry_ready(self, price: float, lvl: float) -> bool:
@@ -2497,10 +2568,17 @@ class AIPilot:
         self._save_state()
         return terminal
 
+    def _drop_topup_plan(self) -> None:
+        """Ревью 5.4.2: позиция закрыта — план ДОБОРА к ней (src topup от наследника) не вход: снимается."""
+        if self.plan and self.plan.get("src") == "topup":
+            log.info("ИИ-пилот %s: позиция закрыта — план добора снят", self.base)
+            self.plan = None
+
     def _finish_closed(self, pos: dict, why: str, reanalyze: bool) -> None:
         pnl = _f(pos.get("exit_pnl_total"))
         self._risk_round(pos)                  # v5.4.2: круг закрыт — killswitch видит его итог один раз
         self.position = None
+        self._drop_topup_plan()
         self._mx = None                        # позиции нет — «сколько даёт биржа» заново (иначе флип берёт sell с закрытием лонга)
         self._closed_ts = time.time()          # лаг портфеля: позицию «со счёта» примем не раньше двух сверок
         self._save_state()
@@ -2622,6 +2700,7 @@ class AIPilot:
             # позицию закрыло что-то вне петли: биржевой трос или владелец.
             # Стоп-сироту снять ОБЯЗАТЕЛЬНО (иначе позже откроет позицию)
             pos, self.position = self.position, None
+            self._drop_topup_plan()
             self._mx = None                # позиции нет — «сколько даёт биржа» считать заново
             if pos.get("stop_id"):
                 await self.broker.cancel_stop(pos["stop_id"])
@@ -2902,7 +2981,8 @@ class AIPilot:
             pos["guard_busy"] = False
             raise
         except Exception as e:                               # noqa: BLE001
-            r = {"decision": "СЛИТЬ", "why": f"{self._money_name()} не ответил ({str(e)[:80] or type(e).__name__}) — стоп по правилу"}
+            # v5.4.2 (ревью): молчание — не решение ИИ; выход по правилу остаётся страховкой, но пишется как действие кода
+            r = {"decision": "СЛИТЬ", "rule": "НЕТ_ОТВЕТА", "detail": str(e)[:80] or type(e).__name__}
         finally:
             pos["guard_busy"] = False
         try:
@@ -2910,21 +2990,41 @@ class AIPilot:
         except Exception as e:                               # noqa: BLE001
             log.warning("ИИ-пилот %s: решение у троса не применилось: %s", self.base, str(e)[:120])
 
+    def _rule_rec(self, rec: dict, r: dict, action: str) -> str:
+        """v5.4.2 (ревью): у троса/тейка решения ИИ не было (r["rule"]: НЕТ_ОТВЕТА — таймаут/сбой, НЕ_РАЗОБРАН — слово
+        не разобрано) — страховка кода (action: СЛИТЬ / ЗАФИКСИРОВАТЬ) пишется как действие кода: decision = rule,
+        silent, source «код», сырой ответ; слова ИИ при непонятном ответе — в note. Возврат: «что случилось» для причины."""
+        mm = self._money_name()
+        rule = str(r.get("rule") or "НЕТ_ОТВЕТА")
+        det = str(r.get("detail") or "")[:80]
+        what = (f"{mm} не ответил" if rule == "НЕТ_ОТВЕТА" else "ответ не разобран") + (f" ({det})" if det else "")
+        rec.update(decision=rule, silent=True, source="код", raw=(str(r.get("raw") or "")[:80] or None),
+                   why=f"{what} — ответа не было, выход по правилу", applied=f"по правилу: {action}",
+                   note=str(r.get("why") or "")[:300])
+        return what
+
     async def _apply_guard(self, r: dict, price: float, pos: dict) -> None:
         if self.position is not pos or not self.position:
             return                             # позиция уже закрыта/сменилась
         raw = str(r.get("decision") or "").upper().replace("Ё", "Е")
-        hold = ("ЖД" in raw or "ДЕРЖ" in raw or "HOLD" in raw or "WAIT" in raw) and "СЛИ" not in raw
+        rule = bool(r.get("rule"))             # v5.4.2: решения ИИ не было — выход по правилу (запись кода)
+        hold = ("ЖД" in raw or "ДЕРЖ" in raw or "HOLD" in raw or "WAIT" in raw) and "СЛИ" not in raw and not rule
         why = str(r.get("why") or "")[:300]
         cur = self.prices[-1] if self.prices else price
         mm = self._money_name()
         rec = {"ts": time.time(), "side": "stop", "decision": "ЖДАТЬ" if hold else "СЛИТЬ", "why": why,
                "note": str(r.get("note") or "")[:300], "price": cur,
                "trigger": pos.get("invalidation"), "hold_until": _f(r.get("hold_until_price")) or None,
-               "hold_minutes": _f(r.get("hold_minutes")) or None, "model": mm}
+               "hold_minutes": _f(r.get("hold_minutes")) or None, "model": mm, "silent": False, "source": "ИИ"}
+        what = self._rule_rec(rec, r, "СЛИТЬ") if rule else ""
+        if rule:
+            rec["hold_until"] = rec["hold_minutes"] = None
         self.guards.append(rec)
         del self.guards[:-GUARDS_KEEP]
         pos["guard_last"] = time.time()
+        if rule:
+            await self._close_all(cur, f"мягкий стоп по правилу: {what}")
+            return
         if not hold:
             await self._close_all(cur, f"мягкий стоп: {mm} решил слить — " + (why or "без объяснений"))
             return
@@ -2977,8 +3077,8 @@ class AIPilot:
             pos.pop("guard_side", None)
             raise
         except Exception as e:                               # noqa: BLE001
-            r = {"decision": "ЗАФИКСИРОВАТЬ",
-                 "why": f"{self._money_name()} не ответил ({str(e)[:80] or type(e).__name__}) — фиксация по правилу"}
+            # v5.4.2 (ревью): молчание — не решение ИИ; фиксация по правилу — страховка кода, так и пишется
+            r = {"decision": "ЗАФИКСИРОВАТЬ", "rule": "НЕТ_ОТВЕТА", "detail": str(e)[:80] or type(e).__name__}
         finally:
             pos["guard_busy"] = False
             pos.pop("guard_side", None)
@@ -2994,8 +3094,9 @@ class AIPilot:
         if self.position is not pos or not self.position:
             return                             # позиция уже закрыта/сменилась
         raw = str(r.get("decision") or "").upper().replace("Ё", "Е")
+        rule = bool(r.get("rule"))             # v5.4.2: решения ИИ не было — фиксация по правилу (запись кода)
         hold = (("ДЕРЖ" in raw or "ЖД" in raw or "HOLD" in raw or "WAIT" in raw)
-                and "ФИКС" not in raw and "ЗАКР" not in raw and "СЛИ" not in raw)
+                and "ФИКС" not in raw and "ЗАКР" not in raw and "СЛИ" not in raw and not rule)
         why = str(r.get("why") or "")[:300]
         cur = self.prices[-1] if self.prices else price
         take = _f(pos.get("take"))
@@ -3006,10 +3107,16 @@ class AIPilot:
         rec = {"ts": time.time(), "side": "take", "decision": "ПОДЕРЖАТЬ" if hold else "ЗАФИКСИРОВАТЬ", "why": why,
                "note": str(r.get("note") or "")[:300], "price": cur, "take": take or None,
                "lock_price": lock_ai or None, "tp_next": tp_next or None,
-               "hold_minutes": _f(r.get("hold_minutes")) or None, "model": mm}
+               "hold_minutes": _f(r.get("hold_minutes")) or None, "model": mm, "silent": False, "source": "ИИ"}
+        what = self._rule_rec(rec, r, "ЗАФИКСИРОВАТЬ") if rule else ""
+        if rule:
+            rec["lock_price"] = rec["tp_next"] = rec["hold_minutes"] = None
         self.guards.append(rec)
         del self.guards[:-GUARDS_KEEP]
         pos["take_last"] = time.time()
+        if rule:
+            await self._close_all(cur, f"ПОБЕДА: тейк @{take:g} — фиксация по правилу: {what}")
+            return
         if not hold:
             await self._close_all(cur, f"ПОБЕДА: тейк @{take:g} — {mm}: зафиксировать — " + (why or "без объяснений"))
             return
@@ -3362,6 +3469,8 @@ if __name__ == "__main__":
             from . import config as _cfg0
         except ImportError:
             import config as _cfg0
+        # ревью 5.4.2: ручки «свободного пилота» — на умолчаниях (data/config_user.json и окружение владельца не роняют тест)
+        _cfg0.pin_free_pilot_defaults()
         # блоки 1–29 писались под трос НА БИРЖЕ (5.2–5.4.0); умолчание 5.4.1 — стопы только в программе (блок 30)
         _cfg0.PYTHIA_EXCHANGE_STOP = True
         # 1) приказ принимается; без exec / с мусорными сторонами — отказ
@@ -3722,6 +3831,24 @@ if __name__ == "__main__":
         pm._tick_n = 11
         await pm.tick(90000.0, BOOK)
         assert pm.pending is None and pm.position["topup_left"] == 0, "биржа не даёт — добор закончен"
+        #     ревью 5.4.2: приказ HOLD — держать как есть БЕЗ добора (биржа снова даёт 4 — не берём), уровни обновлены;
+        #     null — прежний уровень; уровень не с той стороны — приказ отклонён, позиция не тронута
+        pm.broker.mx = {"buy": 4, "sell": 0}
+        n_pl = len(pm.broker.placed)
+        assert pm.adopt_forecast({"exec": {"do": "HOLD", "entry": None, "take": 96000.0, "invalidation": 89500.0}})
+        assert pm.position["invalidation"] == 89500.0 and pm.position["take"] == 96000.0 and pm.plan is None
+        assert pm.position["topup_left"] == 0 and "без добора" in pm.last_action, pm.last_action
+        pm.position["last_fill_ts"] -= TOPUP_GAP_SEC + 1
+        pm._tick_n = 17
+        await pm.tick(90000.0, BOOK)
+        assert len(pm.broker.placed) == n_pl and pm.pending is None and pm.position["lots"] == 17, "HOLD — не добор"
+        assert pm.adopt_forecast({"exec": {"do": "HOLD", "take": None, "invalidation": None}})
+        assert pm.position["invalidation"] == 89500.0 and pm.position["take"] == 96000.0 and "(прежний)" in pm.last_action
+        assert not pm.adopt_forecast({"exec": {"do": "HOLD", "invalidation": 90500.0}}), "стоп выше цены у лонга"
+        assert pm.position["invalidation"] == 89500.0 and "HOLD отклонён" in pm.last_action, pm.last_action
+        p_nh = mk()
+        p_nh._prepared = True                        # до prepare() HOLD ждёт позицию со счёта — здесь её уже нет
+        assert not p_nh.adopt_forecast({"exec": {"do": "HOLD", "invalidation": 89000.0}}) and "позиции уже нет" in p_nh.last_action
         #     ограничение владельца (deposit при запуске) режет сверху даже число биржи
         pcap = mk(); pcap.broker = MaxBroker(); pcap.deposit_override = 30000.0
         pcap.adopt_forecast(ex("BUY", inv=89000.0))
@@ -3872,7 +3999,10 @@ if __name__ == "__main__":
             raise RuntimeError("сеть")
         ps._stop_guard = boom
         await ps.tick(88900.0, BOOK); await settle_guard(ps)
-        assert ps.position is None and "стоп по правилу" in ps.last_action
+        assert ps.position is None and "мягкий стоп по правилу: " in ps.last_action and "решил слить" not in ps.last_action
+        g_ = ps.guards[-1]                   # ревью 5.4.2: страховка кода — не решение ИИ «СЛИТЬ»
+        assert g_["decision"] == "НЕТ_ОТВЕТА" and g_["silent"] and g_["source"] == "код" \
+            and g_["applied"] == "по правилу: СЛИТЬ" and "ответа не было" in g_["why"], g_
         #     предел «ждать»: PYTHIA_SOFT_STOP_MAX_HOLDS=3 → четвёртый раз не спрашиваем, закрываем
         ps._stop_guard = SoftPilot._stop_guard.__get__(ps, SoftPilot)
         fresh(ps)
@@ -3964,7 +4094,9 @@ if __name__ == "__main__":
         open_t(pt); await pt.tick(90000.0, BOOK); await pt.tick(90000.0, BOOK)
         TakePilot.take_answers[:] = ["boom"]
         await pt.tick(95100.0, BOOK); await settle_take(pt)
-        assert pt.position is None and "фиксация по правилу" in pt.last_action and pt.guards[-1]["decision"] == "ЗАФИКСИРОВАТЬ"
+        assert pt.position is None and "фиксация по правилу" in pt.last_action and pt.guards[-1]["decision"] == "НЕТ_ОТВЕТА"
+        assert pt.guards[-1]["silent"] and pt.guards[-1]["source"] == "код" \
+            and pt.guards[-1]["applied"] == "по правилу: ЗАФИКСИРОВАТЬ", pt.guards[-1]
         #     предел «подержать» (PYTHIA_SOFT_TAKE_MAX_HOLDS=2) → третий раз не спрашиваем, фиксируем
         open_t(pt); await pt.tick(90000.0, BOOK); await pt.tick(90000.0, BOOK)
         pt.position["take_holds"] = 2
@@ -4353,7 +4485,12 @@ if __name__ == "__main__":
         await pbk.tick(90000.0, BOOK)
         assert pbk.plan and "мертва" not in pbk.last_action and not fired_b, pbk.last_action
         await pbk.tick(90510.0, BOOK)
-        assert pbk.plan and pbk.plan.get("crossed")
+        assert pbk.plan and pbk.plan.get("crossed") == 90500.0, "пометка привязана к пробитому уровню"
+        #     ревью 5.4.2: уровень сменили (дверь ЖДАТЬ с новым прорывом) — пробитие старого уровня новый не хоронит
+        pbk.plan["entry"], pbk.plan["invalidation"] = 90800.0, 90600.0
+        await pbk.tick(90550.0, BOOK)
+        assert pbk.plan and "мертва" not in pbk.last_action and not fired_b, pbk.last_action
+        pbk.plan["entry"], pbk.plan["invalidation"] = 90500.0, 90200.0
         await pbk.tick(90100.0, BOOK)
         await asyncio.sleep(0)
         assert pbk.plan is None and "мертва ДО входа" in pbk.last_action and fired_b

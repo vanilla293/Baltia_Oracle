@@ -618,7 +618,7 @@ def test_profit_silence_and_garbage_are_no_decision_with_quick_retry(free):
     asyncio.run(scenario())
 
 
-# ── трос и тейк: только словарь (молчание — прежнее безопасное правило) ──────────────────────────────────────────────
+# ── трос и тейк: только словарь; молчание и непонятный ответ — страховка кода, записанная как действие кода ──────────
 def test_guard_and_take_vocabulary(free):
     fake = free
 
@@ -626,15 +626,53 @@ def test_guard_and_take_vocabulary(free):
         m, p = make_pilot()
         pos = await open_long(p, fake)
         for ans, want in (({"decision": "HOLD", "why": "т"}, "ЖДАТЬ"), ({"choice": "EXIT"}, "СЛИТЬ"),
-                          ({"decision": "???"}, "СЛИТЬ")):
+                          ({"decision": "НЕ СЛИВАТЬ — держать", "why": "вынос стопов"}, "ЖДАТЬ")):
             fake.queue("mission_guard", ans)
             r = await p._stop_guard(97.9, pos)
-            assert r["decision"] == want, (ans, r)
-        assert "ответ не разобран" in r["why"]
-        for ans, want in (({"decision": "CLOSE"}, "ЗАФИКСИРОВАТЬ"), ({"decision": "HOLD"}, "ПОДЕРЖАТЬ"), ({}, "ЗАФИКСИРОВАТЬ")):
+            assert r["decision"] == want and not r.get("rule"), (ans, r)
+        fake.queue("mission_guard", {"decision": "???", "why": "лента выкупает"})
+        r = await p._stop_guard(97.9, pos)
+        assert r["decision"] == "СЛИТЬ" and r["rule"] == "НЕ_РАЗОБРАН" and r["raw"] == "???", r
+        for ans, want in (({"decision": "CLOSE"}, "ЗАФИКСИРОВАТЬ"), ({"decision": "HOLD"}, "ПОДЕРЖАТЬ")):
             fake.queue("mission_take", ans)
             r = await p._take_guard(110.2, pos)
-            assert r["decision"] == want, (ans, r)
+            assert r["decision"] == want and not r.get("rule"), (ans, r)
+        fake.queue("mission_take", {})
+        r = await p._take_guard(110.2, pos)
+        assert r["decision"] == "ЗАФИКСИРОВАТЬ" and r["rule"] == "НЕ_РАЗОБРАН", r
+
+    asyncio.run(scenario())
+
+
+def test_guard_and_take_fallback_is_code_rule_not_ai_decision(free, monkeypatch):
+    """Ревью 5.4.2: у троса ответ не разобран / у тейка молчание — выход по правилу остаётся (страховка), но запись —
+    действие кода (НЕ_РАЗОБРАН / НЕТ_ОТВЕТА, silent, source «код», сырой ответ), причина закрытия — «по правилу», не
+    «PRO решил слить»; в промптах — «ответа не было — выход по правилу»."""
+    fake = free
+
+    async def scenario():
+        m, p = make_pilot()
+        pos = await open_long(p, fake)
+        fake.queue("mission_guard", {"decision": "может быть", "why": "лента выкупает"})
+        await tick(p, 97.9)
+        assert p.position is None, p.last_action
+        g = p.guards[-1]
+        assert g["decision"] == "НЕ_РАЗОБРАН" and g["silent"] and g["source"] == "код" and g["raw"] == "может быть" \
+            and g["applied"] == "по правилу: СЛИТЬ" and "ответа не было" in g["why"] and g["note"] == "лента выкупает", g
+        assert "мягкий стоп по правилу: ответ не разобран (может быть)" in p.last_action and "решил слить" not in p.last_action
+        gt = p._guards_text()
+        assert "трос: ответа не было — выход по правилу" in gt and "трос: СЛИТЬ" not in gt and "НЕ_РАЗОБРАН" not in gt, gt
+        # тейк: PRO молчит (таймаут) — фиксация по правилу, запись кода
+        m2, p2 = make_pilot()
+        pos2 = await open_long(p2, fake, take=101.0)
+        fake.queue("mission_take", FakeMoney.SILENT)
+        await tick(p2, 101.2)
+        assert p2.position is None, p2.last_action
+        g2 = p2.guards[-1]
+        assert g2["side"] == "take" and g2["decision"] == "НЕТ_ОТВЕТА" and g2["silent"] and g2["source"] == "код" \
+            and g2["applied"] == "по правилу: ЗАФИКСИРОВАТЬ" and "не ответил" in g2["why"], g2
+        assert "фиксация по правилу: PRO не ответил" in p2.last_action, p2.last_action
+        assert "тейк: ответа не было — выход по правилу" in p2._guards_text()
 
     asyncio.run(scenario())
 
@@ -647,5 +685,250 @@ def test_wait_texts_are_neutral(free):
     m.exec, m.exec_ts = wait, time.time()
     assert "WAIT — совет ждал: закрепление выше 101" in mission._exec_text(m) and "перевеса нет" not in mission._exec_text(m)
     sit = p._situation_text(100.0)
+    # ревью 5.4.2: выбор — из списка перепроверки (режим игры, НОВЫЙ_АНАЛИЗ), а не зашитые три слова
     assert ("ПРИКАЗ СОВЕТА (0 мин назад): вне рынка; совет ждал: закрепление выше 101. Это прошлое мнение, а не запрет: "
-            "реши заново — КУПИТЬ_СЕЙЧАС / ПРОДАТЬ_СЕЙЧАС с уровнями или ЖДЁМ") in sit, sit
+            "реши заново — КУПИТЬ_СЕЙЧАС | ЖДЁМ | ПРОДАТЬ_СЕЙЧАС | НОВЫЙ_АНАЛИЗ") in sit, sit
+    m2, p2 = make_pilot(play="long")
+    assert p2.adopt_forecast({"exec": wait})
+    m2.exec, m2.exec_ts = wait, time.time()
+    sit2 = p2._situation_text(100.0)
+    assert "реши заново — КУПИТЬ_СЕЙЧАС | ЖДЁМ | НОВЫЙ_АНАЛИЗ" in sit2 and "ПРОДАТЬ" not in sit2, sit2
+
+
+# ══ ревью 5.4.2 (часть 2) ══════════════════════════════════════════════════════════════════════════════════════════
+# ── приказ HOLD: держать как есть без добора ───────────────────────────────────────────────────────────────────────
+def test_council_hold_updates_levels_without_topup(free):
+    """Позиция по размеру биржи; вердикт совета «держать» → HOLD: стоп и тейк обновлены, добора нет (биржа даёт ещё —
+    aip-topup не шлётся), дверь не спрашивается; явный BUY той же стороны — добор до максимума, как раньше."""
+    fake = free
+
+    async def scenario():
+        b = Broker()
+        b.mx = {"buy": 3, "sell": 3}
+        m, p = make_pilot(b)
+        p.deposit_override = None
+        pos = await open_long(p, fake, inv=98.0, take=104.0)
+        assert p._sized_by_broker and pos["lots"] == 3, pos
+        pos["topup_left"] = 0                                        # добор самого входа исчерпан
+        b.mx = {"buy": 4, "sell": 4}
+        p._mx = None
+        p.prices.append(103.0)
+        hold, err = mission._validate_exec({"do": "ДЕРЖАТЬ", "invalidation": 101.0, "take": 107.0,
+                                            "why": "держать, стоп подтянуть к 101"}, "auto", 103.0, in_pos=True,
+                                           pos_side="long")
+        assert err is None and hold["do"] == "HOLD", err
+        m.exec, m.exec_ts = hold, time.time()
+        assert p.adopt_forecast({"exec": hold})
+        assert pos["invalidation"] == 101.0 and pos["take"] == 107.0 and p.plan is None and not pos.get("topup_left")
+        assert "HOLD — держать позицию как есть, без добора" in mission._exec_text(m)
+        n_o, n_entry = len(b.placed), fake.count("mission_entry")
+        pos["last_fill_ts"] = 0.0
+        await tick(p, 103.0, n=13)
+        assert len(b.placed) == n_o and pos["lots"] == 3 and fake.count("mission_entry") == n_entry, b.placed
+        # null — прежний уровень; не с той стороны — приказ отклонён, позиция не тронута
+        assert p.adopt_forecast({"exec": {"do": "HOLD", "invalidation": None, "take": None}})
+        assert pos["invalidation"] == 101.0 and pos["take"] == 107.0
+        assert not p.adopt_forecast({"exec": {"do": "HOLD", "invalidation": 103.5}}) and pos["invalidation"] == 101.0
+        # явный «добрать» (BUY той же стороны «сейчас») — добор до максимума, как было
+        assert p.adopt_forecast(ex("BUY", None, 107.0, 101.0))
+        assert pos["topup_left"] > 0
+        pos["last_fill_ts"] = 0.0
+        await tick(p, 103.0, n=7)
+        assert [o for o in b.placed if o["tag"] == "aip-topup"], b.placed
+
+    asyncio.run(scenario())
+
+
+# ── ответ двери про прежний план не отменяет свежее решение, обновившее план на месте ─────────────────────────────
+@pytest.mark.parametrize("answer", ["ОТМЕНИТЬ", "ЖДАТЬ", "SILENT"])
+def test_stale_door_answer_does_not_veto_fresh_review(free, answer):
+    fake = free
+
+    async def scenario():
+        m, p = make_pilot()
+        assert p.adopt_forecast(ex("BUY"))
+        gate = asyncio.Event()
+
+        async def hold(route):
+            await gate.wait()
+        fake.during = hold
+        fake.queue("mission_entry", FakeMoney.SILENT if answer == "SILENT" else
+                   {"decision": answer, "why": "прежний план слабый", "council": True, "wait_minutes": 30})
+        await p.tick(100.0, book(100.0))
+        plan = p.plan
+        assert plan["gate_busy"] and plan["src"] == "council"
+        await asyncio.sleep(0.01)
+        # пока дверь думает, дежурный PRO по живым данным решил купить — план обновлён на месте
+        p._plan_from_review("КУПИТЬ_СЕЙЧАС", {"invalidation": 97.0, "take": 112.0}, "лента за нас", 100.0, 100.0,
+                            snap_ts=time.time())
+        assert p.plan is plan and plan["src"] == "review" and plan["snap_ts"] > plan["gate_ts"]
+        gate.set()
+        await settle_bg(p)
+        fake.during = None
+        g = p.gates[-1]
+        assert p.plan is plan and g["applied"] == "план обновлён свежим решением за время ответа — не применено", g
+        assert not plan.get("gate_busy") and "gate_wait_ts" not in plan and "gate_after" not in plan, plan
+        assert not m.handoffs and not p._reanalyzing and p.reanalyze_cb.await_count == 0, "ни совета, ни отмены"
+        assert "gate_silent" not in plan
+        n = fake.count("mission_entry")
+        await tick(p, 100.1)                                         # свежее решение — без второго вопроса у двери
+        assert p.pending and p.pending["invalidation"] == 97.0 and fake.count("mission_entry") == n, p.last_action
+
+    asyncio.run(scenario())
+
+
+def test_in_place_update_restarts_plan_ttl_and_door_enter_applies(free):
+    """Срок плана (PLAN_TTL_SEC) — от свежего решения: приказ совета состарился, пока дверь думала, перепроверка обновила
+    план на месте — ВОЙТИ двери исполняется, а не «приказ протух»."""
+    fake = free
+
+    async def scenario():
+        m, p = make_pilot()
+        assert p.adopt_forecast(ex("BUY"))
+        gate = asyncio.Event()
+
+        async def hold(route):
+            await gate.wait()
+        fake.during = hold
+        fake.queue("mission_entry", {"decision": "ВОЙТИ", "why": "ок"})
+        await p.tick(100.0, book(100.0))
+        plan = p.plan
+        plan["ts"] = time.time() - ai_pilot.PLAN_TTL_SEC - 10           # приказ совета протух за время раздумий
+        await asyncio.sleep(0.01)
+        p._plan_from_review("КУПИТЬ_СЕЙЧАС", {"invalidation": 97.0}, "всё ещё да", 100.0, 100.0, snap_ts=time.time())
+        assert p.plan is plan and time.time() - plan["ts"] < 5, "срок — от нового решения"
+        gate.set()
+        await settle_bg(p)
+        fake.during = None
+        assert p.pending and "протух" not in p.gates[-1]["applied"], (p.gates[-1], p.last_action)
+
+    asyncio.run(scenario())
+
+
+def test_in_place_update_drops_crossed_mark(free):
+    fake = free
+
+    async def scenario():
+        m, p = make_pilot()
+        assert p.adopt_forecast({"exec": {"do": "BUY", "entry": 101.0, "entry_kind": "прорыв", "take": 106.0,
+                                          "invalidation": 100.5, "why": "совет: пробой"}})
+        gate = asyncio.Event()
+
+        async def hold(route):
+            await gate.wait()
+        fake.during = hold
+        fake.queue("mission_entry", {"decision": "ВОЙТИ", "why": "ок"})
+        await p.tick(101.1, book(101.1))
+        await p.tick(101.1, book(101.1))
+        plan = p.plan
+        assert plan["gate_busy"] and plan.get("crossed") == 101.0, plan
+        p._plan_from_review("КУПИТЬ_СЕЙЧАС", {"entry": 102.0, "entry_kind": "прорыв", "invalidation": 101.3}, "выше",
+                            101.1, 101.1, snap_ts=time.time())
+        assert p.plan is plan and "crossed" not in plan and plan["entry"] == 102.0
+        gate.set()
+        await settle_bg(p)
+        fake.during = None
+
+    asyncio.run(scenario())
+
+
+# ── пробой: новый уровень от двери после пробития старого — идея жива до пробития нового ──────────────────────────
+def test_door_new_breakout_level_after_crossing_survives_dip(free):
+    fake = free
+
+    async def scenario():
+        m, p = make_pilot()
+        assert p.adopt_forecast({"exec": {"do": "BUY", "entry": 101.0, "entry_kind": "прорыв", "take": 106.0,
+                                          "invalidation": 100.5, "why": "совет: пробой 101"}})
+        assert p.plan["kind"] == "прорыв"
+        await tick(p, 100.0)
+        fake.queue("mission_entry", {"decision": "ЖДАТЬ", "why": "ложный пробой — жду выше", "entry": 102.0,
+                                     "entry_kind": "прорыв", "invalidation": 101.3})
+        await tick(p, 101.1, n=mission.BREAK_CONFIRM_TICKS)          # 101 пробит → дверь: ЖДАТЬ пробоя 102, стоп 101.3
+        assert fake.count("mission_entry") == 1 and p.plan and p.plan["entry"] == 102.0 and p.plan["kind"] == "прорыв"
+        assert p.plan["invalidation"] == 101.3 and p.plan["src"] == "gate_level", p.plan
+        await tick(p, 101.1)                                         # ниже нового стопа, но 102 не пробит — жив
+        assert p.plan and p.pending is None and "мертва" not in p.last_action, p.last_action
+        await tick(p, 102.1, n=mission.BREAK_CONFIRM_TICKS)          # пробит новый уровень — вход (решение свежее)
+        assert p.pending and fake.count("mission_entry") == 1, p.last_action
+
+    asyncio.run(scenario())
+
+
+# ── план добора без позиции — не новый вход ────────────────────────────────────────────────────────────────────────
+def test_leftover_topup_plan_never_opens_new_position(free, monkeypatch):
+    fake = free
+    monkeypatch.setattr(config, "PYTHIA_SOFT_TAKE", False)             # тейк — сразу в кассу (как в сценарии ревью)
+
+    async def scenario():
+        m, p = make_pilot()
+        pos = await open_long(p, fake, inv=98.0, take=100.8)
+        p._plan_from_review("КУПИТЬ_СЕЙЧАС", {"invalidation": 98.0, "take": 100.8}, "добрать", 100.5, 100.5,
+                            topup=True, snap_ts=time.time())
+        assert p.plan and p.plan["src"] == "topup"
+        await tick(p, 100.9)                                         # тейк взят — позиция закрыта
+        assert p.position is None and p.plan is None, (p.plan, p.last_action)
+        n = len(p.broker.placed)
+        await tick(p, 100.6, n=3)
+        assert len(p.broker.placed) == n and p.pending is None and fake.count("mission_entry") == 1, p.broker.placed
+        # план добора пережил позицию другим путём — дверь снимает его, а не бьёт свежий вход
+        p.plan = {"side": "long", "entry": None, "kind": "сейчас", "take": 104.0, "invalidation": 98.0, "why": "добор",
+                  "src": "topup", "snap_price": 100.6, "snap_ts": time.time(), "ts": time.time()}
+        await tick(p, 100.6)
+        assert p.plan is None and p.last_action == "добор снят: позиции уже нет" and p.state == "ЖДУ_ПЛАН"
+        assert len(p.broker.placed) == n and fake.count("mission_entry") == 1
+
+    asyncio.run(scenario())
+
+
+# ── дверь выключена: решение, от которого цена уехала, не догоняем ──────────────────────────────────────────────────
+def test_door_off_drift_is_not_chased(free, monkeypatch):
+    fake = free
+    monkeypatch.setattr(config, "PYTHIA_ENTRY_CHECK", False)
+
+    async def scenario():
+        m, p = make_pilot()
+        p.prices.append(103.5)
+        p._plan_from_review("КУПИТЬ_СЕЙЧАС", {"invalidation": 99.0, "take": 104.0}, "импульс", 100.0, 103.5,
+                            snap_ts=time.time())
+        assert p.plan and p.plan["gate_note"], p.plan
+        p.review_ts = time.time() + 1800
+        await tick(p, 103.5)
+        assert p.plan is None and p.pending is None and not p.broker.placed and fake.count("mission_entry") == 0
+        assert "цена ушла на 3.50% от снимка решения 100 (стало 103.5) — реши заново по живой цене" in p._review_reason
+        assert p.review_ts <= max(time.time(), p._last_review_ts) + mission.EVENT_MIN_GAP_SEC + 1
+        assert m.handoffs[-1]["kind"] == "pilot"
+        # в пределах PYTHIA_ENTRY_DRIFT_PCT — вход сразу, как было
+        m2, p2 = make_pilot()
+        p2._plan_from_review("КУПИТЬ_СЕЙЧАС", {"invalidation": 99.0, "take": 104.0}, "т", 100.0, 100.3, snap_ts=time.time())
+        await tick(p2, 100.3)
+        assert p2.pending and fake.count("mission_entry") == 0
+        # приказ совета при выключенной двери — вход сразу (как в 5.4.1)
+        m3, p3 = make_pilot()
+        assert p3.adopt_forecast(ex("BUY"))
+        await tick(p3, 100.0)
+        assert p3.pending
+
+    asyncio.run(scenario())
+
+
+# ── «после закрытия» — по строке кода, а не по слову «закрытие» в тексте ИИ ────────────────────────────────────────
+def test_door_cancel_with_closing_word_in_why_pulls_review_soon(free, monkeypatch):
+    fake = free
+    monkeypatch.setattr(config, "PYTHIA_AFTER_CLOSE_SEC", 900)
+
+    async def scenario():
+        m, p = make_pilot()
+        assert p.adopt_forecast(ex("BUY"))
+        p.review_ts = time.time() + 1800
+        fake.queue("mission_entry", {"decision": "ОТМЕНИТЬ", "why": "ход отыгран, закрытие часа ниже 100"})
+        await tick(p, 100.0)
+        assert p.plan is None and "закрытие часа" in (p._review_reason or "")
+        assert p.review_ts - time.time() <= mission.EVENT_MIN_GAP_SEC + 1, p.review_ts - time.time()
+        # настоящий повод «после закрытия» — пауза PYTHIA_AFTER_CLOSE_SEC, как было
+        m2, p2 = make_pilot()
+        p2.review_ts = time.time() + 1800
+        p2._fire_reanalyze("после закрытия — огромный анализ с нуля")
+        assert p2.review_ts - time.time() >= 890
+
+    asyncio.run(scenario())

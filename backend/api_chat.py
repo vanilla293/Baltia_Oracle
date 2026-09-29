@@ -165,6 +165,11 @@ def _mission_text() -> tuple[str, dict]:
         elif do == "CLOSE":
             L.append(f"Приказ совета ({ai_v5.fmt_ts(st.get('exec_ts'))}): CLOSE — закрыть позицию"
                      + (f" — {str(ex['why'])[:300]}" if ex.get("why") else ""))
+        elif do == "HOLD":                       # v5.4.2 (ревью): держать как есть, без добора; null — прежний уровень
+            L.append(f"Приказ совета ({ai_v5.fmt_ts(st.get('exec_ts'))}): HOLD — держать позицию как есть, без добора; "
+                     f"стоп {ex.get('invalidation') if ex.get('invalidation') is not None else 'прежний'}, "
+                     f"тейк {ex.get('take') if ex.get('take') is not None else 'прежний'}"
+                     + (f" — {str(ex['why'])[:300]}" if ex.get("why") else ""))
         else:
             L.append(f"Приказ совета: {ex.get('do')} вход {ex.get('entry') if ex.get('entry') is not None else 'сейчас'}"
                      f" ({ex.get('entry_kind') or '—'}) тейк {ex.get('take')} стоп {ex.get('invalidation')}"
@@ -753,6 +758,10 @@ if __name__ == "__main__":
         snap_w["missions"]["SBER"]["exec"] = {"do": "CLOSE", "why": "слом", "invalidation": 1.0}
         txt, _ = _mission_text()
         assert "): CLOSE — закрыть позицию — слом" in txt and "вход сейчас" not in txt, txt
+        snap_w["missions"]["SBER"]["exec"] = {"do": "HOLD", "why": "ход жив", "invalidation": 298.0, "take": None}
+        txt, _ = _mission_text()                     # ревью 5.4.2: HOLD — держать без добора, null — прежний уровень
+        assert "): HOLD — держать позицию как есть, без добора; стоп 298.0, тейк прежний — ход жив" in txt \
+            and "вход сейчас" not in txt, txt
 
         # ── без миссии: честная строка; без ключа — отказ ──
         StubMission.snap = {"active": None, "missions": {}}

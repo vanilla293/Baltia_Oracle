@@ -181,8 +181,10 @@ def test_validate_exec_wait_forms_and_position_rule():
     assert w0["wait_for"] == "условие входа не названо — реши по живой картине" and w0["why"] == "(причина не указана)"
     _, err = mission._validate_exec({"do": "WAIT", "why": "x"}, "auto", 100, in_pos=True)
     assert err and "позиция открыта" in err and "WAIT недопустим" in err
-    _, err = mission._validate_exec({"do": "HOLD"}, "auto", 100)
-    assert err and "нужно BUY, SELL или WAIT (CLOSE — только при открытой позиции)" in err and "флета нет" not in err
+    _, err = mission._validate_exec({"do": "HOLD"}, "auto", 100)     # ревью 5.4.2: HOLD — только при позиции
+    assert err and "HOLD — только при открытой позиции" in err and "нужно BUY, SELL или WAIT" in err and "флета нет" not in err
+    _, err = mission._validate_exec({"do": "???"}, "auto", 100)
+    assert err and "нужно BUY, SELL или WAIT (HOLD и CLOSE — только при открытой позиции)" in err
     _, err = mission._validate_exec({"do": "CLOSE"}, "auto", 100)
     assert err and "позиции нет" in err and "WAIT" in err
 

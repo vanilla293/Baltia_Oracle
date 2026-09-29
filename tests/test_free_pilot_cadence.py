@@ -496,6 +496,12 @@ def test_council_timeout_unfreezes_pilot_and_keeps_position(offline, monkeypatch
         assert p.review_ts <= time.time() + mission.EVENT_MIN_GAP_SEC + 1
         assert "совет не уложился" in (p._review_reason or "") and "прерван" in (m.error or "")
         assert any(r == "mission_council" for r, _ in fake.errors), fake.errors
+        # ревью 5.4.2: окно совета — от обрыва: НОВЫЙ_АНАЛИЗ сразу после него ждёт окна, а не крутит «совет — обрыв»
+        assert time.time() - m.council_ts < 5, m.council_ts
+        assert "Последний полный совет прерван 0 мин назад (не уложился в срок)" in p._situation_text(100.0)
+        monkeypatch.setattr(config, "PYTHIA_COUNCIL_GAP_SEC", 1800)
+        p._fire_reanalyze("перепроверка потребовала свежий разбор: снова", kind="council")
+        assert not p._reanalyzing and p._reanalyze_pending == p._council_deferred, p.last_action
 
     asyncio.run(scenario())
 
@@ -568,6 +574,79 @@ def test_resume_without_adopted_order_reviews_soon(monkeypatch):
             assert r["ok"] and m.phase == "idle" and p.plan is None, r
             assert p.review_ts <= time.time() + max(ai_pilot.OPEN_REVIEW_GRACE_SEC, 120.0) + 1
             assert "пилот поднят заново: приказа нет — реши по живой картине" in (p._review_reason or "")
+        finally:
+            m.task.cancel()
+            await asyncio.gather(m.task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+# ══ ревью 5.4.2 (часть 2) ══════════════════════════════════════════════════════════════════════════════════════════
+# ── рывок в нашу сторону, пока дежурный PRO думает, — мысль о прибыли после ответа без порога хода ─────────────────
+def test_shock_rally_during_review_runs_profit_thought_after_answer(offline, monkeypatch):
+    fake = offline
+    monkeypatch.setattr(config, "PYTHIA_SHOCK_PCT", 1.0)
+    monkeypatch.setattr(config, "PYTHIA_SHOCK_WIN_SEC", 600)
+
+    async def scenario():
+        m, p = make_pilot()
+        pos = await open_position(p, inv=98.0, take=110.0)
+        pos["profit_next"] = 0.0
+        entry = pos["entry"]
+        now = time.time()
+        p._px_hist[:] = [(now - 400, entry), (now - 300, entry), (now - 200, entry)]
+        p._last_shock_ts = 0.0
+
+        async def slow_review(price):
+            await asyncio.sleep(0.05)
+        p._review = slow_review
+        t = asyncio.create_task(p._review_bg(entry))
+        await asyncio.sleep(0.01)
+        assert p._review_busy
+        cur = round(entry * 1.013, 2)
+        p.prices.append(cur)
+        p._shock_watch(cur)                                  # +1.3 % за окно — рывок в плюс, PRO занят
+        assert pos.get("profit_pending_kind") == "shock" and fake.count("mission_profit") == 0, pos
+        assert p._profit_trigger(cur, pos) is None, "до порога хода к тейку далеко — повод только от рывка"
+        await t
+        await settle_bg(p)
+        assert fake.count("mission_profit") == 1, "рывок израсходован — мысль о прибыли сразу после ответа PRO"
+        assert "profit_pending" not in pos and "profit_pending_kind" not in pos
+        assert "рывок в нашу сторону" in str(pos.get("profit_reason") or p.profits[-1].get("reason") or ""), \
+            (pos.get("profit_reason"), p.profits[-1:])
+
+    asyncio.run(scenario())
+
+
+# ── новый приказ не несёт рамку прошлого совета ────────────────────────────────────────────────────────────────
+def test_new_order_drops_previous_frame(monkeypatch):
+    seen: list = []
+
+    async def frame(kind, payload):
+        seen.append(mission._M["SBER"].frame)
+        return {"headline": f"рамка {len(seen)}"}
+
+    _council_offline(monkeypatch, [{"do": "BUY", "entry": None, "take": 104, "invalidation": 98},
+                                   {"do": "WAIT", "wait_for": "закрепление выше 101", "why": "мутно"}], frame=frame)
+
+    async def scenario():
+        await mission.start("SBER", "auto")
+        m = mission._M["SBER"]
+        await m.council_task
+        try:
+            for _ in range(200):
+                if m.frame:
+                    break
+                await asyncio.sleep(0.005)
+            assert m.frame == {"headline": "рамка 1"}
+            ex2 = await mission._council(m, "повтор", False)
+            assert ex2 and ex2["do"] == "WAIT"
+            assert m.frame in (None, {"headline": "рамка 2"}), m.frame
+            for _ in range(200):
+                if len(seen) >= 2:
+                    break
+                await asyncio.sleep(0.005)
+            assert seen[1] is None, "рамка прошлого совета снята, пока новая не пришла"
         finally:
             m.task.cancel()
             await asyncio.gather(m.task, return_exceptions=True)
