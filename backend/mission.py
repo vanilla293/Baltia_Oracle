@@ -1336,6 +1336,8 @@ class MissionPilot(ai_pilot.AIPilot):
         if per > 0 and not self._review_busy:
             due = max(self._last_review_ts, self._review_started_ts, _f(m.exec_ts, 0.0),
                       _f(getattr(self, "started_ts", 0.0), 0.0)) + per
+            # рынок только что открылся — стакану даём запас OPEN_REVIEW_GRACE_SEC, ритм WAIT его не отменяет
+            due = max(due, _f(getattr(self, "_opened_ts", 0.0), 0.0) + ai_pilot.OPEN_REVIEW_GRACE_SEC)
             if due < self.review_ts:
                 self.review_ts = due
         ref = _f(st.get("ref"), 0.0)
@@ -2116,6 +2118,9 @@ class MissionPilot(ai_pilot.AIPilot):
                                   detail=self.last_action))
                 return False
         deferred = getattr(self, "_review_deferred", None)
+        # v5.4.2: событие (резкий ход, новость, прокол) подтянуло перепроверку, пока шёл совет, — совет его не видел:
+        # после приказа повод не теряется, дежурный PRO вернётся к нему вскоре (проверка ритма WAIT)
+        carry = (self._review_reason, self._review_kind) if (self._review_pulled and self._review_reason) else None
         ok = super().adopt_forecast(forecast)
         self._council_kind = ""
         if ok and not self._last_reanalyze_ts:
@@ -2133,6 +2138,14 @@ class MissionPilot(ai_pilot.AIPilot):
                     self.review_ts = min(self.review_ts, time.time() + EVENT_MIN_GAP_SEC)
                 else:
                     log.info("миссия %s: %s — снято: совет дал свой приказ", self.base, deferred.get("text"))
+            if carry and not self._close_pending:
+                txt, kind0 = carry
+                if not self._review_reason:
+                    self._review_reason, self._review_kind = txt, kind0
+                elif txt not in self._review_reason:
+                    self._review_reason = f"{self._review_reason}; {txt}"
+                self._review_pulled = True
+                self.review_ts = min(self.review_ts, max(time.time(), self._last_review_ts) + EVENT_MIN_GAP_SEC)
             if isinstance(ex, dict) and str(ex.get("do") or "").upper() in ("CLOSE", "HOLD"):
                 return ok
             if self.plan and isinstance(ex, dict):
@@ -2203,8 +2216,8 @@ class MissionPilot(ai_pilot.AIPilot):
         pulled, note = False, ""
         if kind == "open":                           # рынок открылся: без пейсинга и тишины — накопилось
             due = now + ai_pilot.OPEN_REVIEW_GRACE_SEC
-            if due < self.review_ts:
-                self.review_ts, pulled = due, True
+            self.review_ts = min(self.review_ts, due)
+            pulled = self.review_ts <= due           # перепроверка уже раньше (другой повод) — этот идёт в неё же
         elif self._market_closed():                  # биржа закрыта: повод копится к открытию, PRO не дёргаем
             nxt = (self.market or {}).get("next_open_msk")
             note = f" — рынок закрыт{(' до ' + nxt) if nxt else ''}, повод дойдёт до перепроверки на открытии"
@@ -2213,13 +2226,13 @@ class MissionPilot(ai_pilot.AIPilot):
             after = float(getattr(config, "PYTHIA_AFTER_CLOSE_SEC", 900)) if closed else 0.0
             if after > 0:
                 due = max(now + after, floor)
-                if due < self.review_ts:
-                    self.review_ts, pulled = due, True
+                self.review_ts = min(self.review_ts, due)
+                pulled = self.review_ts <= due
             elif not closed and not self.position and not self.plan and not self.pending:
                 # v5.4.2: вне рынка без плана и без решения — дежурный PRO решает скоро, а не на плановой (до 30 мин)
                 due = max(now, self._last_review_ts) + EVENT_MIN_GAP_SEC
-                if due < self.review_ts:
-                    self.review_ts, pulled = due, True
+                self.review_ts = min(self.review_ts, due)
+                pulled = self.review_ts <= due
         elif age is not None and age < quiet and not triage:
             note = f" — позиция моложе {int(quiet // 60)} мин, повод дойдёт до плановой перепроверки"
         elif triage and t_urg != "СЕЙЧАС":           # v5.3 W2: FLASH-триаж — PRO не нужен сейчас
@@ -2227,8 +2240,8 @@ class MissionPilot(ai_pilot.AIPilot):
                     + (f": {triage.get('why')}" if triage.get("why") else "") + ", повод дойдёт до плановой перепроверки")
         else:
             due = max(now, floor)
-            if due < self.review_ts:
-                self.review_ts, pulled = due, True
+            self.review_ts = min(self.review_ts, due)
+            pulled = self.review_ts <= due           # два повода одним тиком: второй — в ту же перепроверку, не «отложен»
         if self._review_reason and why not in self._review_reason:
             self._review_reason = f"{self._review_reason}; {why}"
         elif not self._review_reason:

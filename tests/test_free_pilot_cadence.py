@@ -652,3 +652,74 @@ def test_new_order_drops_previous_frame(monkeypatch):
             await asyncio.gather(m.task, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+# ── проверка ритма 29.09.2026: база 30 мин, триггеры будят раньше — и не теряются ─────────────────────────────
+def test_wait_base_cadence_is_thirty_minutes_by_default():
+    assert float(config.PYTHIA_WAIT_REVIEW_SEC) == 1800.0 == ai_pilot.wait_review_sec() == float(ai_pilot.REVIEW_SEC), \
+        "воля владельца: в базе PRO смотрит рынок раз в 30 мин, раньше — только по триггерам"
+
+    async def scenario():
+        m, p = make_pilot()
+        wait_order(m, p)
+        assert 1790 <= p.review_ts - time.time() <= 1801, p.review_ts - time.time()
+        await tick(p, 100.0, n=2)
+        assert 1790 <= p.review_ts - time.time() <= 1801, "без триггеров ритм WAIT не короче 30 мин"
+
+    asyncio.run(scenario())
+
+
+def test_event_during_council_not_lost_after_council_wait():
+    """Серьёзная новость пришла, пока шёл совет (он её не видел); совет ответил WAIT — повод не пропадает:
+    дежурный PRO вернётся к нему через EVENT_MIN_GAP_SEC, а не через 30 мин."""
+    async def scenario():
+        m, p = make_pilot()
+        wait_order(m, p)
+        p._last_review_ts = time.time() - 1200
+        p._reanalyzing = True                                   # идёт совет
+        p._ask_review_now("серьёзная новость: ЦБ поднял ставку", kind="news")
+        assert p._review_pulled and p._review_reason and p.review_ts <= time.time() + 1
+        ex1, err = mission._validate_exec({"do": "WAIT", "wait_for": "реакция на ставку", "why": "ждём"}, "auto", PRICE)
+        assert err is None
+        m.exec, m.exec_ts = ex1, time.time()
+        p._reanalyzing = False
+        assert p.adopt_forecast({"exec": ex1})                  # совет кончился WAIT
+        assert p._review_reason and "ЦБ поднял ставку" in p._review_reason, "повод события, которого совет не видел, жив"
+        assert p.review_ts <= time.time() + mission.EVENT_MIN_GAP_SEC + 1, p.review_ts - time.time()
+        # без события совет WAIT — обычный ритм, повода нет
+        m2, p2 = make_pilot()
+        wait_order(m2, p2)
+        assert not p2._review_reason and p2.review_ts > time.time() + 1700
+
+    asyncio.run(scenario())
+
+
+def test_market_open_grace_kept_under_wait():
+    """Долго закрытый рынок открылся при приказе WAIT: ритм WAIT не отменяет запас OPEN_REVIEW_GRACE_SEC стакану."""
+    async def scenario():
+        m, p = make_pilot()
+        wait_order(m, p)
+        await tick(p, 100.0)                                    # цена отсчёта WAIT и живой стакан
+        old = time.time() - 4000                                # приказ, старт и ответ PRO — давно: ритм WAIT «просрочен»
+        m.exec_ts, p._last_review_ts, p._review_started_ts = old, old, old
+        if hasattr(p, "started_ts"):
+            p.started_ts = old
+        p._opened_ts = time.time()                              # рынок только что открылся
+        p.review_ts = time.time() + ai_pilot.OPEN_REVIEW_GRACE_SEC
+        p._wait_watch(100.0)                                    # ритм WAIT смотрит до плановой перепроверки
+        assert p.review_ts >= p._opened_ts + ai_pilot.OPEN_REVIEW_GRACE_SEC - 1, p.review_ts - time.time()
+
+    asyncio.run(scenario())
+
+
+def test_two_triggers_same_tick_second_not_marked_deferred():
+    async def scenario():
+        m, p = make_pilot()
+        wait_order(m, p)
+        p._last_review_ts = time.time() - 1200
+        p._ask_review_now("резкий ход +1.2%", kind="shock")
+        p._ask_review_now("WAIT: цена прошла уровень 101", kind="wait_level")
+        assert not m.handoffs[-1]["deferred"], m.handoffs[-1]
+        assert "через 0 мин" not in (p.last_action or "") or "решит через" in (p.last_action or "")
+
+    asyncio.run(scenario())

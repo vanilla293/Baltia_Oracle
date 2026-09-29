@@ -303,6 +303,7 @@ class AIPilot:
         self.market: dict | None = None        # рыночные часы: последний статус биржи (None — часы выключены)
         self._market_open_prev: bool | None = None   # был ли рынок открыт на прошлом тике
         self._closed_since = 0.0               # с какого момента рынок закрыт (для повода на открытии)
+        self._opened_ts = 0.0                  # v5.4.2: когда рынок открылся (запас стакану не отменяет ритм WAIT)
         self._review_saved: float | None = None  # плановая перепроверка до закрытия (короткий клиринг → вернуть)
         self.pnls: list[float] = []
         self.prices: list[float] = []
@@ -1325,6 +1326,7 @@ class AIPilot:
         """Рынок открылся: сразу сверка со счётом; закрыт был долго (ночь/выходной) → перепроверка
         с поводом «рынок открылся: накопились новости/события» (наследник собирает заметки дозора)."""
         closed_for = time.time() - self._closed_since if self._closed_since else 0.0
+        self._opened_ts = time.time()
         await self._reconcile(price)
         if self.state == "РЫНОК_ЗАКРЫТ":
             self.state = self._resting_state()
