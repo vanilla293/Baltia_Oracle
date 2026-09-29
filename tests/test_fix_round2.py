@@ -32,6 +32,14 @@ from oracle.tools import news as tnews  # noqa: F401  (регистрирует 
 from oracle.tools import projects  # noqa: F401  (регистрирует add_task/list_tasks)
 from oracle.tools import reminders as rem
 
+@pytest.fixture(autouse=True)
+def _owner_already_talked(monkeypatch):
+    """Эти тесты — про механику ежедневных задач; «владелец ещё не писал» проверяется отдельно."""
+    async def yes(self):
+        return True
+    monkeypatch.setattr(Scheduler, "_owner_talked", yes)
+
+
 from conftest import FakeNotifier
 from test_bot import (OWNER, FakeBot, FakeTTS, FakeUserbot, Reply, _live_msg, _sent_texts, bot, cbq, deps, h,
                       live)  # noqa: F401  (фикстуры — оттуда же)

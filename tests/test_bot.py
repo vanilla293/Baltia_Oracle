@@ -635,6 +635,7 @@ async def test_tts_skipped_on_agent_error_and_failures_ignored(h, deps, notifier
 
 
 async def test_voice_message_transcribed_and_answered_by_voice(h, deps, notifier, bot, db):
+    await db.kv_set("tts_mode", "mirror")                  # по умолчанию голосом не отвечаем — включён явно
     notifier_html = NotifierWithHtml(notifier)
     deps.notifier = notifier_html
     m = msg(bot, voice=Voice(file_id="f1", file_unique_id="u1", duration=3, file_size=2000))
@@ -750,7 +751,7 @@ async def test_voice_mode_cycle(h, deps, notifier, bot, db):
     for _ in range(4):
         await h.cmd_voice(msg(bot, "/voice"))
         seen.append(await db.kv_get("tts_mode"))
-    assert seen == ["always", "off", "mirror", "always"]       # из умолчания mirror
+    assert seen == ["mirror", "always", "off", "mirror"]       # из умолчания off
     deps.tts = FakeTTS(ok=False)
     await db.kv_set("tts_mode", "off")
     await h.cmd_voice(msg(bot, "/voice"))
@@ -1266,6 +1267,7 @@ async def test_live_commands_and_unknown(live, db):
 
 
 async def test_live_voice_download_and_transcribe(live):
+    await live.deps.db.kv_set("tts_mode", "mirror")
     reqs = await live.feed(message=_live_msg(voice=Voice(file_id="vf", file_unique_id="u", duration=2)))
     assert live.deps.stt.calls[0][0] == b"OggS-real-download"
     texts = _sent_texts(reqs)

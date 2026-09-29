@@ -54,6 +54,8 @@ ACTIONS_PREFIX = "[действия бота] "
 ACTIONS_MAX = 800            # длина записи «[действия бота] …»
 SUMMARY_COUNT = 3            # сколько последних конспектов идёт в промпт
 SUMMARY_MAX = 3000           # и сколько знаков они занимают вместе
+ACQUAINTED_FACTS = 5          # меньше фактов о нём…
+ACQUAINTED_MESSAGES = 40      # …и меньше его реплик — ещё «знакомство» (persona.ACQUAINTANCE_NOTE)
 HISTORY_ITEM_MAX = 6000      # одна старая реплика истории в контексте
 CURRENT_ITEM_MAX = 20_000    # сообщение, на которое отвечаем (длинная голосовая диктовка — целиком)
 VOICE_NOTE = "Сообщение пришло голосом (расшифровка может быть неточной)."
@@ -78,6 +80,28 @@ LATE_AFTER_SEC = 60.0        # отстояло в очереди дольше �
 SLOW_TEXT = "⏳ Отвечаю дольше обычного — DeepSeek (или сеть) медлит, жду. Если не дождусь, напишу, что случилось."
 QUEUE_TEXT = "⏳ Ещё дорешиваю прошлое сообщение — это в очереди, отвечу следом."
 OUT_OF_TIME = "⏳ Не успел договорить: DeepSeek медлит, а время на ответ вышло."
+ESCALATE_TEXT = "🧠 Тут надо подумать как следует — включаю глубокий режим, это до пары минут."
+THINK_DEEPER = "think_deeper"
+# не инструмент из реестра, а сигнал агенту: быстрая модель сама решает, что вопрос ей не по зубам
+THINK_DEEPER_SCHEMA = {"type": "function", "function": {
+    "name": THINK_DEEPER,
+    "description": (
+        "Передать этот вопрос глубокой модели с размышлением (дольше и дороже, зато основательно). "
+        "Вызывай ПЕРВЫМ и ЕДИНСТВЕННЫМ действием, если ответ требует серьёзного анализа: стратегия и планы, "
+        "решения про деньги, работу, здоровье, отношения, разбор сложных аргументов, расчёты, многошаговые "
+        "задачи, глубокая оценка идеи. НЕ вызывай для болтовни, приветствий, напоминаний, календаря, "
+        "простых фактов и коротких мнений — там отвечай сам."),
+    "parameters": {"type": "object", "properties": {
+        "reason": {"type": "string", "description": "одна фраза: почему тут нужно подумать глубже"}},
+        "required": ["reason"]}}}
+
+
+class Escalate(Exception):
+    """Быстрая модель попросила глубокую (think_deeper) до любых действий хода."""
+
+    def __init__(self, reason: str = ""):
+        super().__init__(reason)
+        self.reason = reason
 DONE_MAX = 600               # «Успел сделать: …» в ответе
 
 # чужой текст
@@ -633,7 +657,19 @@ class Agent:
             guard = TurnGuard(urls=owner_urls | mine | await self._trusted_urls(), web_search=self._search_on(),
                               ringing=await self._ringing())
             try:
-                final = await self._run(msgs, deep=deep_v, turn=turn, actions=actions, guard=guard, said=said)
+                try:
+                    final = await self._run(msgs, deep=deep_v, turn=turn, actions=actions, guard=guard,
+                                            said=said, escalate=not deep_v and bool(self.cfg.llm_auto_deep))
+                except Escalate as esc:
+                    # тот же ход заново — глубокой моделью; быстрая ничего не успела сделать
+                    log.info("ход: быстрая модель передала вопрос глубокой (%s)", esc.reason)
+                    deep_v = True
+                    await _stop(slow)
+                    slow = None
+                    await self._say(ESCALATE_TEXT)
+                    system = await self._system(text, deep=True, extra="\n".join(extra))
+                    msgs = await self._history(system, fallback=text, owner_urls=set())
+                    final = await self._run(msgs, deep=True, turn=turn, actions=actions, guard=guard, said=said)
             finally:
                 await self._keep_urls(guard.fresh)
                 await self._keep_urls(mine | guard.pinned, owner=True)
@@ -815,12 +851,15 @@ class Agent:
             "SELECT id, text, challenge, (nag_active=0) AS snoozed FROM reminders WHERE status='active' "
             "AND (nag_active=1 OR (challenge=1 AND snooze_at IS NOT NULL)) ORDER BY id"),
             [], "долбящие напоминания")
+        # знакомство: пока о нём мало фактов и разговоров — сдержанно, без панибратства
+        talked = await _safe(lambda: db.scalar("SELECT COUNT(*) FROM messages WHERE role='user'"), 0, "реплики")
+        new_owner = len(facts or []) < ACQUAINTED_FACTS and int(talked or 0) < ACQUAINTED_MESSAGES
         return persona.build_system(
             name=self.cfg.bot_name, owner_name=await self._owner_name(),
             now=timeutil.fmt_now_for_prompt(self.cfg.tz),
             facts=facts or [], opinions=opinions or [], journal=journal, summary=summary or "",
             nags=nags or [], deep=deep, extra=extra,
-            owner_gender=str(getattr(self.cfg, "owner_gender", "m") or "m"))
+            owner_gender=str(getattr(self.cfg, "owner_gender", "m") or "m"), new_owner=new_owner)
 
     async def _history(self, system: str, *, tail: str | None = None, fallback: str = "",
                        owner_urls: set[str] | None = None) -> list[dict]:
@@ -853,8 +892,19 @@ class Agent:
         return [{"role": "system", "content": system}, *msgs]
 
     # ── цикл «модель → инструменты» ──────────────────────────────────────────
+    async def _say(self, text: str) -> None:
+        """Короткое служебное сообщение владельцу прямо по ходу (не в историю)."""
+        notifier = self.ctx.services.notifier
+        if notifier is None:
+            return
+        try:
+            await notifier.send(text, silent=True)
+        except Exception as e:
+            log.debug("служебное сообщение не ушло: %s", e)
+
     async def _run(self, msgs: list[dict], *, deep: bool, turn: ToolContext, actions: list[Action],
-                   guard: TurnGuard | None = None, said: list[str] | None = None) -> str:
+                   guard: TurnGuard | None = None, said: list[str] | None = None,
+                   escalate: bool = False) -> str:
         """Модель ↔ инструменты до LLM_MAX_STEPS шагов → итоговый текст. `msgs` дополняется на месте,
         `actions` — вызовами инструментов, `said` — текстом, который модель написала рядом с вызовами
         (всё это видно вызывающему даже при ошибке модели).
@@ -863,6 +913,8 @@ class Agent:
         остатка, на новый шаг времени нет — итог из того, что успели. После успешного инструмента
         пустой итог модели — не ошибка: ответом становится сказанное по ходу или «Готово.»."""
         schemas = tbase.schemas(self.cfg) or None
+        if escalate:
+            schemas = (schemas or []) + [THINK_DEEPER_SCHEMA]
         guard = guard if guard is not None else TurnGuard()
         said = said if said is not None else []
         loop = asyncio.get_running_loop()
@@ -885,12 +937,22 @@ class Agent:
                 final = resp.content or ""
                 note = _finish_note(resp)
                 break
+            deeper = [c for c in resp.tool_calls if c.name == THINK_DEEPER]
+            if deeper and escalate and not actions and not said \
+                    and len(resp.tool_calls) == len(deeper):
+                args = _loads(deeper[0].arguments)
+                raise Escalate(str(args.get("reason") or "") if isinstance(args, dict) else "")
             _keep_said(said, resp.content)
             msgs.append(resp.to_message())
             # вызовы одного шага модель написала до того, как увидела их результаты: чужой текст из этого
             # шага на них повлиять не мог — «заражены» они, только если ход был «заражён» до шага
             step_tainted = guard.tainted
             for call in resp.tool_calls:
+                if call.name == THINK_DEEPER:       # поздно (уже действовал) или вместе с другими — отвечай сам
+                    msgs.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(
+                        {"ok": False, "error": "глубокий режим сейчас не включить — ответь сам"},
+                        ensure_ascii=False)})
+                    continue
                 blocked = guard.check(call.name, call.arguments, tainted=step_tainted)
                 if blocked is not None:
                     log.warning("ход: %s не выполнен — защита от чужого текста", call.name)

@@ -55,6 +55,28 @@ def _secrets(cfg: Any) -> tuple[str, ...]:
     return tuple(out)
 
 
+class TwinHint(logging.Filter):
+    """Telegram отвечает Conflict на getUpdates — значит, этого бота опрашивает ещё одна копия
+    (второе окно, второй компьютер, сервер). Сообщения тогда достаются то одной, то другой. Подсказка
+    по-русски — не чаще раза в 10 минут; сама запись aiogram не глушится."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._last = 0.0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args if isinstance(record.args, tuple) else ()
+        if args and "Conflict" in str(args[0]):
+            import time
+            now = time.monotonic()
+            if now - self._last > 600:
+                self._last = now
+                log.warning("Похоже, бот запущен дважды: другая копия тоже забирает сообщения (второе окно, "
+                            "другой компьютер или сервер). Закрой лишнюю — иначе ответы будут то от одной, "
+                            "то от другой, а та, что без OWNER_ID, скажет «я ещё не настроен».")
+        return True
+
+
 def setup_logging(level: str, secrets: tuple[str, ...] = ()) -> None:
     root = logging.getLogger()
     before = set(root.handlers)
@@ -64,6 +86,9 @@ def setup_logging(level: str, secrets: tuple[str, ...] = ()) -> None:
             handler.setFormatter(RedactingFormatter(LOG_FORMAT, secrets))
     for name in NOISY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+    disp = logging.getLogger("aiogram.dispatcher")
+    if not any(isinstance(f, TwinHint) for f in disp.filters):
+        disp.addFilter(TwinHint())
 
 
 def problems_text(cfg: config.Settings) -> str:
@@ -71,6 +96,26 @@ def problems_text(cfg: config.Settings) -> str:
     return ("Baltia Oracle не может запуститься — не хватает настроек:\n"
             + "\n".join(f"  • {p}" for p in probs)
             + "\nЗаполни .env (рядом с папкой oracle) и запусти снова: python -m oracle")
+
+
+async def remember_owner(cfg: config.Settings, db: Any) -> config.Settings:
+    """OWNER_ID из .env запоминаем в базе. Пропал из .env (архив распакован поверх, .env пересоздан) —
+    берём прежнего владельца из базы, а не впадаем в «режим настройки». Сменить владельца — вписать
+    новый OWNER_ID: он перезапишет запомненный."""
+    from dataclasses import replace
+    try:
+        stored = int(await db.kv_get("owner_id", 0) or 0)
+    except (TypeError, ValueError):
+        stored = 0
+    if cfg.owner_id:
+        if stored != cfg.owner_id:
+            await db.kv_set("owner_id", int(cfg.owner_id))
+        return cfg
+    if stored:
+        log.warning("OWNER_ID в .env пуст — беру прежнего владельца из базы (%s). Впиши OWNER_ID=%s в .env, "
+                    "чтобы не зависеть от базы", stored, stored)
+        return replace(cfg, owner_id=stored)
+    return cfg
 
 
 def is_setup_mode(cfg: config.Settings) -> bool:
@@ -247,6 +292,7 @@ async def main() -> int:
               f"(/backup): README, «Восстановление из копии».", file=sys.stderr)
         await bot.session.close()
         return 1
+    cfg = await remember_owner(cfg, db)
     llm = LLM(cfg)
     try:
         from . import tools

@@ -739,7 +739,7 @@ async def test_news_digest_prompt_and_answer(nctx):
         assert title in user
     assert "https://a.test/1" in user and "Лента А" in user and "b.test" in user
     assert "Старое" not in user                       # старше суток
-    for must in ("Факты:", "Кто что говорит:", "Чего не говорят", "Мой взгляд:", "5–7"):
+    for must in ("Факт", "заявление", "умолчани", "Мой взгляд:", "4–6", "не длиннее 2000"):
         assert must in system
     assert "ТЕМА" not in system
 

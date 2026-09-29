@@ -196,6 +196,7 @@ async def test_two_plain_messages_stay_two_turns(live):
 
 # ── T7: голосовые ответы — в порядке вопросов ───────────────────────────────
 async def test_voice_replies_keep_order(live, db):
+    await live.deps.db.kv_set("tts_mode", "mirror")
     S = 0.02
     texts = ["расскажи новости за сегодня", "спасибо"]
 

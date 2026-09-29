@@ -22,6 +22,14 @@ from oracle.tools import birthdays as bd
 from oracle.tools import calendar as cal
 from oracle.tools import reminders as rem
 
+@pytest.fixture(autouse=True)
+def _owner_already_talked(monkeypatch):
+    """Эти тесты — про механику ежедневных задач; «владелец ещё не писал» проверяется отдельно."""
+    async def yes(self):
+        return True
+    monkeypatch.setattr(Scheduler, "_owner_talked", yes)
+
+
 from conftest import FakeLLM, FakeNotifier
 
 MSK = ZoneInfo("Europe/Moscow")

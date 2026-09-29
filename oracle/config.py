@@ -186,7 +186,8 @@ class Settings:
     llm_api_keys: tuple[str, ...] = ()        # запасные ключи: DEEPSEEK_API_KEY=ключ1,ключ2
     llm_base_url: str = "https://api.deepseek.com"
     llm_model: str = "deepseek-flash"          # быстрый режим: обычный диалог и инструменты
-    llm_model_deep: str = "deepseek-flash"     # глубокий режим: с размышлением
+    llm_model_deep: str = "deepseek-v4-pro"    # глубокий режим: с размышлением (не принят API — уходим на llm_model)
+    llm_auto_deep: bool = True                 # быстрая модель сама переключается на глубокую на сложном
     llm_fast_thinking: str = "off"             # off | low | high — размышление в быстром режиме
     llm_deep_effort: str = "high"              # low | high | max — глубина в глубоком режиме
     llm_temperature: float = 1.0
@@ -217,7 +218,7 @@ class Settings:
     whisper_compute_type: str = "int8"
     show_transcript: bool = True
     tts_voice: str = "ru-RU-DmitryNeural"
-    tts_default: str = "mirror"                # off | mirror (голосом на голос) | always
+    tts_default: str = "off"                   # off | mirror (голосом на голос) | always
     tts_max_chars: int = 1500
 
     # расписание (локальное время, "" — выключено)
@@ -350,7 +351,10 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
         llm_api_keys=api_keys,
         llm_base_url=base_url,
         llm_model=_get("LLM_MODEL", "deepseek-flash"),
-        llm_model_deep=_get("LLM_MODEL_DEEP", _get("LLM_MODEL", "deepseek-flash")),
+        # по умолчанию у DeepSeek глубокая — Pro; у другого провайдера — та же, что быстрая
+        llm_model_deep=_get("LLM_MODEL_DEEP", "deepseek-v4-pro" if "deepseek" in base_url.lower()
+                            else _get("LLM_MODEL", "deepseek-flash")),
+        llm_auto_deep=_bool("LLM_AUTO_DEEP", True),
         llm_fast_thinking=fast_thinking,
         llm_deep_effort=deep_effort,
         llm_temperature=_float("LLM_TEMPERATURE", 1.0),
@@ -376,7 +380,7 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
         whisper_compute_type=_get("WHISPER_COMPUTE_TYPE", "int8"),
         show_transcript=_bool("SHOW_TRANSCRIPT", True),
         tts_voice=_get("TTS_VOICE", "ru-RU-DmitryNeural"),
-        tts_default=_get("TTS_DEFAULT", "mirror").lower(),
+        tts_default=_get("TTS_DEFAULT", "off").lower(),
         tts_max_chars=_int("TTS_MAX_CHARS", 1500),
         morning_brief_time=_hhmm("MORNING_BRIEF_TIME", "08:00"),
         news_digest_time=_hhmm("NEWS_DIGEST_TIME", "09:00"),

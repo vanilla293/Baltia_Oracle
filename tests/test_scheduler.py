@@ -18,6 +18,14 @@ from oracle.services.scheduler import Scheduler
 
 from conftest import FakeNotifier
 
+@pytest.fixture(autouse=True)
+def _owner_already_talked(monkeypatch):
+    """Эти тесты — про механику ежедневных задач; «владелец ещё не писал» проверяется отдельно."""
+    async def yes(self):
+        return True
+    monkeypatch.setattr(Scheduler, "_owner_talked", yes)
+
+
 MSK = ZoneInfo("Europe/Moscow")
 UTC = timezone.utc
 QUIET = dict(morning_brief_time="", birthday_time="", news_digest_time="", reflection_time="")
@@ -886,11 +894,12 @@ async def test_morning_brief_fallback_on_empty_answer(brief_data, fake_llm):
 
 
 async def test_morning_brief_empty_day(ctx, fake_llm):
+    # утром пустой день — не повод писать: ни модели, ни сообщения
+    assert await brief.morning_brief(ctx) == "" and fake_llm.calls == []
+    # а если он сам спросил (/today) — ответ есть
     fake_llm.script = [lambda m, kw: (_ for _ in ()).throw(LLMError("нет связи"))]
-    text = await brief.morning_brief(ctx)
-    assert text.startswith("Доброе утро. Сегодня понедельник, 28 сентября.")
-    assert "Встреч и напоминаний на сегодня нет — день свободный." in text
-    assert "📅" not in text and "📌" not in text
+    text = await brief.today_brief(ctx)
+    assert text and "📅" not in text and "📌" not in text
 
 
 async def test_morning_brief_journal_push_when_no_tasks(ctx, fake_llm):
@@ -905,9 +914,10 @@ async def test_morning_brief_ignores_stale_journal(ctx, clock, fake_llm):
     await ctx.db.execute("INSERT INTO journal(content, created_at) VALUES(?, ?)",
                          ("старая запись про юриста", timeutil.iso(clock.now - timedelta(days=10))))
     fake_llm.script = ["ок"]
-    await brief.morning_brief(ctx)
+    assert await brief.morning_brief(ctx) == ""        # старый дневник — не повестка: утро пустое, молчим
+    await brief.morning_brief(ctx, mode="now")
     user = fake_llm.calls[-1]["messages"][1]["content"]
-    assert "юриста" not in user and "Твой дневник: свежих записей нет." in user
+    assert "юриста" not in user
 
 
 async def test_morning_brief_source_failure_is_isolated(brief_data, fake_llm, monkeypatch):
@@ -988,3 +998,18 @@ def test_parse_hhmm_and_texts():
     assert sch.reminder_buttons({"id": 3, "kind": "followup"}) is None
     for b in (sch.reminder_buttons({"id": 10**9, "kind": "reminder"}), sch.reminder_buttons({"id": 10**9, "kind": "wake"})):
         assert all(len(cb.encode()) <= 64 for r in b for _, cb in r)
+
+
+async def test_daily_digest_and_brief_wait_until_owner_talks(ctx, clock, fake_llm, monkeypatch):
+    """Первый запуск: незнакомцу ни сводок, ни дайджестов — пока он сам не написал боту."""
+    monkeypatch.undo()                                    # настоящий _owner_talked, без автофикстуры
+    from dataclasses import replace as _r
+    sctx = ctx
+    sctx.cfg = _r(ctx.cfg, morning_brief_time="08:00", news_digest_time="08:30", birthday_time="", reflection_time="")
+    s = Scheduler(sctx)
+    await s.tick()
+    await ctx.services.drain()
+    assert ctx.services.notifier.sent == [] and fake_llm.calls == []
+    assert await ctx.db.kv_get("job:morning") == "2026-09-28" and await ctx.db.kv_get("job:news") == "2026-09-28"
+    await ctx.db.add_message("user", "привет")
+    assert await s._owner_talked() is True

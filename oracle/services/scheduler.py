@@ -312,6 +312,7 @@ class Scheduler:
         self._job_text: dict[tuple[str, date], str] = {}   # готовый текст сводки/дайджеста — для повтора
         self._job_sent: dict[tuple[str, date], list[int]] = {}   # …и сколько его кусков уже дошло
         self._last_summary: datetime | None = None
+        self._talked = False                               # владелец уже писал боту (кэш _owner_talked)
         self._summary_task: asyncio.Task | None = None
         self.ticks = 0
 
@@ -789,11 +790,23 @@ class Scheduler:
                 self._job_fails.pop(name, None)
                 log.info("ежедневная задача %s за %s пропущена: не вышло за %s", name, day, CATCH_UP)
                 continue
+            if name in ("morning", "news") and not await self._owner_talked():
+                # он ещё ни слова не сказал — сводки и дайджесты незнакомцу не шлём (первый запуск)
+                await self.ctx.db.kv_set(key, day.isoformat())
+                log.info("ежедневная задача %s за %s пропущена: владелец ещё не писал боту", name, day)
+                continue
             retry = self._job_retry_at.get(name)
             if retry is not None and now < retry:
                 continue
             log.info("ежедневная задача %s за %s", name, day)
             self._job_tasks[name] = self.ctx.services.spawn(self._run_daily(name, day), name=f"job:{name}")
+
+    async def _owner_talked(self) -> bool:
+        """Владелец хоть раз написал боту сам (не /start). До этого ежедневные рассылки молчат."""
+        if not self._talked:
+            self._talked = bool(await self.ctx.db.scalar(
+                "SELECT 1 FROM messages WHERE role='user' LIMIT 1"))
+        return self._talked
 
     async def _run_daily(self, name: str, day: date) -> None:
         """Фон: задача; сделана — отметка в kv, нет — повтор через JOB_RETRY (отметки нет, так что и
