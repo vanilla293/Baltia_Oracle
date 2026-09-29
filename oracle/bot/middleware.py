@@ -1,4 +1,4 @@
-"""Бот личный: слушается только владельца (OWNER_ID) и только в личке.
+"""Бот личный: слушается только своих (OWNER_ID и тех, кого главный пустил) и только в личке.
 
 Внешний (outer) middleware на сообщения и нажатия кнопок. Владелец проходит дальше — но только
 из личного чата с ботом: в группе, куда бота кто-то добавил, его /backup или /memory ушли бы
@@ -42,6 +42,12 @@ from .. import timeutil
 log = logging.getLogger("oracle.bot.middleware")
 
 STRANGER_TEXT = "Это личный бот."
+ACCESS_TEXT = {        # ответ чужому на /start, когда можно попроситься
+    "sent": "Это личный бот. Спросил хозяина, можно ли тебе им пользоваться, — если пустит, я напишу.",
+    "wait": "Хозяину уже передал — жди, если пустит, я напишу.",
+    "denied": STRANGER_TEXT,
+    "full": STRANGER_TEXT,
+}
 NO_ACCESS = "Нет доступа"
 SETUP_HINT = "Я ещё не настроен. Пришли /start — скажу твой Telegram id, его нужно вписать в .env."
 REPLY_EVERY = 3600.0              # чужому — не чаще раза в час
@@ -82,8 +88,14 @@ class OwnerOnly(BaseMiddleware):
     и callback_query."""
 
     def __init__(self, cfg: Any, *, stranger_reply: bool = True, reply_every: float = REPLY_EVERY,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 allowed: Callable[[Any], bool] | None = None,
+                 on_request: Callable[[Any], Awaitable[str]] | None = None):
+        """allowed(uid) — кого пускать (по умолчанию — только OWNER_ID); on_request(user) — чужой прислал
+        /start: спросить главного, пустить ли (→ "sent" | "wait" | "denied" | "full")."""
         self.cfg = cfg
+        self.allowed = allowed or (lambda uid: is_owner(cfg, uid))
+        self.on_request = on_request
         self.stranger_reply = stranger_reply
         self.reply_every = float(reply_every)
         self._clock = clock
@@ -110,7 +122,7 @@ class OwnerOnly(BaseMiddleware):
                        event: TelegramObject, data: dict[str, Any]) -> Any:
         user = getattr(event, "from_user", None)
         uid = getattr(user, "id", None)
-        if is_owner(self.cfg, uid):
+        if uid is not None and not isinstance(uid, bool) and self.allowed(uid):
             chat = event_chat(event)
             chat_type = getattr(chat, "type", None)
             if chat_type == "private":
@@ -127,7 +139,7 @@ class OwnerOnly(BaseMiddleware):
             if isinstance(event, CallbackQuery):
                 await event.answer(NO_ACCESS, show_alert=True)
             elif isinstance(event, Message):
-                await self._stranger_message(event, uid)
+                await self._stranger_message(event, uid, user)
         except Exception as e:   # ответ чужому — не повод падать
             log.debug("ответ постороннему не ушёл: %r", e)
         return None
@@ -143,9 +155,17 @@ class OwnerOnly(BaseMiddleware):
         log.warning("посторонний %s написал боту — игнорирую. Если это ты, OWNER_ID в .env неверный: "
                     "впиши OWNER_ID=%s и перезапусти бота", uid, uid)
 
-    async def _stranger_message(self, message: Message, uid: int | None) -> None:
+    async def _stranger_message(self, message: Message, uid: int | None, user: Any = None) -> None:
         owner_set = bool(int(getattr(self.cfg, "owner_id", 0) or 0))
         chat_type = getattr(getattr(message, "chat", None), "type", "private")
+        if owner_set and self.on_request is not None and uid is not None and chat_type == "private" \
+                and is_start(message.text):
+            status = await self.on_request(user)
+            log.info("чужой %s прислал /start — запрос доступа: %s", uid, status)
+            text = ACCESS_TEXT.get(status)
+            if text and (status == "sent" or self._may_reply(uid)):
+                await message.answer(text, parse_mode=None)
+            return
         if not owner_set:
             if uid is not None and is_start(message.text):
                 log.info("OWNER_ID не задан; /start от %s — отправляю ему id", uid)
@@ -195,18 +215,21 @@ class TurnOrder(BaseMiddleware):
     обновлений (фильтры роутера — уже потом, и они бывают асинхронными)."""
 
     def __init__(self) -> None:
-        self._tail: asyncio.Future | None = None
-        self._last: _Ticket | None = None
+        # у каждого человека своя очередь: второй не ждёт, пока бот ответит первому
+        self._tails: dict[Any, asyncio.Future] = {}
+        self._lasts: dict[Any, _Ticket] = {}
 
     async def __call__(self, handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
                        event: TelegramObject, data: dict[str, Any]) -> Any:
-        prev = self._tail
+        who = getattr(getattr(event, "from_user", None), "id", None)
+        prev = self._tails.get(who)
         mine = asyncio.get_running_loop().create_future()
-        self._tail = mine
+        self._tails[who] = mine
         ticket = _Ticket(prev, mine, event=event)
-        if self._last is not None and self._last.mine is prev:
-            self._last.next = ticket
-        self._last = ticket
+        last = self._lasts.get(who)
+        if last is not None and last.mine is prev:
+            last.next = ticket
+        self._lasts[who] = ticket
         token = _ticket.set(ticket)
         try:
             return await handler(event, data)

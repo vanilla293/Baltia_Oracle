@@ -175,7 +175,8 @@ def resolve_timezone(name: str) -> str | None:
 class Settings:
     # Telegram
     bot_token: str = ""
-    owner_id: int = 0
+    owner_id: int = 0                          # главный (первый в OWNER_ID)
+    owner_ids: tuple[int, ...] = ()            # все из OWNER_ID=id1,id2 — у каждого своё пространство
     telegram_api_url: str = ""                 # свой Bot API сервер; пусто — api.telegram.org
     bot_name: str = "Оракул"
     owner_name: str = ""
@@ -261,6 +262,11 @@ class Settings:
             return ZoneInfo("UTC")
 
     @property
+    def owners(self) -> tuple[int, ...]:
+        """Все, кому бот служит по .env: главный первым."""
+        return self.owner_ids or ((self.owner_id,) if self.owner_id else ())
+
+    @property
     def tz_ok(self) -> bool:
         """TIMEZONE распознан (иначе cfg.tz молча стал UTC и все будильники съедут)."""
         return _zone_ok(self.timezone)
@@ -322,6 +328,15 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
     base_url = _get("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/")
     ds_key, other_key = _get("DEEPSEEK_API_KEY"), _get("LLM_API_KEY")
     api_key = (ds_key or other_key) if "deepseek" in base_url.lower() else (other_key or ds_key)
+    # OWNER_ID=главный[,второй,…] — несколько людей, у каждого своё пространство
+    owner_ids: tuple[int, ...] = ()
+    for part in re.split(r"[,;\s]+", _get("OWNER_ID", "")):
+        try:
+            v = int(part)
+        except ValueError:
+            continue
+        if v > 0 and v not in owner_ids:
+            owner_ids += (v,)
     # несколько ключей через запятую: основной + запасные (кончились деньги / отозван — берём следующий)
     api_keys = tuple(dict.fromkeys(k.strip() for k in re.split(r"[,;\s]+", api_key) if k.strip()))
     api_key = api_keys[0] if api_keys else ""
@@ -342,7 +357,8 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
 
     return Settings(
         bot_token=_get("BOT_TOKEN"),
-        owner_id=_int("OWNER_ID", 0),
+        owner_id=owner_ids[0] if owner_ids else 0,
+        owner_ids=owner_ids,
         telegram_api_url=_get("TELEGRAM_API_URL", "").rstrip("/"),
         bot_name=_get("BOT_NAME", "Оракул"),
         owner_name=_get("OWNER_NAME", ""),

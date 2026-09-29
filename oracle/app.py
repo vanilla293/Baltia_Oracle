@@ -62,14 +62,14 @@ class TwinHint(logging.Filter):
 
     def __init__(self) -> None:
         super().__init__()
-        self._last = 0.0
+        self._last: float | None = None
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args if isinstance(record.args, tuple) else ()
         if args and "Conflict" in str(args[0]):
             import time
             now = time.monotonic()
-            if now - self._last > 600:
+            if self._last is None or now - self._last > 600:
                 self._last = now
                 log.warning("Похоже, бот запущен дважды: другая копия тоже забирает сообщения (второе окно, "
                             "другой компьютер или сервер). Закрой лишнюю — иначе ответы будут то от одной, "
@@ -130,9 +130,11 @@ def bot_commands() -> list:
     return [BotCommand(command=c, description=d) for c, d in COMMANDS]
 
 
-def build_dispatcher(cfg: config.Settings, deps: Any) -> Any:
-    """Dispatcher: «только владелец и только в личке» на сообщения и кнопки, очередь реплик по порядку
-    прихода, учёт обновлений в работе (`dp.oracle_inflight`) + роутер обработчиков."""
+def build_dispatcher(cfg: config.Settings, deps: Any, tenants: Any = None) -> Any:
+    """Dispatcher: «только свои и только в личке» на сообщения и кнопки, очередь реплик по порядку
+    прихода (у каждого своя), учёт обновлений в работе (`dp.oracle_inflight`) + роутеры.
+    tenants (oracle.tenants.Tenants) — несколько людей: у каждого свой роутер со своим пространством,
+    а впереди — роутер главного для управления людьми. Без tenants — один владелец, один роутер."""
     from aiogram import Dispatcher
 
     from .bot.handlers import build_router
@@ -141,12 +143,20 @@ def build_dispatcher(cfg: config.Settings, deps: Any) -> Any:
     dp = Dispatcher()
     inflight = Inflight()
     dp.update.outer_middleware(inflight)
-    guard = OwnerOnly(cfg)
+    if tenants is not None:
+        guard = OwnerOnly(cfg, allowed=tenants.allowed, on_request=tenants.request_access)
+    else:
+        guard = OwnerOnly(cfg)
     dp.message.outer_middleware(guard)
-    dp.message.outer_middleware(TurnOrder())       # после guard: билеты — только репликам владельца
+    dp.message.outer_middleware(TurnOrder())       # после guard: билеты — только репликам своих
     dp.edited_message.outer_middleware(guard)
     dp.callback_query.outer_middleware(guard)
-    dp.include_router(build_router(deps))
+    if tenants is not None:
+        from .bot.admin import build_admin_router
+        dp.include_router(build_admin_router(tenants))
+        tenants.attach(dp)
+    else:
+        dp.include_router(build_router(deps))
     dp.oracle_inflight = inflight                   # type: ignore[attr-defined]
     return dp
 
@@ -318,6 +328,7 @@ async def main() -> int:
     services.userbot = userbot
     agent: Any = None
     scheduler: Any = None
+    tenants: Any = None
     dp: Any = None
     ub_task: asyncio.Task | None = None
     try:
@@ -345,7 +356,15 @@ async def main() -> int:
                     log.warning("не сказал о прерванных разборах: %s", e)
         deps = Deps(cfg=cfg, db=db, llm=llm, ctx=ctx, agent=agent, stt=stt, tts=tts, userbot=userbot,
                     news=news, notifier=notifier, scheduler=scheduler)
-        dp = build_dispatcher(cfg, deps)
+        if not setup:                           # несколько людей: у каждого своё пространство
+            from .tenants import Tenant, Tenants
+            tenants = Tenants(cfg, bot, llm=llm, stt=stt, tts=tts,
+                              primary=Tenant(uid=int(cfg.owner_id), cfg=cfg, db=db, ctx=ctx, deps=deps,
+                                             agent=agent, scheduler=scheduler, news=news))
+            await tenants.load()
+            if len(tenants.by_id) > 1:
+                log.info("людей в боте: %d (у каждого своё пространство)", len(tenants.by_id))
+        dp = build_dispatcher(cfg, deps, tenants)
         try:
             from aiogram.types import BotCommandScopeAllPrivateChats
             await bot.set_my_commands(bot_commands(), scope=BotCommandScopeAllPrivateChats())
@@ -373,6 +392,7 @@ async def main() -> int:
             ub_task.cancel()
             await asyncio.gather(ub_task, return_exceptions=True)
         await _quietly("userbot", userbot.stop())
+        await _quietly("пространства других людей", tenants.stop_all() if tenants is not None else None)
         await _quietly("фоновые задачи", services.drain(timeout=5.0))
         await _quietly("новости", news.aclose())
         await _quietly("распознавание", stt.aclose())
