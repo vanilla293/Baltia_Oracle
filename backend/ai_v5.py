@@ -209,7 +209,8 @@ SYN_WAIT = ("ЖДАТЬ", "ЖДЕМ", "ЖДУ", "ПОДОЖДАТЬ", "ОЖИД�
 # «вне рынка» зависит от позиции: без позиции — не входить (ожидание), в позиции — выйти; «NONE/PASS» — не ответ
 SYN_OUT = ("ВНЕ_РЫНКА", "STAY_OUT", "NO_TRADE", "OUT_OF_MARKET")
 SYN_HOLD = ("ДЕРЖАТЬ", "ДЕРЖИМ", "ДЕРЖУ", "ПОДЕРЖАТЬ", "ОСТАВИТЬ", "HOLD", "KEEP")
-SYN_CLOSE = ("ЗАКРЫТЬ", "ЗАКРЫВАЕМ", "ЗАКРЫВАТЬ", "ВЫЙТИ", "ВЫХОД", "ВЫХОДИМ", "СЛИТЬ", "СЛИВАЕМ", "ЗАФИКСИРОВАТЬ",
+SYN_CLOSE = ("ЗАКРЫТЬ", "ЗАКРЫВАЕМ", "ЗАКРЫВАТЬ", "ВЫЙТИ", "ВЫХОД", "ВЫХОДИМ", "ВЫХОДИТЬ", "СЛИТЬ", "СЛИВАЕМ", "СЛИВАТЬ",
+             "ЗАФИКСИРОВАТЬ",
              "ФИКСИРОВАТЬ", "ФИКСИРУЕМ", "ЗАБРАТЬ", "ЗАБРАТЬ_ПРИБЫЛЬ", "ФИКСИРОВАТЬ_ПРИБЫЛЬ", "ЗАФИКСИРОВАТЬ_ПРИБЫЛЬ",
              "CLOSE", "EXIT", "FLAT", "TAKE_PROFIT", "CLOSE_ALL")
 SYN_CANCEL = ("ОТМЕНИТЬ", "ОТМЕНА", "ОТМЕНЯЕМ", "ОТКАЗ", "ОТКАЗАТЬСЯ", "CANCEL", "SKIP", "ABORT")
@@ -241,10 +242,28 @@ def decision_raw(obj: Any, keys: tuple[str, ...] = DECISION_KEYS) -> str:
     return ""
 
 
+_CLAUSE_SEP = r"\s*(?:[—–;:()]|(?<!\d),(?!\d)|\s-\s)\s*"   # запятая между цифрами (99,5) — не граница
+_NEG_WORDS = frozenset({"НЕ", "НЕТ", "НЕЛЬЗЯ", "NOT", "NO", "DONT"})
+_CONTRAST = frozenset({"НО", "ОДНАКО", "BUT"})
+
+
+def _prefix_hit(words: list[str], idx: dict[str, set[str]]) -> tuple[str | None, int]:
+    """Самое длинное слово словаря в начале (все / 3 / 2 / 1 слово): (токен | None, сколько слов съедено)."""
+    for n in (len(words), 3, 2, 1):
+        if 0 < n <= len(words):
+            hit = idx.get("_".join(words[:n]))
+            if hit:
+                return (next(iter(hit)) if len(hit) == 1 else None), n
+    return None, 0
+
+
 def decision_of(raw: Any, table: dict[str, tuple[str, ...]]) -> str | None:
     """Каноническое решение узла или None. table: {токен узла: синонимы} (токен сам себе синоним).
-    Сначала весь ответ целиком, потом первые 3 / 2 / 1 слова; попадание в два разных решения → None;
-    «НЕ …» в начале и «… или …» → None (не угадываем ни в сторону входа, ни в сторону ожидания)."""
+    Решение — в первом предложении ответа (граница — запятая, тире, «;», «:», скобка):
+      «КУПИТЬ_СЕЙЧАС — анализ подтверждён» → КУПИТЬ_СЕЙЧАС; «ДЕРЖАТЬ, не надо сливать» → ДЕРЖАТЬ.
+    Отрицание сразу после слова решения в том же предложении — переспрос: «ВОЙТИ нельзя», «ВОЙТИ не сейчас, …».
+    «X, но не …» — переспрос. «НЕ X — Y» — решение Y, только если Y другое, чем отвергнутый X («НЕ СЛИВАТЬ —
+    держать» → держать; «НЕ ВХОДИТЬ — вход выше 101» → переспрос). «… или …» и два решения сразу — переспрос."""
     import re
     text = str(raw or "")
     words = _norm_word(text).split()
@@ -259,24 +278,28 @@ def decision_of(raw: Any, table: dict[str, tuple[str, ...]]) -> str | None:
         return next(iter(whole)) if len(whole) == 1 else None
     if "ИЛИ" in words or "OR" in words:
         return None                        # «ВОЙТИ или ЖДАТЬ» — решения нет, переспросить
-    if words[0] in _NEGATIONS:
-        # «НЕ СЛИВАТЬ — держать», «НЕ ВХОДИТЬ, ЖДАТЬ»: решение — во второй части после знака; без неё — нет решения
-        parts = re.split(r"\s*[—–;:,]\s*|\s+-\s+", text.strip(), maxsplit=1)
-        if len(parts) == 2 and parts[1].strip() and _norm_word(parts[1]).split()[:1] != words[:1]:
-            rest = _norm_word(parts[1]).split()
-            if rest and rest[0] not in _NEGATIONS:
-                return decision_of(parts[1], table)
-        return None                        # «НЕ ВХОДИТЬ» — чего хочет ИИ, не сказано: переспросить
-    for n in (len(words), 3, 2, 1):
-        if n > len(words):
-            continue
-        hit = idx.get("_".join(words[:n]))
-        if hit:
-            tail = words[n:n + 2]
-            if tail and (tail[0] in _POST_NEG or "_".join(tail) in _POST_NEG):
-                return None                # «ВОЙТИ нельзя» — не решение войти
-            return next(iter(hit)) if len(hit) == 1 else None
-    return None
+    clauses = [c for c in re.split(_CLAUSE_SEP, text.strip()) if _norm_word(c)]
+    if not clauses:
+        return None
+    first = _norm_word(clauses[0]).split()
+    if first[0] in _NEGATIONS:
+        # «НЕ СЛИВАТЬ — держать»: отвергнутое — в первом предложении, выбранное — дальше, и они должны различаться
+        neg, _n = _prefix_hit(first[1:], idx) if len(first) > 1 else (None, 0)
+        if neg is None or len(clauses) < 2:
+            return None
+        alt = decision_of(", ".join(clauses[1:]), table)
+        return alt if alt is not None and alt != neg else None
+    hit, n = _prefix_hit(first, idx)
+    if hit is None:
+        return None
+    tail = first[n:n + 2]
+    if tail and (tail[0] in _NEG_WORDS or "_".join(tail) in _POST_NEG):
+        return None                        # «ВОЙТИ нельзя», «ВОЙТИ не сейчас» — не решение войти
+    if len(clauses) > 1:
+        nxt = _norm_word(clauses[1]).split()
+        if nxt and nxt[0] in _CONTRAST and any(w in _NEG_WORDS for w in nxt):
+            return None                    # «ВОЙТИ, но не сейчас»
+    return hit
 
 
 def _side_syn(side: str | None, long_syn: tuple[str, ...], short_syn: tuple[str, ...]) -> tuple[str, ...]:
@@ -298,7 +321,7 @@ def review_table(in_pos: bool, side: str | None = None) -> dict[str, tuple[str, 
 
 def door_table(side: str | None) -> dict[str, tuple[str, ...]]:
     """Проверка входа у двери: BUY/LONG — «войти» только для плана лонга, SELL/SHORT — только для шорта."""
-    return {"ВОЙТИ": SYN_ENTER + _side_syn(side, SYN_BUY, SYN_SELL), "ЖДАТЬ": SYN_WAIT, "ОТМЕНИТЬ": SYN_CANCEL}
+    return {"ВОЙТИ": SYN_ENTER + _side_syn(side, SYN_BUY, SYN_SELL), "ЖДАТЬ": SYN_WAIT + SYN_OUT, "ОТМЕНИТЬ": SYN_CANCEL}
 
 
 def profit_table(side: str | None) -> dict[str, tuple[str, ...]]:
