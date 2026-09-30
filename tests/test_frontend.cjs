@@ -244,3 +244,185 @@ test('final chat snapshot uses the completed run text, even after the next answe
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(restored, 'short completed answer');
 });
+
+// ═══ 5.4.4 «честная панель» (воля владельца: «если реально не запущен пилот — то не мигает, если запущен — то работает»):
+// одно правило pilotRun(status) для точки фазы, пилюли «Пилот», полосы степпера и мини-шапки; события пилота из шины —
+// в хронику, не в вечный progress; плашки связи/отказа/маржи; метки решений перепроверки; «нет тиков» вместо молчания.
+const NOW = 1_800_000_000;
+const HM = new Intl.DateTimeFormat('ru-RU', {timeZone: 'Europe/Moscow', hour: '2-digit', minute: '2-digit'});
+function honestContext(extra = {}) {
+  const c = context({fmtNum: String, fmtInt: String, fmtLeft: m => Math.round(m) + ' мин', _hm: HM,
+    ST: {mission: {}}, renderStepper() {}, pollMission() {}, ...extra});
+  c.run(section('const DEC_RU =', 'const mmOf ='));
+  c.run(section('// ═══ 5.4.4 «честная панель»', 'const HANDOFF_KIND = {'));
+  return c;
+}
+const armed = (pilot, extra) => ({ticker: 'AFLT', phase: 'armed', live: true, pilot: {state: 'ЗАСАДА', mode: 'real', ...pilot}, ...extra});
+
+test('only a really ticking pilot animates; stopped, absent, dead-feed and closed-market pilots stay still', () => {
+  const c = honestContext(), run = st => c.ctx.pilotRun(st, NOW);
+  let r = run(armed({ticking: true, loop_alive: true, feed: {ok: true, kind: 'ok'}}));
+  assert.equal(r.on, true); assert.equal(r.kind, 'ticking'); assert.equal(c.ctx.phaseStill(r), '');
+  r = run(armed({ticking: false, loop_alive: true, last_tick_ts: NOW - 700, feed: {ok: false, kind: 'auth', reason: 'токен отозван (401)'}}));
+  assert.equal(r.on, false); assert.equal(r.level, 'err'); assert.equal(r.text, 'пилот не тикает: токен отозван (401)');
+  assert.equal(c.ctx.phaseStill(r), ' still halt');
+  r = run(armed({ticking: false, loop_alive: true, last_tick_ts: NOW - 300, feed: {ok: true, kind: 'ok'}}));
+  assert.equal(r.on, false); assert.equal(r.level, 'warn'); assert.equal(r.text, 'пилот не тикает: нет тиков 5 мин');
+  assert.equal(c.ctx.phaseStill(r), ' still stale');
+  assert.equal(run(armed({ticking: true, loop_alive: false})).on, false);   // петля мертва — флаг ticking не спасает
+  assert.equal(run(null).kind, 'none');
+  assert.equal(run(armed(null, {pilot: null})).kind, 'none');
+  for (const phase of ['stopped', 'panic', 'error']) assert.equal(run(armed({ticking: true}, {phase})).on, false);
+  assert.equal(run(armed({ticking: true}, {live: false})).on, false);   // фаза от прошлого, задачи пилота нет
+  const closed = run(armed({ticking: true}, {phase: 'closed'}));
+  assert.equal(closed.kind, 'closed'); assert.equal(closed.on, false); assert.equal(c.ctx.phaseStill(closed), ' still');
+  assert.equal(run({phase: 'council', pilot: null}).on, true);   // идёт совет — живой прогон
+  // старый бэкенд без ticking: по tick_ts; без единого тика дольше пары минут — «не тикает»
+  assert.equal(run(armed({tick_ts: NOW - 5})).on, true);
+  r = run(armed({tick_ts: NOW - 600})); assert.equal(r.on, false); assert.equal(r.legacy, true);
+  r = run(armed({tick_ts: null, uptime_h: 1.2})); assert.equal(r.on, false); assert.equal(r.text, 'пилот не тикает: нет тиков — ни одного с запуска');
+});
+
+test('Pilot pill follows status: heartbeat while ticking, PRO minutes while reviewing, still/halt when not ticking', () => {
+  const c = honestContext(), M = c.ctx.ST.mission, ms = NOW * 1000;
+  const settle = (st, live = false) => c.ctx.stepperSettle(st, c.ctx.pilotRun(st, NOW), live, NOW);
+  Object.assign(M, {news: {status: 'start', at: ms - 30000}, review: {status: 'start', at: ms - 30000}, profit: {status: 'start', at: ms - 30000},
+    guard: {status: 'start', at: ms - 2000}, pilot: {status: 'progress', at: ms - 30000}});
+  const st = armed({ticking: true, review_busy: false, profit: {busy: false}, guard: {busy: false}});
+  assert.equal(settle(st), true);
+  assert.equal(M.news.status, 'done');     // отчёт 2, A2: CancelledError — ни done, ни error; совет не идёт — стадия закрыта
+  assert.equal(M.review.status, 'done');   // A4: review_busy false — перепроверка не идёт
+  assert.equal(M.profit.status, 'done');   // A3: ранний return — profit.busy false
+  assert.equal(M.guard.status, 'start');   // событие свежее 8 с — статус мог его ещё не увидеть
+  assert.equal(M.pilot.status, 'tick'); assert.equal(M.pilot.note, 'работает');   // A1: не вечный progress
+  settle(armed({ticking: true, review_busy: true, review_started_ts: NOW - 180}));
+  assert.equal(M.pilot.status, 'progress'); assert.equal(M.pilot.note, 'PRO думает 3 мин');
+  settle(armed({ticking: false, feed: {ok: false, kind: 'auth', reason: 'токен отозван'}}));
+  assert.equal(M.pilot.status, 'halt'); assert.equal(M.pilot.note, 'не тикает');
+  settle(armed({ticking: false, last_tick_ts: NOW - 100}));
+  assert.equal(M.pilot.status, 'still');
+  settle(armed({ticking: true}, {phase: 'stopped'}));
+  assert.equal(M.pilot.status, ''); assert.equal(M.pilot.note, 'остановлен');
+  assert.equal(settle(armed({ticking: true}, {phase: 'stopped'})), false);   // без изменений — без перерисовки
+  // идёт совет: пилюлю и стадии ведут события прогона
+  M.news = {status: 'start', at: ms - 30000}; M.pilot = {status: 'start', at: ms};
+  settle({phase: 'council', pilot: null}, true);
+  assert.equal(M.news.status, 'start'); assert.equal(M.pilot.status, 'start');
+});
+
+test('stepper bar flows only while something runs; a ticking pilot counts as reached and shows its note', () => {
+  const host = element(), det = element();
+  const c = context({ST: {mission: {}}, STEPS: {mission: ['exec', 'pilot']}, STAGE_RU: {exec: 'Приказ', pilot: 'Пилот'}, bScrollTo() {},
+    $: id => id === '#stepper-mission' ? host : id === '#detail-mission' ? det : element()});
+  c.run(section('function counterText(stage, c) {', "document.addEventListener('click', e => {   // действия из блока ошибки стадии"));
+  c.run(section('function put(sel, html) {', '/* ───────── навигация'));
+  c.ctx.ST.mission = {exec: {status: 'done'}, pilot: {status: 'tick', note: 'работает', tip: 'пилот работает'}};
+  c.run("renderStepper('mission')");
+  assert.doesNotMatch(host.innerHTML, /progress live/); assert.match(host.innerHTML, /width:100%/);
+  assert.match(host.innerHTML, /class="stg tick"/); assert.match(host.innerHTML, /· работает/);
+  c.ctx.ST.mission.pilot = {status: 'progress', note: 'PRO думает 3 мин'};
+  c.run("renderStepper('mission')");
+  assert.match(host.innerHTML, /progress live/);
+  c.ctx.ST.mission.pilot = {status: 'halt', note: 'не тикает'};
+  c.run("renderStepper('mission')");
+  assert.doesNotMatch(host.innerHTML, /progress live/); assert.match(host.innerHTML, /class="d">!</);
+  assert.doesNotMatch(det.innerHTML, /stg-err/);   // не тикает — не «ошибка стадии» с кнопками пересмотра
+});
+
+test('pilot bus events after the council go to the chronicle and never start a new run or pin the pill', () => {
+  const renders = [];
+  const c = honestContext({renderStepper: k => renders.push(k), SCOPE_KEY: {mission: 'mission'}, STAGE_RU: {}, CHAIR_STAGES: ['analysis'],
+    CH: {mission: {live: false, stages: {}}}, Chat: {onStage() {}}, Xp: {onStage() {}},
+    mkChairs() { throw Error('pilot event started a new run'); }, setSub() { throw Error('pilot event lit the tab'); },
+    renderChairs() {}, updateChair() {}, loadRun() {}, refreshState() {}, pilotCountdown() {}});
+  c.run(section('function onStage(ev) {', 'function onText(ev) {'));
+  Object.assign(c.ctx.S, {runs: {mission: 'r1'}}); c.ctx.S.mission.ticker = 'SBER';
+  c.ctx.ST.mission = {pilot: {status: 'tick', note: 'работает'}};
+  const ev = o => c.ctx.onStage({type: 'v5', scope: 'mission', ticker: 'SBER', ...o});
+  ev({run_id: 'r1', stage: 'pilot', status: 'progress', detail: 'ВОШЁЛ: лонг 10 лот @284.6', data: {fill: {new: true}}});
+  ev({run_id: 'r1', stage: 'pilot', status: 'progress', detail: 'ВОШЁЛ: лонг 10 лот @284.6'});   // повтор — одна запись
+  assert.equal(c.ctx.ST.mission.pilot.status, 'tick');
+  assert.equal(c.ctx.S.mission.pev.length, 1); assert.equal(c.ctx.S.mission.pev[0].fill, true);
+  assert.equal(c.ctx.ST.mission.pilot.detail, 'ВОШЁЛ: лонг 10 лот @284.6');
+  c.ctx.S.mission.reviewAt = Date.now() + 1800e3;   // review_ts переставлен при старте перепроверки — это следующая плановая, не текущая
+  ev({run_id: 'r0', stage: 'review', status: 'start', detail: 'перепроверка'});   // run_id прошлого совета — не новый прогон
+  assert.equal(c.ctx.ST.mission.review.status, 'start'); assert.equal(c.ctx.ST.mission.pilot.status, 'tick');
+  assert.ok(c.ctx.S.mission.reviewBusyAt > 0); assert.equal(c.ctx.S.mission.reviewAt, null);   // отсчёт — «PRO перепроверяет… N»
+  ev({run_id: 'r0', stage: 'review', status: 'done', detail: 'ДЕРЖАТЬ: тест'});
+  assert.equal(c.ctx.S.mission.reviewBusyAt, null);
+  ev({run_id: 'r0', stage: 'pilot', status: 'progress', ticker: 'GAZP', detail: 'чужой тикер'});
+  assert.equal(c.ctx.S.mission.pev.length, 1);
+  assert.ok(renders.length >= 2);
+});
+
+test('chronicle: a level/wake or market-open cue is not «to the council»; unknown kinds are a neutral cue', () => {
+  const c = context();
+  c.run(section('const HANDOFF_KIND = {', 'function pilotLines(st) {'));
+  assert.equal(c.run('HANDOFF_KIND.wait_level[1]'), 'уровень → PRO');
+  assert.equal(c.run('HANDOFF_KIND.open[1]'), 'открытие → PRO');
+  assert.equal(c.run("(HANDOFF_KIND['новый_вид'] || HANDOFF_OTHER)[1]"), 'повод');
+  assert.equal(c.run('HANDOFF_KIND.council[1]'), 'совету');
+  const html = section('const evAll = [', '].sort((a, b) => (b.ts || 0) - (a.ts || 0));');
+  assert.match(html, /HANDOFF_KIND\[h\.kind\] \|\| HANDOFF_OTHER/);
+  assert.doesNotMatch(html, /HANDOFF_KIND\[h\.kind\] \|\| HANDOFF_KIND\.council/);
+});
+
+test('review decisions show the label the model saw: ambush, HOLD in position, silence in words', () => {
+  const c = honestContext(), L = r => c.ctx.revLabel(r);
+  assert.equal(L({choice: 'КУПИТЬ_СЕЙЧАС', label: 'КУПИТЬ — засада откат @296.6'}), 'КУПИТЬ — засада откат @296.6');
+  assert.equal(L({choice: 'ЖДЁМ', label: 'ДЕРЖАТЬ', in_pos: true}), 'ДЕРЖАТЬ');
+  assert.equal(L({choice: 'ЖДЁМ', in_pos: true}), 'ДЕРЖАТЬ');   // старый бэкенд без label
+  assert.equal(L({choice: 'ЖДЁМ', in_pos: false}), 'ЖДЁМ');
+  assert.equal(L({choice: 'КУПИТЬ_СЕЙЧАС'}), 'КУПИТЬ');
+  assert.equal(L({choice: 'ПРОДАТЬ_СЕЙЧАС', entry: 301.5, entry_kind: 'прорыв'}), 'ПРОДАТЬ — засада прорыв @301.5');
+  assert.equal(L({choice: 'КУПИТЬ_СЕЙЧАС', entry: 301.5, entry_kind: 'сейчас'}), 'КУПИТЬ');
+  assert.match(L({choice: 'НЕТ_ОТВЕТА'}), /решения не было/);
+  assert.match(L({choice: 'ЖДЁМ', label: 'НЕ_РАЗОБРАН'}), /решения не было/);
+});
+
+test('pilot card alerts: dead broker link red, flaky link amber, exchange refusal, exhausted margin, wake alarm', () => {
+  const c = honestContext();
+  const A = pilot => { const st = armed(pilot); return c.ctx.pilotAlerts(st, c.ctx.pilotRun(st, NOW), NOW); };
+  let a = A({ticking: false, feed: {ok: false, kind: 'auth', reason: 'токен отозван (401)'}});
+  assert.equal(a.length, 1); assert.equal(a[0].level, 'err'); assert.equal(a[0].text, 'Т-Банк: токен отозван (401)');
+  a = A({ticking: true, feed: {ok: false, kind: 'network', reason: 'таймаут чтения'}});
+  assert.equal(a[0].level, 'warn'); assert.equal(a[0].text, 'Т-Банк: таймаут чтения');
+  a = A({ticking: true, feed: {ok: true, kind: 'ok'}, broker_refusal: {what: 'вход', code: 30042, text: 'недостаточно средств', count: 3, ts: NOW - 60},
+    account_limits: {buy_lots: 0, sell_lots: 195, note: ''}});
+  const ref = a.find(x => x.kind === 'refusal'), mar = a.find(x => x.kind === 'margin');
+  assert.equal(ref.text, `Биржа отклонила вход: недостаточно средств (3 раза, ${HM.format(new Date((NOW - 60) * 1000))})`); assert.equal(ref.level, 'err');
+  assert.equal(mar.text, 'Покупка недоступна: маржа исчерпана · продажа до 195 лот');
+  assert.equal(A({ticking: true, feed: {ok: true}, broker_refusal: null, account_limits: {buy_lots: 12, sell_lots: 40}}).length, 0);
+  a = A({ticking: false, last_tick_ts: NOW - 200, feed: {ok: true}});
+  assert.equal(a.length, 1); assert.equal(a[0].kind, 'tick'); assert.match(a[0].text, /^пилот не тикает: нет тиков/);
+  assert.equal(c.ctx.nRaz(1), '1 раз'); assert.equal(c.ctx.nRaz(22), '22 раза'); assert.equal(c.ctx.nRaz(12), '12 раз');
+  // «Tinkoff» в шапке — по связи живого пилота, а не «токен задан» (отчёт 1: зелёный при отозванном токене)
+  const tk = feed => c.ctx.tkLink({app: {tinkoff: true}, mission: {missions: {AFLT: armed({feed})}}});
+  assert.equal(tk({ok: false, kind: 'auth', reason: 'токен отозван'}).cls, 'bad');
+  assert.equal(tk({ok: false, kind: 'network', reason: 'таймаут'}).cls, 'off');
+  assert.equal(tk({ok: true, kind: 'ok'}).cls, 'ok');
+  assert.equal(tk({ok: false, kind: 'closed'}).cls, 'ok');   // рынок закрыт — не поломка связи
+  assert.equal(c.ctx.tkLink({app: {tinkoff: false}}).cls, 'bad');
+  assert.match(c.ctx.wakeHtml({level: 296.6, dir: 'up', why: 'пробой 296.6', ref: 295, ts: NOW - 60, fired: null}), /будильник у 296\.6 \(вверх\)/);
+  assert.match(c.ctx.wakeHtml({level: 290, dir: 'down', fired: NOW}), /будильник у 290 \(вниз\) · сработал/);
+  assert.equal(c.ctx.wakeHtml(null), '');
+});
+
+test('problems panel says «нет тиков» instead of silence and does not repeat what the server said', () => {
+  const c = honestContext(), mem = {};
+  const ms = {ticker: 'AFLT', phase: 'in_position', live: true, pilot: {state: 'В_ПОЗИЦИИ', mode: 'real', price_ts: null, tick_ts: null, uptime_h: 0}};
+  assert.equal(c.ctx.pilotProblems(ms, {open: true}, [], NOW, mem).length, 0);   // только что запущен — не сразу
+  const later = c.ctx.pilotProblems(ms, {open: true}, [], NOW + 40, mem);
+  const ids = list => list.map(x => x.id).join(',');   // массивы из vm-контекста — сравниваем строкой
+  assert.equal(ids(later), 'price'); assert.match(later[0].text, /^Пилот AFLT: нет тиков/);
+  assert.equal(c.ctx.pilotProblems(ms, {open: false}, [], NOW + 40, {}).length, 0);   // рынок закрыт — не тревожим
+  const dead = {...ms, pilot: {...ms.pilot, ticking: false, loop_alive: true, feed: {ok: false, kind: 'auth', reason: 'токен отозван (401)'}}};
+  let pp = c.ctx.pilotProblems(dead, {open: true}, [], NOW + 40, {});
+  assert.equal(ids(pp), 'pl:feed'); assert.equal(pp[0].level, 'err'); assert.equal(pp[0].act, 'keys');
+  pp = c.ctx.pilotProblems(dead, {open: true}, [{kind: 'tinkoff', level: 'err', text: 'Tinkoff: токен отозван'}], NOW + 40, {});
+  assert.equal(pp.length, 0);
+  const stale = {...ms, pilot: {...ms.pilot, ticking: false, loop_alive: true, last_tick_ts: NOW - 400, price_ts: NOW - 400, uptime_h: 2}};
+  pp = c.ctx.pilotProblems(stale, {open: true}, [], NOW, {});
+  assert.equal(ids(pp), 'pl:tick');   // «не тикает» — одна запись, без второй «цена не обновлялась»
+  assert.equal(c.ctx.pilotProblems(stale, {open: true}, [{kind: 'pilot', level: 'warn', text: 'Пилот AFLT не тикает 6 мин'}], NOW, {}).length, 0);
+});

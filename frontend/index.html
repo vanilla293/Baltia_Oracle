@@ -458,6 +458,17 @@ textarea.inp{min-height:180px;resize:vertical;line-height:1.55;font-size:16px}
 .phase.in_position{background:var(--green-soft);color:var(--green)} .phase.stopped{background:var(--gray-soft);color:var(--muted)}
 .phase.panic,.phase.error{background:var(--red-soft);color:var(--red)} .phase.idle{background:var(--gray-soft);color:var(--muted)}
 .phase.closed{background:var(--amber-soft);color:var(--amber-text)} .phase.closed .d{animation:pulse 2.4s infinite}   /* рыночные часы: рынок закрыт — пилот стопорится до открытия */
+/* 5.4.4 «честная панель»: мигает только живой пилот (status().pilot.ticking; без поля — по tick_ts); не тикает — статично и серым,
+   связь с брокером мертва (feed auth/rights/cert) — красным; рынок закрыт — своим цветом, без пульса. Пилюля «Пилот» в степпере:
+   tick — сердцебиение (пилот тикает), progress — PRO думает, still — стоит, halt — связь с брокером мертва */
+.phase.still .d{animation:none} .phase.still.stale{background:var(--gray-soft);color:var(--muted)} .phase.still.halt{background:var(--red-soft);color:var(--red)}
+.stg.tick{background:var(--accent-soft);color:var(--accent)} .stg.tick .d{background:var(--accent);color:var(--on-accent);animation:pulse 2s ease-in-out infinite}
+.stg.still .d{background:var(--faint);color:var(--card-solid)} .stg.halt{background:var(--red-soft);color:var(--red)} .stg.halt .d{background:var(--red);color:#fff}
+.m-run{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 10px;font-size:13px;color:var(--muted);line-height:1.45;overflow-wrap:anywhere} .m-run.halt{color:var(--red)} .m-run:empty{display:none}
+.pl-alerts{display:flex;flex-direction:column;gap:6px;margin:0 0 12px} .pl-alerts:empty{display:none}
+.pl-al{padding:8px 12px;border-radius:12px;font-size:13.5px;line-height:1.45;border:1px solid var(--line2);background:var(--sunk);color:var(--muted);overflow-wrap:anywhere}
+.pl-al.err{background:var(--red-soft);border-color:var(--red-line);color:var(--red)} .pl-al.warn{background:var(--amber-soft);border-color:var(--amber-line);color:var(--amber-text)} .pl-al b{margin-right:4px;font-weight:800}
+.wake-ln{margin-top:6px}
 .order{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
 .order .tile .v{font-size:19px}
 .order .entry .v{color:var(--accent)} .order .take .v{color:var(--green)} .order .stop .v{color:var(--red)}
@@ -1579,7 +1590,7 @@ const mmCls = (p, dflt) => mmOf(p, dflt) === 'PRO' ? 'pro' : 'flash';
 const PLAY_RU = {long: 'Только лонг', short: 'Только шорт', mixed: 'Смешанно', auto: 'Пусть решает ИИ'};
 const MISSION_PHASE_PAST = new Set(['armed', 'entering', 'in_position', 'done', 'stopped', 'panic', 'closed']);   // совет и запуск пилота уже позади
 const PHASE_RU = {council: 'Совет думает', armed: 'Засада', entering: 'Вхожу', in_position: 'В позиции', stopped: 'Стоп', panic: 'Паника', idle: 'Жду план', error: 'Ошибка', closed: 'Рынок закрыт'};
-const STAGE_RU = {start: 'Старт', collect: 'Сбор новостей', triage: 'Отбор к бирже', characterize: 'Разметка', group: 'Потоки', snapshot: 'Цены', analysis: 'Аналитик', critique: 'Критик', verdict: 'Вердикт', summary: 'Итог', distribute: 'Раскладка', compress: 'Сжатие взгляда', present: 'Рамка', impact: 'Влияние', dossier: 'Досье', exec: 'Приказ', pilot: 'Пилот', review: 'Перепроверка', council: 'Совет', scan: 'Сканер стакана', news: 'Новости по инструменту', scout: 'Разведка данных', partners: 'Связанные бумаги', guard: 'Мягкий стоп', take: 'Мягкий тейк', triage: 'Триаж события', puncture: 'Прокол сканера', explain: 'Толмач', memory: 'Память миссии', context: 'Состояние терминала', answer: 'Ответ', end: 'Готово'};
+const STAGE_RU = {start: 'Старт', collect: 'Сбор новостей', triage: 'Отбор к бирже', characterize: 'Разметка', group: 'Потоки', snapshot: 'Цены', analysis: 'Аналитик', critique: 'Критик', verdict: 'Вердикт', summary: 'Итог', distribute: 'Раскладка', compress: 'Сжатие взгляда', present: 'Рамка', impact: 'Влияние', dossier: 'Досье', exec: 'Приказ', pilot: 'Пилот', review: 'Перепроверка', council: 'Совет', scan: 'Сканер стакана', news: 'Новости по инструменту', scout: 'Разведка данных', partners: 'Связанные бумаги', guard: 'Мягкий стоп', take: 'Мягкий тейк', triage: 'Триаж события', puncture: 'Прокол сканера', entry: 'Проверка входа', profit: 'Мысль о прибыли', explain: 'Толмач', memory: 'Память миссии', context: 'Состояние терминала', answer: 'Ответ', end: 'Готово'};
 const STEPS = {council: ['collect', 'triage', 'characterize', 'group', 'snapshot', 'scout', 'analysis', 'critique', 'verdict', 'summary', 'distribute'],
                human: ['compress', 'snapshot', 'scout', 'analysis', 'critique', 'verdict', 'summary', 'distribute', 'present'],
                mission: ['scan', 'dossier', 'partners', 'news', 'scout', 'analysis', 'critique', 'verdict', 'exec', 'present', 'pilot']};   // v5.2: разведка FLASH перед аналитиком; v5.3: связанные бумаги (корреляции)
@@ -1875,11 +1886,12 @@ function renderStepper(key) {
   const el = $('#stepper-' + key); if (!el) return;
   const st = ST[key]; const order = STEPS[key].slice();
   Object.keys(st).forEach(k => { if (!order.includes(k) && k !== 'start' && k !== 'end') order.push(k); });
-  const done = order.filter(s => (st[s] || {}).status === 'done').length, live = order.some(s => /start|progress/.test((st[s] || {}).status || ''));
+  // 5.4.4: пилюля «Пилот» живёт по статусу (tick / still / halt — путь до пилота пройден, полоса полная); полоса «течёт» только при start/progress
+  const done = order.filter(s => /^(done|tick|still|halt)$/.test((st[s] || {}).status || '')).length, live = order.some(s => /^(start|progress)$/.test((st[s] || {}).status || ''));
   const any = Object.keys(st).length;
-  el.innerHTML = order.map((s, i) => { const c = st[s] || {}; const cnt = counterText(s, c); const cs = c.status || '';
-    return `<span class="stg ${esc(cs)}" title="${esc(c.detail || STAGE_RU[s] || s)}"><span class="d">${cs === 'done' ? '✓' : cs === 'error' ? '!' : i + 1}</span>${esc(STAGE_RU[s] || s)}${cnt ? `<span class="c">· ${esc(cnt)}</span>` : ''}</span>`; }).join('') +
-    (any ? `<div class="progress ${live ? 'live' : ''}" style="flex:1 1 100%"><i style="width:${Math.round(done / order.length * 100)}%"></i></div>` : '');
+  put(el, order.map((s, i) => { const c = st[s] || {}; const cnt = counterText(s, c) || c.note || ''; const cs = c.status || '';
+    return `<span class="stg ${esc(cs)}" title="${esc(c.tip || c.detail || STAGE_RU[s] || s)}"><span class="d">${cs === 'done' ? '✓' : cs === 'error' || cs === 'halt' ? '!' : cs === 'still' ? '–' : i + 1}</span>${esc(STAGE_RU[s] || s)}${cnt ? `<span class="c">· ${esc(cnt)}</span>` : ''}</span>`; }).join('') +
+    (any ? `<div class="progress ${live ? 'live' : ''}" style="flex:1 1 100%"><i style="width:${Math.round(done / order.length * 100)}%"></i></div>` : ''));   // put: без перерисовки при том же HTML — опрос статуса не перезапускает анимации
   const last = Object.values(st).sort((a, b) => (b.at || 0) - (a.at || 0))[0];
   const det = $('#detail-' + key);
   const errs = order.filter(s => (st[s] || {}).status === 'error');   // ═══ фаза 3 · W2: ошибка стадии раскрывается текстом и предлагает действие
@@ -1962,10 +1974,20 @@ function onStage(ev) {
   const key = SCOPE_KEY[ev.scope]; if (!key) return;
   if (key === 'mission' && (ev.stage === 'explain' || ev.stage === 'memory')) { Xp.onStage(ev); return; }   // v5.3: толмач и память — своя карточка, не стадия конвейера
   if (ev.stage === 'end') { if (ev.status === 'error' && ev.error) toast((key === 'mission' ? 'Миссия' : 'Совет') + ': ' + ev.error, 'err'); setTimeout(refreshState, 300); if (key === 'mission') setTimeout(pollMission, 400); return; }   // конец прогона — сразу снимок, в степпер не кладём
-  if (S.runs[key] !== ev.run_id) { S.runs[key] = ev.run_id; ST[key] = {}; CH[key] = mkChairs(); CH[key].live = true; renderChairs(key); setSub(key, 'run', 'идёт'); if (key === 'mission') S.mission.ticker = ev.ticker || S.mission.ticker; }
+  // 5.4.4: пилот шлёт события на run_id последнего совета (перепроверка, трос, дверь, «pilot · progress») — это не новый прогон: степпер и кресла не сбрасываем, вкладку не «зажигаем»
+  const pilotEv = key === 'mission' && ((ev.stage === 'pilot' && ev.status === 'progress') || PILOT_STAGES.has(ev.stage));
+  if (S.runs[key] !== ev.run_id) {
+    if (pilotEv) { if (!CH[key].live) S.runs[key] = ev.run_id; }
+    else { S.runs[key] = ev.run_id; ST[key] = {}; CH[key] = mkChairs(); CH[key].live = true; renderChairs(key); setSub(key, 'run', 'идёт'); if (key === 'mission') S.mission.ticker = ev.ticker || S.mission.ticker; }
+  }
+  if (key === 'mission' && ev.stage === 'pilot' && ev.status === 'progress') { pilotEvent(ev); return; }   // разовое событие пилота (вход, закрытие, передача совету) — запись в хронике, пилюля «Пилот» — по статусу
   const st = ST[key][ev.stage] || {stage: ev.stage};
   st.status = ev.status; if (ev.n != null) st.n = ev.n; if (ev.total != null) st.total = ev.total; if (ev.detail) st.detail = ev.detail; st.at = Date.now();
   ST[key][ev.stage] = st; renderStepper(key);
+  if (key === 'mission' && ev.stage === 'review') {   // 5.4.4: отсчёт сразу — «PRO перепроверяет… N» со старта, а после ответа — свежий статус со следующей плановой
+    const on = ev.status === 'start' || ev.status === 'progress';
+    S.mission.reviewBusyAt = on ? (S.mission.reviewBusyAt || Date.now()) : null; if (on) S.mission.reviewAt = null; else setTimeout(pollMission, 600);
+    pilotCountdown(); }
   if (CHAIR_STAGES.includes(ev.stage)) {
     const c = CH[key].stages[ev.stage];
     if (ev.status === 'start') { c.status = 'live'; c.t0 = Date.now(); c.t1 = 0; }
@@ -2044,7 +2066,7 @@ function applyState(st, missionContext) {   // 5.4.1 (логика 5.4.0): missi
   const app = st.app || {}, keys = st.keys || {};
   $('#astro').textContent = (st.astro || {}).line || '';
   $('#ind-ds').className = 'ind ' + (app.deepseek ? 'ok' : 'bad');
-  $('#ind-tk').className = 'ind ' + (app.tinkoff ? 'ok' : 'bad');
+  { const tk = tkLink(st), el = $('#ind-tk'); el.className = 'ind ' + tk.cls; el.title = tk.title; }   // 5.4.4: связь по живому пилоту, не «токен задан»
   { const tg = tgState(), ti = $('#ind-tg'); if (ti) { ti.className = 'ind ' + ({ok: 'ok', bad: 'bad', wait: 'wait'}[tg.lvl] || ''); ti.title = 'Telegram-бот: ' + tg.text; } }   // фаза 4 · W3
   marketInd(st.market);
   const m = $('#ind-mode'); m.className = 'ind ' + (app.dry ? 'dry' : 'live'); m.textContent = app.dry ? 'СУХОЙ' : 'БОЕВОЙ';
@@ -2097,7 +2119,8 @@ function applyState(st, missionContext) {   // 5.4.1 (логика 5.4.0): missi
   if (missionFresh && S.mission.ticker && missions[S.mission.ticker]) applyMissionStatus(missions[S.mission.ticker]);
   else if (missionFresh && !S.mission.status && !liveByKey.mission && $('#mission-body').dataset.ticker !== 'none') { $('#mission-body').dataset.ticker = 'none'; renderMission(null); }
   const nMis = Object.keys(missions).length;
-  if (missionFresh && !liveByKey.mission) setSub('mission', nMis ? 'ok' : '', nMis ? (ms.active ? ms.active + ' · ' + (PHASE_RU[(missions[ms.active] || {}).phase] || '') : nMis + ' мисс.') : 'пусто');
+  if (missionFresh && !liveByKey.mission) { const am = missions[ms.active], ar = pilotRun(am || null);   // 5.4.4: пилот не тикает — и в навигации (красным, если связь с брокером мертва)
+    setSub('mission', nMis ? (ar.kind === 'stale' && ar.level === 'err' ? 'err' : 'ok') : '', nMis ? (ms.active ? ms.active + ' · ' + (PHASE_RU[(am || {}).phase] || '') + (ar.kind === 'stale' ? ' · не тикает' : '') : nMis + ' мисс.') : 'пусто'); }
 
   // журнал
   const tr = st.trades || {};
@@ -2379,14 +2402,150 @@ async function pollMission() {
 function applyMissionStatus(st) {
   S.mission.revision = (S.mission.revision || 0) + 1;   // 5.4.1 (логика 5.4.0): каждый принятый снимок — новая ревизия (её сверяют pollMission и refreshState)
   S.mission.status = st; S.mission.statusAt = Date.now();
-  const p = st.pilot || {};
-  if (p.next_review_in_s != null) { S.mission.reviewAt = Date.now() + p.next_review_in_s * 1000; S.mission.reviewPeriod = Math.max(S.mission.reviewPeriod || 0, p.next_review_in_s); } else S.mission.reviewAt = null;
+  const p = st.pilot || {}, run = S.mission.run = pilotRun(st), rt0 = num(p.review_started_ts);
+  // 5.4.4: PRO перепроверяет — отсчёт от начала раздумий (review_started_ts), следующую плановую (review_ts переставлен при старте) не показываем как текущую;
+  //        без review_busy (старый бэкенд) — по событию шины «перепроверка · start»; свежее событие (< 8 с) статус мог ещё не увидеть; пилот не тикает / стоит — отсчёта нет
+  const rv = ST.mission.review, evAt = rv && /^(start|progress)$/.test(rv.status || '') ? (rv.at || Date.now()) : null;
+  S.mission.reviewBusyAt = 'review_busy' in p ? (p.review_busy ? (rt0 ? rt0 * 1000 : (S.mission.reviewBusyAt || evAt || Date.now())) : (evAt && Date.now() - evAt < STAGE_SETTLE_S.pilot * 1000 ? evAt : null)) : evAt;
+  if (p.next_review_in_s != null) S.mission.reviewPeriod = Math.max(S.mission.reviewPeriod || 0, p.next_review_in_s);
+  S.mission.reviewAt = p.next_review_in_s != null && !S.mission.reviewBusyAt && (run.on || run.kind === 'council') ? Date.now() + p.next_review_in_s * 1000 : null;
   if (st.run_id && st.run_id !== S.runs.mission && st.phase !== 'council') { S.runs.mission = st.run_id; chairsFromTexts('mission', st.texts, false); }
   // миссия живёт, а инструмент для новой не набран — лаунчер сворачиваем (один раз на миссию; руками можно развернуть)
   if (st.phase && st.phase !== 'stopped' && st.phase !== 'idle' && !$('#tk-search').value.trim() && S.mission.launcherAuto !== st.ticker) { S.mission.launcherAuto = st.ticker; $('#launcher-body').classList.add('hidden'); $('#btn-launcher-toggle').textContent = 'Новая миссия'; }
   renderMission(st);
 }
-const HANDOFF_KIND = {council: ['amber', 'совету', 'полный совет: три кресла и шифровальщик'], pilot: ['indigo', 'PRO', 'повод пилота — решит дежурный PRO на перепроверке'], shock: ['indigo', 'PRO', 'событие: резкий ход цены — внеплановая перепроверка дежурного PRO'], news: ['indigo', 'PRO', 'событие: серьёзная новость дозора — внеплановая перепроверка дежурного PRO'], stop: ['amber', 'трос → совет', 'мягкий стоп: цена за триггером, дежурный ИИ (PRO или FLASH по настройке) решил ждать и передал задачу Совету — полный совет без очереди'], take: ['amber', 'тейк → совет', 'мягкий тейк: цена у цели, дежурный ИИ решил подержать (прибыль заперта триггером) и передал задачу Совету — полный совет без очереди'], entry: ['amber', 'дверь → совет', 'проверка входа у двери (5.4.1): перед заявкой PRO посмотрел на живой рынок, не подтвердил вход — план снят, позван полный совет без очереди'], profit: ['amber', 'прибыль → совет', 'мысль о прибыли (5.4.1): позиция в плюсе, PRO позвал полный совет без очереди — позиция держится, триггер подтянут к lock_price'], puncture: ['teal', 'прокол', 'прокол сканера: полоса устойчивого вакуума со стойкостью выше порога и важной стороной (вход / предупреждение / угроза / подтверждение) — блок ПРОКОЛ СКАНЕРА первым в ситуации: в позиции через триаж ИИ, вне рынка — сразу дежурный PRO']};
+// ═══ 5.4.4 «честная панель» (воля владельца 30.09.2026: «сделай, чтобы он без перерыву не мигал: если реально не запущен пилот —
+//     то не мигает, если запущен — то работает»). Одно правило pilotRun(st) — для точки фазы, пилюли «Пилот», полосы степпера,
+//     мини-шапки и отсчёта перепроверки: status().pilot.ticking (петля жива и тик был недавно), loop_alive, feed (связь с Т-Банком),
+//     review_busy / review_started_ts (PRO думает); без полей 5.4.4 (старый бэкенд, мок) — по tick_ts, а без него — по фазе и live.
+//     Разовые события пилота из шины — запись в хронике (pilotEvent), а не вечный progress пилюли (отчёт 2, A1) ═══
+const PILOT_STAGES = new Set(['review', 'guard', 'take', 'triage', 'entry', 'profit', 'puncture']);   // стадии пилота вне прогона совета (run_id — последнего совета)
+const FEED_RED = new Set(['auth', 'rights', 'cert']);   // токен не принят / нет прав / сертификат: брокер не работает — красным
+const FEED_RU = {auth: 'токен не принят', rights: 'у токена нет прав на торговлю', cert: 'сертификат не принят', network: 'нет связи с сервером', no_price: 'цена не приходит', closed: 'рынок закрыт'};
+const PILOT_TICK_STALE_S = 90;   // старый бэкенд без ticking: тик старше — «не тикает» (петля — 1,5 с, при закрытом рынке — 30 с)
+const STAGE_SETTLE_S = {pilot: 8, council: 8, present: 180, silent: 1200};   // степпер: start/progress старше — сверка со статусом (busy пилота / совет не идёт / рамка фоном / без флага)
+const LABEL_ENTRY = {'КУПИТЬ_СЕЙЧАС': 'КУПИТЬ', 'ПРОДАТЬ_СЕЙЧАС': 'ПРОДАТЬ'};   // как mission._choice_label: канон кода → метка, которую видела модель
+function fmtAge(s) { s = Math.max(0, Math.round(s)); return s < 90 ? s + ' с' : fmtLeft(s / 60); }
+function fmtHM(ts) { const n = num(ts); return n ? _hm.format(new Date(n * 1000)) : ''; }
+function nRaz(n) { const a = Math.abs(n) % 100, b = a % 10; return n + ' ' + (a > 10 && a < 20 ? 'раз' : b >= 2 && b <= 4 ? 'раза' : 'раз'); }
+function feedWhy(feed) { return String((feed && (feed.reason || FEED_RU[feed.kind] || feed.kind)) || 'нет связи'); }
+function pilotRun(st, now) {   // {on — анимировать, kind: none|stopped|council|ticking|closed|stale, level: off|ok|warn|err, text, reason, age — с последнего тика, last, busy — PRO думает, legacy — без полей 5.4.4}
+  now = now != null ? now : Date.now() / 1000;
+  const R = (on, kind, level, text, x) => Object.assign({on, kind, level, text, reason: '', age: null, last: null, busy: false, legacy: false}, x);
+  if (!st) return R(false, 'none', 'off', 'миссии нет');
+  const phase = st.phase || 'idle';
+  if (phase === 'council') return R(true, 'council', 'ok', 'совет думает');   // прогон совета идёт — живой процесс, его стадии ведёт шина
+  const p = st.pilot && typeof st.pilot === 'object' ? st.pilot : null;
+  if (!p || !(p.state || p.mode)) return R(false, 'none', 'off', 'пилот не запущен');
+  if (phase === 'stopped' || phase === 'panic' || phase === 'error') return R(false, 'stopped', phase === 'error' ? 'err' : 'off', phase === 'panic' ? 'паника — пилот стоит' : phase === 'error' ? 'ошибка миссии — пилот стоит' : 'пилот остановлен');
+  if (st.live === false) return R(false, 'stopped', 'off', 'пилот не запущен — петли нет');   // фаза осталась от прошлого, а задачи пилота нет
+  const feed = p.feed && typeof p.feed === 'object' ? p.feed : null, bad = !!(feed && feed.ok === false);
+  const last = num(p.last_tick_ts) || num(p.tick_ts) || null, age = last ? Math.max(0, now - last) : null;
+  const legacy = typeof p.ticking !== 'boolean', x = {age, last, busy: !!p.review_busy, legacy};
+  const ticking = p.loop_alive === false ? false : !legacy ? p.ticking
+    : ('tick_ts' in p || 'last_tick_ts' in p) ? (age != null ? age < PILOT_TICK_STALE_S : !(num(p.uptime_h) > 0)) : true;   // старый бэкенд: по tick_ts (первые минуты без тика — запуск), без него — по фазе и live
+  if (bad && FEED_RED.has(feed.kind)) { const reason = feedWhy(feed); return R(false, 'stale', 'err', 'пилот не тикает: ' + reason, Object.assign(x, {reason})); }
+  if (p.loop_alive === false) { const reason = 'петля пилота не работает'; return R(false, 'stale', 'warn', 'пилот не тикает: ' + reason, Object.assign(x, {reason})); }
+  if (phase === 'closed' || (feed && feed.kind === 'closed')) return R(false, 'closed', 'off', ticking ? 'рынок закрыт — пилот ждёт открытия' : 'рынок закрыт', x);   // стопор до открытия: ничего не происходит — не мигаем
+  if (ticking) return R(true, 'ticking', bad ? 'warn' : 'ok', x.busy ? 'пилот работает · PRO перепроверяет' : 'пилот работает', x);
+  const reason = bad ? feedWhy(feed) : age != null ? 'нет тиков ' + fmtAge(age) : 'нет тиков — ни одного с запуска';
+  return R(false, 'stale', 'warn', 'пилот не тикает: ' + reason, Object.assign(x, {reason}));
+}
+function phaseStill(run) { return !run || run.on ? '' : ' still' + (run.kind === 'stale' ? (run.level === 'err' ? ' halt' : ' stale') : ''); }   // классы бейджа фазы: пилот не работает — без пульса
+function pilotPill(st, run, now) {   // пилюля «Пилот» в степпере — по статусу: {status, note, tip}; null — идёт прогон совета, пилюлю ведут его события
+  if (!run || run.kind === 'council') return null;
+  const p = (st && st.pilot) || {}, t0 = num(p.review_started_ts), mins = t0 ? Math.max(1, Math.round((now - t0) / 60)) : null;
+  if (run.busy && run.level !== 'err' && run.kind !== 'stopped' && run.kind !== 'none') return {status: 'progress', note: 'PRO думает' + (mins ? ' ' + mins + ' мин' : '…'), tip: 'дежурный PRO перепроверяет' + (t0 ? ' с ' + fmtHM(t0) : '') + (run.on ? '' : ' · ' + run.text)};
+  if (run.kind === 'ticking') return {status: 'tick', note: 'работает', tip: run.text + (run.age != null ? ' · последний тик ' + fmtAge(run.age) + ' назад' : '')};
+  if (run.kind === 'stale') return {status: run.level === 'err' ? 'halt' : 'still', note: 'не тикает', tip: run.text};
+  if (run.kind === 'closed') return {status: 'still', note: 'рынок закрыт', tip: run.text};
+  const ph = (st && st.phase) || '';
+  return {status: '', note: ph === 'panic' ? 'паника' : ph === 'error' ? 'ошибка' : ph === 'stopped' ? 'остановлен' : 'не запущен', tip: run.text};
+}
+function stepperSettle(st, run, councilLive, now) {   // сверка степпера миссии со статусом: зависшие start/progress (done потерялся, ранний выход, CancelledError — отчёт 2, A2/A3) — в done; «Пилот» — из pilotPill. true — было что менять
+  const M = ST.mission, p = (st && st.pilot) || {}; let ch = false;
+  const busy = {review: 'review_busy' in p ? !!p.review_busy : null, guard: !!(p.guard || {}).busy, take: !!(p.take_guard || {}).busy, triage: 'triage_busy' in p ? !!p.triage_busy : null, entry: !!(p.entry_gate || {}).busy, profit: !!(p.profit || {}).busy, puncture: false};
+  Object.keys(M).forEach(k => { const v = M[k]; if (!v || k === 'pilot' || !/^(start|progress)$/.test(v.status || '')) return;
+    const age = now - (v.at || 0) / 1000, b = busy[k];
+    const settle = PILOT_STAGES.has(k) ? (b === false ? age > STAGE_SETTLE_S.pilot : b == null && age > STAGE_SETTLE_S.silent)
+      : !councilLive && age > (k === 'present' ? STAGE_SETTLE_S.present : STAGE_SETTLE_S.council);
+    if (settle) { v.status = 'done'; ch = true; } });
+  const pp = councilLive ? null : pilotPill(st, run, now);
+  if (pp && (M.pilot || pp.status || Object.keys(M).length)) { const c = M.pilot || (M.pilot = {stage: 'pilot'}); if (c.status !== pp.status || c.note !== pp.note || c.tip !== pp.tip) { Object.assign(c, pp); ch = true; } }   // пустой степпер (пилота нет, совета не было) пилюлей не заводим
+  return ch;
+}
+function pilotEvent(ev) {   // разовое событие пилота из шины («pilot · progress»: исполнение, закрытие сделки, передача совету, повод) — в хронику и строку под степпером; анимации не оставляет
+  const d = String(ev.detail || '').trim(); if (!d || (ev.ticker && S.mission.ticker && ev.ticker !== S.mission.ticker)) return;
+  const ts = Date.now() / 1000, list = S.mission.pev || (S.mission.pev = []);
+  if (!list.some(x => x.text === d && ts - x.ts < 60)) { list.push({ts, text: d, fill: !!(ev.data && ev.data.fill)}); if (list.length > 30) list.splice(0, list.length - 30); }
+  const c = ST.mission.pilot || (ST.mission.pilot = {stage: 'pilot'}); c.detail = d; c.at = Date.now();   // статус пилюли не трогаем — его ведёт статус (stepperSettle)
+  renderStepper('mission');
+  clearTimeout(S.mission._pevT); S.mission._pevT = setTimeout(pollMission, 700);   // позиция и хроника — свежим статусом
+}
+function revLabel(r) {   // решение перепроверки как его видела модель: label бэкенда («КУПИТЬ — засада откат @296.6», «ДЕРЖАТЬ», «ОТМЕНИТЬ»); без label — канон кода по-человечески
+  r = r || {}; const lb = String(r.label || '').trim(); if (lb) return decRu(lb);
+  const c = String(r.choice || '').trim(); if (DEC_RU[c]) return DEC_RU[c];
+  if (c === 'ЖДЁМ' && r.in_pos) return 'ДЕРЖАТЬ';
+  const base = LABEL_ENTRY[c] || c, e = num(r.entry), k = String(r.entry_kind || '').toLowerCase().trim();
+  return e != null && (base === 'КУПИТЬ' || base === 'ПРОДАТЬ') && k && k !== 'сейчас' ? `${base} — засада ${k} @${fmtNum(e)}` : base;
+}
+function pilotAlerts(st, run, now) {   // плашки карточки пилота (и записи панели проблем): связь с Т-Банком, пилот не тикает, отказ биржи, маржа — [{kind, level, text, tip}]
+  const p = (st && st.pilot) || {}, out = [], feed = p.feed && typeof p.feed === 'object' ? p.feed : null;
+  if (feed && feed.ok === false && feed.kind !== 'closed') { const red = FEED_RED.has(feed.kind); out.push({kind: 'feed', level: red ? 'err' : 'warn', text: 'Т-Банк: ' + feedWhy(feed) + (num(feed.since) ? ' · с ' + fmtHM(feed.since) : ''), tip: red ? 'брокер не принимает запросы: пилот не видит цену и не может ни войти, ни закрыть — новый токен в «Ключах»' : 'связь с брокером сбоит — пилот повторяет запросы'}); }
+  else if (run && run.kind === 'stale') out.push({kind: 'tick', level: 'info', text: run.text + (run.last ? ' · последний тик ' + fmtHM(run.last) : ''), tip: 'петля пилота не получает цену — ни входа, ни выхода, ни перепроверки, пока тики не пойдут'});
+  const br = p.broker_refusal;
+  if (br && typeof br === 'object' && (br.text || br.code)) { const n = Math.max(1, num(br.count) || 1); out.push({kind: 'refusal', level: n > 1 ? 'err' : 'warn', text: `Биржа отклонила ${br.what || 'заявку'}: ${br.text || 'код ' + br.code} (${nRaz(n)}${num(br.ts) ? ', ' + fmtHM(br.ts) : ''})`, tip: (br.code ? 'код биржи ' + br.code + ' · ' : '') + 'заявка не исполнена — причина от брокера дословно'}); }
+  const al = p.account_limits;
+  if (al && typeof al === 'object') {
+    const note = al.note ? ' — ' + al.note : '';
+    if (num(al.buy_lots) === 0) out.push({kind: 'margin', level: 'warn', text: 'Покупка недоступна: маржа исчерпана' + note + (num(al.sell_lots) ? ` · продажа до ${fmtInt(al.sell_lots)} лот` : ''), tip: 'биржа (GetMaxLots) даёт 0 лотов на покупку: вход в лонг и добор невозможны, пока не освободится маржа'});
+    if (num(al.sell_lots) === 0) out.push({kind: 'margin_sell', level: 'warn', text: 'Продажа недоступна: маржа исчерпана' + note + (num(al.buy_lots) ? ` · покупка до ${fmtInt(al.buy_lots)} лот` : ''), tip: 'биржа (GetMaxLots) даёт 0 лотов на продажу: вход в шорт невозможен, пока не освободится маржа'});
+  }
+  return out;
+}
+function alertsHtml(list) { return list.map(a => `<div class="pl-al ${esc(a.level)}" data-al="${esc(a.kind)}"${a.tip ? ` title="${esc(a.tip)}"` : ''}><b>${a.level === 'info' ? '⏸' : '⚠'}</b>${esc(a.text)}</div>`).join(''); }
+function runLineHtml(run) {   // строка под заголовком миссии: пилот не тикает — почему (рядом с бейджем фазы)
+  if (!run || run.kind !== 'stale') return '';
+  return `<span class="badge ${run.level === 'err' ? 'red' : 'gray'}" title="петля пилота не тикает: ни входа, ни выхода, ни перепроверки, пока тики не пойдут">пилот не тикает</span><span>${esc(run.reason || '')}${run.last ? ' · последний тик ' + esc(fmtHM(run.last)) : ''}</span>`;
+}
+function wakeHtml(w, line) {   // будильник ЖДЁМ (5.4.3): уровень из ответа дежурного PRO — цена его пройдёт, и PRO спросят вне плана
+  const lv = num((w || {}).level); if (lv == null) return '';
+  const dir = w.dir === 'up' ? 'вверх' : w.dir === 'down' ? 'вниз' : '', fired = num(w.fired);
+  const tip = 'будильник ЖДЁМ: дежурный PRO назвал уровень — цена его пройдёт, и PRO спросят вне плана' + (num(w.ref) ? ' · поставлен при цене ' + fmtNum(w.ref) : '') + (num(w.ts) ? ' в ' + fmtHM(w.ts) : '');
+  const b = `<span class="badge ${fired ? 'gray' : 'teal'}" data-wake title="${esc(tip)}">⏰ будильник у ${fmtNum(lv)}${dir ? ' (' + dir + ')' : ''}${fired ? ' · сработал ' + fmtHM(fired) : ''}</span>`;
+  return line ? `<div class="small wake-ln">${b}${w.why ? ` <span class="muted">${esc(w.why)}</span>` : ''}</div>` : b;
+}
+function pilotProblems(ms, mk, srv, now, mem) {   // записи панели проблем по пилоту (Pb.tick): не тикает, связь, отказ биржи, маржа, протухшая цена / «нет тиков»; что сервер уже сказал (state.health) — не дублируем; mem — когда запись появилась (без тиков — не сразу)
+  mem = mem || {}; const out = []; if (!ms) return out;
+  srv = (srv || []).filter(Boolean); mk = mk || {};
+  const p = ms.pilot && typeof ms.pilot === 'object' ? ms.pilot : {}, t = ms.ticker || '', run = pilotRun(ms, now);
+  const said = re => srv.some(x => re.test(String(x.text || '')));
+  const skip = {feed: srv.some(x => x.kind === 'tinkoff' && x.level !== 'info') || said(/не тикает|токен/i), tick: said(/не тикает|нет тиков/i), refusal: said(/отклонил/i), margin: said(/маржа/i), margin_sell: said(/маржа/i)};
+  pilotAlerts(ms, run, now).forEach(a => { if (skip[a.kind]) return; out.push({id: 'pl:' + a.kind, kind: a.kind === 'feed' ? 'tinkoff' : 'pilot', level: a.level === 'info' ? 'warn' : a.level, act: a.kind === 'feed' && a.level === 'err' ? 'keys' : 'mission', text: `${t}: ${a.text}${a.tip ? ' — ' + a.tip : ''}`, grace: a.kind === 'tick' && run.age == null ? 20 : 0}); });
+  const pts = num(p.price_ts), feedBad = !!(p.feed && p.feed.ok === false);   // связь с брокером уже названа причиной — «нет тиков» её следствие, не дублируем
+  if (ms.live && (p.state || p.mode) && mk.open !== false && !feedBad && !skip.tick && !out.some(x => x.id === 'pl:tick') && !srv.some(x => x.kind === 'data')) {   // «не тикает» уже сказано — цена протухла по той же причине
+    if (pts && now - pts > 60) out.push({id: 'price', kind: 'data', level: 'warn', act: 'mission', text: `Цена ${t} не обновлялась ${Math.round(now - pts)} с при открытом рынке — котировки не идут (сеть, токен, лимит запросов?); пилот решает по старой цене`, grace: 0});
+    else if (!pts) out.push({id: 'price', kind: 'data', level: 'warn', act: 'mission', text: `Пилот ${t}: нет тиков — с запуска ни одной цены (токен, сеть, лимит запросов?); пилот не видит рынок и ничего не исполняет`, grace: 30});   // отчёт 1: цена на графике идёт (MOEX), а петля не тикает — раньше тут было молчание
+  }
+  const res = out.filter(x => { if (!x.grace || num(p.uptime_h) >= 0.1) return true; if (mem[x.id] == null) mem[x.id] = now; return now - mem[x.id] >= x.grace; });
+  Object.keys(mem).forEach(id => { if (!out.some(x => x.id === id)) delete mem[id]; });
+  return res.map(x => ({id: x.id, kind: x.kind, level: x.level, act: x.act, text: x.text}));
+}
+function tkLink(st) {   // пилюля «Tinkoff» в шапке: не «токен задан», а связь по живым пилотам (feed) — auth/rights/cert красным, network/no_price янтарём (отчёт 1: зелёный при отозванном токене)
+  const app = (st && st.app) || {};
+  if (!app.tinkoff) return {cls: 'bad', md: 'bad', text: 'нет токена', title: 'Токен Tinkoff не задан — «Ключи» в шапке'};
+  const feeds = Object.values(((st.mission || {}).missions) || {}).map(m => m && m.pilot && m.pilot.feed).filter(f => f && f.ok === false && f.kind !== 'closed');
+  const red = feeds.find(f => FEED_RED.has(f.kind)), bad = red || feeds[0];
+  if (red) return {cls: 'bad', md: 'bad', text: feedWhy(red), title: 'Tinkoff: ' + feedWhy(red) + ' — пилот не видит цену и не торгует; новый токен — «Ключи»'};
+  if (bad) return {cls: 'off', md: 'wait', text: feedWhy(bad), title: 'Tinkoff: ' + feedWhy(bad) + ' — связь сбоит, пилот повторяет запросы'};
+  return {cls: 'ok', md: 'ok', text: 'токен задан', title: 'Токен Tinkoff задан' + (Object.keys(((st.mission || {}).missions) || {}).length ? '; связь пилота в порядке' : '')};
+}
+// ═══ 5.4.4: конец помощников «честной панели» ═══
+const HANDOFF_KIND = {council: ['amber', 'совету', 'полный совет: три кресла и шифровальщик'], pilot: ['indigo', 'PRO', 'повод пилота — решит дежурный PRO на перепроверке'], shock: ['indigo', 'PRO', 'событие: резкий ход цены — внеплановая перепроверка дежурного PRO'], news: ['indigo', 'PRO', 'событие: серьёзная новость дозора — внеплановая перепроверка дежурного PRO'], stop: ['amber', 'трос → совет', 'мягкий стоп: цена за триггером, дежурный ИИ (PRO или FLASH по настройке) решил ждать и передал задачу Совету — полный совет без очереди'], take: ['amber', 'тейк → совет', 'мягкий тейк: цена у цели, дежурный ИИ решил подержать (прибыль заперта триггером) и передал задачу Совету — полный совет без очереди'], entry: ['amber', 'дверь → совет', 'проверка входа у двери (5.4.1): перед заявкой PRO посмотрел на живой рынок, не подтвердил вход — план снят, позван полный совет без очереди'], profit: ['amber', 'прибыль → совет', 'мысль о прибыли (5.4.1): позиция в плюсе, PRO позвал полный совет без очереди — позиция держится, триггер подтянут к lock_price'], puncture: ['teal', 'прокол', 'прокол сканера: полоса устойчивого вакуума со стойкостью выше порога и важной стороной (вход / предупреждение / угроза / подтверждение) — блок ПРОКОЛ СКАНЕРА первым в ситуации: в позиции через триаж ИИ, вне рынка — сразу дежурный PRO'],
+  // 5.4.4: поводы, которых панель не знала, — не «совету» (полный совет их не зовёт): цена прошла уровень WAIT или будильника ЖДЁМ, рынок открылся
+  wait_level: ['teal', 'уровень → PRO', 'цена прошла уровень — приказа WAIT или будильника ЖДЁМ: внеплановая перепроверка дежурного PRO (один уровень — один повод); полный совет не зовут'],
+  open: ['indigo', 'открытие → PRO', 'рынок открылся: поводы и новости, накопленные за закрытие, — перепроверка дежурного PRO после открытия; полный совет не зовут']};
+const HANDOFF_OTHER = ['gray', 'повод', 'повод для дежурного PRO — решит на перепроверке'];   // 5.4.4: неизвестный вид — нейтрально, не «совету»
 function pilotLines(st) {
   const p = st.pilot || {}; const pos = p.position; const plan = p.plan; const ex = st.exec || {};
   return {entry: num(pos ? pos.entry : plan ? plan.entry : ex.entry), take: num(pos && pos.take != null ? pos.take : plan && plan.take != null ? plan.take : ex.take), stop: num(pos && pos.invalidation != null ? pos.invalidation : plan && plan.invalidation != null ? plan.invalidation : ex.invalidation), hard: num(pos && pos.hard_stop != null ? pos.hard_stop : null), hardSoft: p.exchange_stop === false, levels: (ex.levels || []).map(num).filter(v => v != null)};   // 5.4.1: hardSoft — трос в программе, не на бирже
@@ -2469,6 +2628,7 @@ function explainHtml(st) {   // v5.3: лента толмача (свежая з
 }
 function renderExplain(st) {
   const el = $('#m-explain'); if (!el || !st) return;
+  if (S.mission.xpPending && Date.now() - (S.mission.xpPendingAt || 0) > 180000) S.mission.xpPending = null;   // 5.4.4: «толмач пишет» с пульсом не висит вечно, если done потерялся (обрыв потока)
   if (put(el, explainHtml(st))) {
     const b = $('#xp-more'); if (b) b.onclick = () => { S.mission.xpAll = !S.mission.xpAll; renderExplain(st); };
     const d = $('#m-mem'); if (d) d.ontoggle = () => { S.mission.memOpen = d.open; };
@@ -2478,7 +2638,7 @@ const Xp = {   // события шины: стадия explain (start → «т�
   onStage(ev) {
     const st = S.mission.status;
     if (ev.stage === 'explain') {
-      if (ev.status === 'start') S.mission.xpPending = ev.detail || '…';
+      if (ev.status === 'start') { S.mission.xpPending = ev.detail || '…'; S.mission.xpPendingAt = Date.now(); }
       else {
         S.mission.xpPending = null;
         if (ev.data && st && (!ev.ticker || ev.ticker === st.ticker)) {
@@ -2541,6 +2701,7 @@ function renderMission(st) {
   }
   $('#btn-launcher-toggle').classList.remove('hidden');
   const phase = st.phase || 'idle', p = st.pilot || {}, pos = p.position, ex = st.exec, live = phase === 'council' || CH.mission.live;
+  const run = S.mission.run = pilotRun(st);   // 5.4.4: жив ли пилот — точка фазы, пилюля «Пилот», мини-шапка, отсчёт
   const px = num(st.price), fl = pos ? (pos.floating != null ? num(pos.floating) : (px && pos.entry ? (pos.side === 'long' ? 1 : -1) * (px - pos.entry) * (pos.lots || 1) : null)) : null;
   const lines = pilotLines(st);
   const already = host.dataset.ticker === st.ticker && $('#chairs-mission');
@@ -2548,7 +2709,7 @@ function renderMission(st) {
     host.dataset.ticker = st.ticker;
     host.innerHTML = `
       <div class="card fx-in" id="m-head"><div class="card-h"><h3><span style="font-size:24px;letter-spacing:-.02em">${esc(st.ticker)}</span><span class="muted" style="font-weight:500">${esc(st.name || '')}</span><span class="badge indigo">${esc(PLAY_RU[st.play] || st.play || '')}</span>${st.started_ts ? `<span class="badge gray">с ${fmtDT(st.started_ts)}</span>` : ''}</h3><span id="m-phase"></span></div>
-        <div id="stepper-mission" class="stepper"></div><div class="run-detail" id="detail-mission"></div><div id="m-note" class="small muted"></div><div id="m-err"></div></div>
+        <div id="m-run" class="m-run"></div><div id="stepper-mission" class="stepper"></div><div class="run-detail" id="detail-mission"></div><div id="m-note" class="small muted"></div><div id="m-err"></div></div>
       ${bSpyHtml()}
       <div class="card fx-in now" id="m-now"></div>
       <div class="card fx-in" id="m-explain"></div>
@@ -2570,11 +2731,15 @@ function renderMission(st) {
     S.mission.orderSig = null; S.mission.orderPrev = null; S.mission.xpAll = false;   // новая миссия — подсветка приказа и лента с чистого листа
     S.mission.evTab = 'all'; S.mission.evAll = false; S.mission.evOpen = {};   // ═══ фаза 3 · W2: фильтр хроники — с чистого листа
     S.mission.chairsOpen = null;   // ═══ фаза 3 · W3: кресла — по умолчанию (свёрнуты при свежем объяснении толмача)
+    S.mission.pev = [];   // 5.4.4: разовые события пилота из шины — с чистого листа
     bMissionMount();   // ═══ плюшки B: чипы разделов, мини-шапка, инструменты графика — один раз на миссию ═══
   }
   // живого прогона нет (сервер перезапущен или совет давно прошёл), а фаза говорит, что путь до пилота пройден — конвейер по факту фазы
-  if (!live && MISSION_PHASE_PAST.has(phase)) { let ch = false; STEPS.mission.forEach(s => { if (!ST.mission[s]) { ST.mission[s] = {status: 'done', stage: s}; ch = true; } }); if (ch) renderStepper('mission'); }
-  const phaseTxt = phaseLabel(st, phase); bPhaseSet(phase, phaseTxt);   // ═══ плюшки B: mission-live-signals — бейдж фазы перекрашивается плавно и даёт одно кольцо-пульс ═══
+  { let ch = false; if (!live && (MISSION_PHASE_PAST.has(phase) || (phase === 'idle' && run.kind !== 'none'))) STEPS.mission.forEach(s => { if (!ST.mission[s]) { ST.mission[s] = {status: 'done', stage: s}; ch = true; } });
+    if (stepperSettle(st, run, live, Date.now() / 1000)) ch = true;   // 5.4.4: зависшие стадии — по статусу, «Пилот» — работает / PRO думает / не тикает / стоит
+    if (ch) renderStepper('mission'); }
+  const phaseTxt = phaseLabel(st, phase); bPhaseSet(phase, phaseTxt, run);   // ═══ плюшки B: mission-live-signals — бейдж фазы перекрашивается плавно и даёт одно кольцо-пульс ═══; 5.4.4: не тикает — без пульса
+  { const mr = $('#m-run'); if (mr) { const c = 'm-run' + (run.kind === 'stale' && run.level === 'err' ? ' halt' : ''); if (mr.className !== c) mr.className = c; put(mr, runLineHtml(run)); } }
   { const det = ($('#detail-mission') || {}).textContent || '', nt = String(st.note || ''); const norm = x => x.replace(/\s+/g, ' ').trim().toLowerCase(); $('#m-note').textContent = nt && norm(det) !== norm(nt) && !norm(det).endsWith(norm(nt)) ? nt : ''; }   // заметка не дублирует строку стадии
   put('#m-err', st.error ? `<div class="errbox" style="margin-top:8px">${esc(st.error)}</div>` : '');
   put('#m-now', nowHtml(st, lines, phase)); S.mission.fl = fl;   // ═══ фаза 3 · W3: «Сейчас» — позиция крупно, уровни с расстояниями, отсчёт, рынок (живые числа — nowLive) ═══
@@ -2605,7 +2770,12 @@ function renderMission(st) {
   const eg = p.entry_gate || {}, pf = p.profit || {}, gates = Array.isArray(p.gates) ? p.gates : [], profits = Array.isArray(p.profits) ? p.profits : [];
   const lastP = profits.length ? profits.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0))[0] : null;
   // ═══ фаза 3 · W2: хроника с разрезами — все · решения PRO · FLASH (трос/тейк/триаж) · поводы (прокол/новости/ход/совет); соседние триажи в одну строку, «ещё N» ═══
-  const evAll = [...reviews.map(r => ({ts: r.ts, cls: '', g: 'pro', text: `<b class="ch">${esc(decRu(r.choice))}</b> ${esc(r.why || '')}${r.note ? ` <span class="muted">— ${esc(r.note)}</span>` : ''}`})), ...handoffs.map(h => { const hk = HANDOFF_KIND[h.kind] || HANDOFF_KIND.council; const tri = !!h.triage; return {ts: h.ts, cls: (tri ? 'h tri' : 'h') + ' r-' + hk[0], tri, g: tri ? mmc + ' why' : (h.kind === 'stop' || h.kind === 'take' || h.kind === 'entry' || h.kind === 'profit') ? mmc + ' why' : 'why', text: `<span class="badge ${hk[0]}" title="${hk[2]}">${hk[1]}</span> ${esc(h.reason || '')}${h.triage ? ` <span class="faint" title="${mm}-триаж события: СЕЙЧАС — PRO разбужен, ПЛАНОВО — повод к плановой перепроверке, САМ — подтянул трос / снял план без PRO">— триаж ${mm}: ${esc(h.triage)}</span>` : ''}${h.deferred && h.kind && h.kind !== 'council' ? ' <span class="faint">— к плановой перепроверке</span>' : ''}`}; }),
+  // 5.4.4: разовые события пилота из шины (вход, закрытие, передача совету) — строкой хроники; то же, что уже есть передачей (handoffs), не дублируем
+  const hoTxt = handoffs.map(h => String(h.reason || '').toLowerCase()).filter(Boolean);
+  const pev = (S.mission.pev || []).filter(e2 => { const t2 = e2.text.toLowerCase(); return !hoTxt.some(r2 => t2.includes(r2)); });
+  const evAll = [...reviews.map(r => ({ts: r.ts, cls: '', g: 'pro', text: `<b class="ch">${esc(revLabel(r))}</b> ${esc(r.why || '')}${r.note ? ` <span class="muted">— ${esc(r.note)}</span>` : ''}`})),   // 5.4.4: метка, как её видела модель (label), — «КУПИТЬ — засада …», «ДЕРЖАТЬ», а не канон кода
+    ...pev.map(e2 => ({ts: e2.ts, cls: 'h ' + (e2.fill ? 'r-indigo' : 'r-teal'), g: 'ev', text: `<span class="badge gray" title="разовое событие пилота из потока событий (исполнение, закрытие, передача совету): записано в хронику, живёт до перезагрузки страницы">пилот</span> ${esc(e2.text)}`})),
+    ...handoffs.map(h => { const hk = HANDOFF_KIND[h.kind] || HANDOFF_OTHER; const tri = !!h.triage; return {ts: h.ts, cls: (tri ? 'h tri' : 'h') + ' r-' + hk[0], tri, g: tri ? mmc + ' why' : (h.kind === 'stop' || h.kind === 'take' || h.kind === 'entry' || h.kind === 'profit') ? mmc + ' why' : 'why', text: `<span class="badge ${hk[0]}" title="${hk[2]}">${hk[1]}</span> ${esc(h.reason || '')}${h.triage ? ` <span class="faint" title="${mm}-триаж события: СЕЙЧАС — PRO разбужен, ПЛАНОВО — повод к плановой перепроверке, САМ — подтянул трос / снял план без PRO">— триаж ${mm}: ${esc(h.triage)}</span>` : ''}${h.deferred && h.kind && h.kind !== 'council' ? ' <span class="faint">— к плановой перепроверке</span>' : ''}`}; }),
     ...guards.map(g => g.side === 'take' ? {ts: g.ts, cls: 'h r-teal', g: gm(g).toLowerCase(), text: `<span class="badge ${decSilent(g) ? 'gray' : gm(g).toLowerCase()}" title="мягкий тейк: цена ${fmtNum(g.price)} дошла до цели ${fmtNum(g.take)} — ${gm(g)} решал, зафиксировать или подержать и передать Совету">${gm(g)} · тейк: ${esc(decRu(g.decision))}</span> ${esc(g.why || '')}${decSilent(g) && g.applied ? ` <span class="faint">— ${esc(g.applied)}</span>` : ''}${g.lock_price ? ` <span class="faint">— прибыль заперта триггером ${fmtNum(g.lock_price)}${g.tp_next ? ', новая цель ' + fmtNum(g.tp_next) : ', тейк снят'}</span>` : ''}`} : {ts: g.ts, cls: 'h r-teal', g: gm(g).toLowerCase(), text: `<span class="badge ${decSilent(g) ? 'gray' : gm(g).toLowerCase()}" title="мягкий стоп: цена ${fmtNum(g.price)} коснулась триггера ${fmtNum(g.trigger)} — ${gm(g)} решал, слить или ждать и передать Совету">${gm(g)} · трос: ${esc(decRu(g.decision))}</span> ${esc(g.why || '')}${decSilent(g) && g.applied ? ` <span class="faint">— ${esc(g.applied)}</span>` : ''}${g.hold_until ? ` <span class="faint">— новый триггер ${fmtNum(g.hold_until)}</span>` : ''}`}),
     // 5.4.1: проверки входа у двери и мысли о прибыли — как ответы у троса: бейдж, решение, почему, уровни; разрезы PRO/FLASH — по модели узлов у денег, «совет» — ещё и в поводах
     ...gates.map(g => ({ts: g.ts, cls: 'h r-indigo', g: mmcN + (g.council ? ' why' : ''), text: `<span class="badge ${mmcN}" title="проверка входа у двери: перед заявкой ${mmN} посмотрел на живой рынок (цена ${fmtNum(g.price)}) — войти, ждать уровня/срока или отменить">${mmN} · вход: ${esc(decRu(g.decision))}</span> ${esc(g.why || '')}${g.entry != null ? ` <span class="faint">— уровень ${fmtNum(g.entry)}${g.entry_kind ? ' (' + esc(g.entry_kind) + ')' : ''}</span>` : g.wait_minutes ? ` <span class="faint">— ждать ${fmtLeft(g.wait_minutes)}</span>` : ''}${g.council ? ' <span class="faint">— зовёт полный совет</span>' : ''}${g.note ? ` <span class="muted">— ${esc(g.note)}</span>` : ''}`})),
@@ -2620,18 +2790,24 @@ function renderMission(st) {
   const events = evShown.map(e2 => { if (e2.items) { const key = String(e2.ts), open = !!(S.mission.evOpen || {})[key], n = e2.items.length; return `<div class="ev ${e2.cls} grp${open ? ' open' : ''}" data-grp="${key}" data-g="${esc(e2.g)}" role="button" tabindex="0" title="соседние триажи событий собраны в одну строку — нажми, чтобы раскрыть"><span class="t">${fmtDT(e2.ts)}</span><span class="d"></span><span>${e2.text} <span class="more">· ещё ${n} триаж${n === 1 ? '' : n < 5 ? 'а' : 'ей'} ${open ? '▴' : '▾'}</span><div class="sub">${e2.items.map(x => `<div>${fmtDT(x.ts)} · ${x.text}</div>`).join('')}</div></span></div>`; } return `<div class="ev ${e2.cls}" data-g="${esc(e2.g)}"><span class="t">${fmtDT(e2.ts)}</span><span class="d"></span><span>${e2.text}</span></div>`; });
   const evFoot = evMore > 0 ? `<button class="btn sm ghost ev-more" type="button" data-evmore="1">ещё ${evMore}</button>` : (S.mission.evAll && evGrp.length > EV_SHOW ? '<button class="btn sm ghost ev-more" type="button" data-evmore="0">свернуть</button>' : '');
   const dis = S.mission.acting ? ' disabled' : '';   // команда в полёте — кнопки заперты и после перерисовки
-  put('#m-pilot', `<div class="card-h"><h3>Пилот <span class="hint">исполняет приказ и перепроверяет себя</span></h3><span class="row"><span class="badge ${p.mode === 'real' ? 'red' : 'indigo'}">${p.mode === 'real' ? 'БОЕВОЙ брокер' : p.mode ? 'СУХОЙ брокер' : 'пилот не запущен'}</span>${p.state ? `<span class="badge gray">${esc(p.state)}</span>` : ''}${p.pending ? '<span class="badge amber">заявка в стакане</span>' : ''}${gd.busy ? `<span class="badge amber" title="цена за триггером: ${mm} решает — слить или ждать и передать Совету${mm === 'PRO' ? '; PRO думает минуты — за тросом закрытие без вопросов' : ' (за секунды)'}">${mm} у троса</span>` : ''}${tg.busy ? `<span class="badge green" title="цена у цели: ${mm} решает — зафиксировать или подержать и передать Совету">${mm} у тейка</span>` : ''}${p.triage_busy ? `<span class="badge teal" title="событие при позиции: ${mm}-триаж решает, нужен ли дежурный PRO сейчас">${mm}-триаж</span>` : ''}${eg.busy ? `<span class="badge indigo" title="проверка входа у двери (5.4.1): перед заявкой ${mmN} смотрит живой рынок — войти, ждать уровня/срока или отменить; молчит — входа нет">${mmN} проверяет вход…</span>` : ''}${pf.busy ? `<span class="badge indigo" title="мысль о прибыли (5.4.1): позиция в плюсе — ${mmN} решает, держать, выйти, выйти и перезайти или звать совет">${mmN} думает о прибыли…</span>` : ''}${p.adopt_account ? '<span class="badge gray" title="всё, что лежит на счёте по инструменту, — позиция пилота: докупил или продал руками — он ведёт и это">весь счёт</span>' : ''}${p.sized_by_broker ? '<span class="badge teal" title="размер входа и добора даёт биржа (GetMaxLots с плечом), ИИ решает только сторону">размер: биржа</span>' : ''}${ks.locked ? `<span class="badge red">стоп-кран: ${esc(ks.reason || 'заперт')}</span>` : ''}</span></div>
+  // 5.4.4: PRO перепроверяет — бейдж с минутами (review_started_ts); плашки: связь с Т-Банком, пилот не тикает, отказ биржи, маржа
+  const rbAt = S.mission.reviewBusyAt, rBusy = rbAt ? `<span class="badge indigo" data-rbusy title="дежурный PRO перепроверяет: думает над живым рынком с ${esc(fmtHM(rbAt / 1000))}; следующая плановая перепроверка — после его ответа">PRO перепроверяет… ${Math.max(1, Math.round((Date.now() - rbAt) / 60000))} мин</span>` : '';   // review_busy / review_started_ts; старый бэкенд — «перепроверка · start» из шины
+  const alerts = alertsHtml(pilotAlerts(st, run, Date.now() / 1000));
+  const lim = p.account_limits || {}, mBuy = acc.max_buy != null ? acc.max_buy : lim.buy_lots, mSell = acc.max_sell != null ? acc.max_sell : lim.sell_lots;   // лоты от биржи: счёт пилота, иначе account_limits (5.4.4)
+  put('#m-pilot', `<div class="card-h"><h3>Пилот <span class="hint">исполняет приказ и перепроверяет себя</span></h3><span class="row"><span class="badge ${p.mode === 'real' ? 'red' : 'indigo'}">${p.mode === 'real' ? 'БОЕВОЙ брокер' : p.mode ? 'СУХОЙ брокер' : 'пилот не запущен'}</span>${p.state ? `<span class="badge gray">${esc(p.state)}</span>` : ''}${p.pending ? '<span class="badge amber">заявка в стакане</span>' : ''}${rBusy}${gd.busy ? `<span class="badge amber" title="цена за триггером: ${mm} решает — слить или ждать и передать Совету${mm === 'PRO' ? '; PRO думает минуты — за тросом закрытие без вопросов' : ' (за секунды)'}">${mm} у троса</span>` : ''}${tg.busy ? `<span class="badge green" title="цена у цели: ${mm} решает — зафиксировать или подержать и передать Совету">${mm} у тейка</span>` : ''}${p.triage_busy ? `<span class="badge teal" title="событие при позиции: ${mm}-триаж решает, нужен ли дежурный PRO сейчас">${mm}-триаж</span>` : ''}${eg.busy ? `<span class="badge indigo" title="проверка входа у двери (5.4.1): перед заявкой ${mmN} смотрит живой рынок — войти, ждать уровня/срока или отменить; молчит — входа нет">${mmN} проверяет вход…</span>` : ''}${pf.busy ? `<span class="badge indigo" title="мысль о прибыли (5.4.1): позиция в плюсе — ${mmN} решает, держать, выйти, выйти и перезайти или звать совет">${mmN} думает о прибыли…</span>` : ''}${p.adopt_account ? '<span class="badge gray" title="всё, что лежит на счёте по инструменту, — позиция пилота: докупил или продал руками — он ведёт и это">весь счёт</span>' : ''}${p.sized_by_broker ? '<span class="badge teal" title="размер входа и добора даёт биржа (GetMaxLots с плечом), ИИ решает только сторону">размер: биржа</span>' : ''}${ks.locked ? `<span class="badge red">стоп-кран: ${esc(ks.reason || 'заперт')}</span>` : ''}</span></div>
+    ${alerts ? `<div class="pl-alerts" data-alerts>${alerts}</div>` : ''}
     <div class="pilot-grid">
-      <div class="tile ringed cd">${ring(null, {size: 50, stroke: 6, color: 'var(--accent)', text: '—', fs: 11, title: 'до следующей перепроверки'})}<div><div class="l"><span class="full">До перепроверки</span><span class="short">Пере&shy;проверка</span></div><div class="v" id="m-countdown" style="font-size:16px">—</div><div class="s">${p.uptime_h != null ? 'на смене ' + p.uptime_h + ' ч' : ''}${reviews.length ? ' · проверок ' + reviews.length : ''}${p.analyses ? ' · анализов ' + p.analyses : ''}${p.review_reason ? `<div class="tiny" style="color:var(--teal)" title="внеплановая перепроверка: повод для дежурного PRO">повод: ${esc(p.review_reason)}</div>` : ''}</div></div></div>
+      <div class="tile ringed cd">${ring(null, {size: 50, stroke: 6, color: 'var(--accent)', text: '—', fs: 11, title: 'до следующей перепроверки'})}<div><div class="l"><span class="full" data-cdl>До перепроверки</span><span class="short">Пере&shy;проверка</span></div><div class="v" id="m-countdown" style="font-size:16px">—</div><div class="s">${p.uptime_h != null ? 'на смене ' + p.uptime_h + ' ч' : ''}${reviews.length ? ' · проверок ' + reviews.length : ''}${p.analyses ? ' · анализов ' + p.analyses : ''}${p.review_reason ? `<div class="tiny" style="color:var(--teal)" title="внеплановая перепроверка: повод для дежурного PRO">повод: ${esc(p.review_reason)}</div>` : ''}</div></div></div>
       <div class="tile"><div class="l">Итог миссии</div><div class="v ${num(tp.pnl) > 0 ? 'pos' : num(tp.pnl) < 0 ? 'neg' : ''}" title="чистыми: по операциям брокера, иначе оценка (P/L по тику минус комиссия по PYTHIA_FEE_PCT)">${fmtPnl(tp.pnl)}</div><div class="s">сделок ${tp.count || 0}${tp.count ? ' · чистыми' + (num(tp.fee) ? ', комиссии ' + fmtNum(tp.fee) : '') + (tp.est ? ' · часть — оценка' : '') : ''}</div></div>
       <div class="tile"><div class="l">${p.adopt_account ? 'База риска' : 'Депозит'}</div><div class="v">${p.deposit != null ? fmtK(p.deposit) + ' ₽' : st.deposit != null ? fmtK(st.deposit) + ' ₽' : '—'}</div><div class="s">${p.adopt_account ? 'весь счёт брокера' : 'база для размера позиции'}${ks.vol_scale != null && ks.vol_scale !== 1 ? ' · масштаб риска ' + ks.vol_scale : ''}</div></div>
-      ${acc.max_buy != null || acc.liquid != null || acc.free != null ? `<div class="tile"><div class="l">Счёт · биржа даёт</div><div class="v" style="font-size:16px">${acc.max_buy != null ? '↑' + fmtInt(acc.max_buy) + ' / ↓' + fmtInt(acc.max_sell) + ' лот' : '—'}</div><div class="s">${[acc.free != null ? 'свободно ' + fmtK(acc.free) + ' ₽' : '', acc.liquid != null ? 'ликвидно ' + fmtK(acc.liquid) + ' ₽' : '', num(acc.missing) > 0 ? '<span style="color:var(--red)">не хватает ' + fmtK(acc.missing) + ' ₽</span>' : ''].filter(Boolean).join(' · ') || (p.sized_by_broker ? 'лоты с плечом по ответу биржи' : 'размер считает код')}</div></div>` : ''}
+      ${mBuy != null || acc.liquid != null || acc.free != null ? `<div class="tile"><div class="l">Счёт · биржа даёт</div><div class="v" style="font-size:16px">${mBuy != null ? `<span${num(mBuy) === 0 ? ' style="color:var(--red)" title="покупка недоступна: маржа исчерпана"' : ''}>↑${fmtInt(mBuy)}</span> / <span${num(mSell) === 0 ? ' style="color:var(--red)" title="продажа недоступна: маржа исчерпана"' : ''}>↓${fmtInt(mSell)}</span> лот` : '—'}</div><div class="s">${[acc.free != null ? 'свободно ' + fmtK(acc.free) + ' ₽' : '', acc.liquid != null ? 'ликвидно ' + fmtK(acc.liquid) + ' ₽' : '', num(acc.missing) > 0 ? '<span style="color:var(--red)">не хватает ' + fmtK(acc.missing) + ' ₽</span>' : ''].filter(Boolean).join(' · ') || (p.sized_by_broker ? 'лоты с плечом по ответу биржи' : 'размер считает код')}</div></div>` : ''}
       <div class="tile"><div class="l">${pos && p.soft_stop ? 'Триггер · мягкий стоп' : 'Трос · стоп'}</div><div class="v ${stopPx != null ? 'neg' : ''}">${stopPx != null ? fmtNum(stopPx) : '—'}</div><div class="s" data-dists${stopPx != null ? ` data-stop="${stopPx}"` : ''}${takePx != null ? ` data-take="${takePx}"` : ''}></div>${pos && pos.hard_stop != null ? `<div class="s" title="${exSoft ? 'аварийный трос живёт в программе (PYTHIA_EXCHANGE_STOP=0): за ним тик закрывает по рынку без вопросов; стопа на бирже нет — при падении программы позиция без защиты, включается в «Ключах»' : 'аварийный трос лежит на бирже дальше триггера: за ним закрытие без вопросов'}; у триггера ${mm} решает — слить или ждать и передать Совету">${exSoft ? 'трос (в программе)' : 'трос биржи'} <b>${fmtNum(pos.hard_stop)}</b>${pos.holds ? ' · ' + mm + ' держал ' + pos.holds + ' раз' : ''}${gd.next_in_s ? ' · след. вопрос через ' + Math.ceil(gd.next_in_s / 60) + ' мин' : ''}${pos.levels_placeholder ? ' · <span style="color:var(--amber)">уровни временные — ждёт PRO</span>' : ''}</div>` : ''}${pos && p.soft_take ? `<div class="s" title="мягкий тейк: у цели ${mm} решает — зафиксировать или подержать (прибыль запирается триггером не ниже входа + ${tg.lock_pct != null ? tg.lock_pct : 50} % хода) и передать Совету">тейк · мягкий${pos.take == null ? ' (снят — ведёт триггер)' : ''}${tg.holds ? ' · ' + mm + ' держал ' + tg.holds + (tg.max_holds ? ' из ' + tg.max_holds : '') : ''}${tg.next_in_s ? ' · след. вопрос через ' + Math.ceil(tg.next_in_s / 60) + ' мин' : ''}</div>` : ''}</div>
       <div class="tile" id="pt-session" title="смена пилота: P/L закрытых сделок с запуска, сделок за смену, стоп-кран по правилу (дневной предел, стопы подряд)"><div class="l">Сессия</div><div class="v ${num(p.session_pnl) > 0 ? 'pos' : num(p.session_pnl) < 0 ? 'neg' : ''}">${p.session_pnl != null ? fmtPnl(p.session_pnl) : '—'}</div><div class="s">${p.trades != null ? 'сделок за смену ' + p.trades : p.state ? 'сделок за смену 0' : 'пилот не запущен'}${ks.locked ? ` · <span style="color:var(--red)" title="${esc(ks.reason || 'стоп-кран сессии')}">стоп-кран</span>` : ks.day_loss_limit != null ? ' · предел дня ' + fmtPnl(ks.day_loss_limit) : ''}${num(ks.streak) > 0 ? ' · потерь подряд ' + ks.streak : ''}</div></div>
     </div>
     ${p.last_action ? `<div class="small muted" style="margin-top:10px">Последнее действие: <span style="color:var(--text)" data-la></span></div>` : ''}
     <div class="small" data-pnote style="margin-top:6px;display:none" title="5.4.0: неподтверждённый трос / паника упёрлась / файл состояния отложен — что делать, сказано в тексте"><span class="badge amber">⚠</span> <span data-pnote-t></span></div>
-    ${lr ? `<div class="review" style="margin-top:12px"><b class="ch">${esc(decRu(lr.choice))}</b> ${freshHtml(lr.ts, Math.max(3600, (S.mission.reviewPeriod || 1800) * 2 + 300), {label: 'решение PRO', stale: 'перепроверка запаздывает', title: 'когда дежурный PRO решал последний раз; дольше двух периодов — перепроверка запаздывает (рынок закрыт, PRO молчит или пилот стоит)'})}<div>${esc(lr.why || '')}</div>${lr.note ? `<div class="muted">${esc(lr.note)}</div>` : ''}</div>` : `<div class="small muted" style="margin-top:12px">Перепроверок ещё не было — первая пройдёт через ${S.mission.reviewPeriod ? Math.round(S.mission.reviewPeriod / 60) + ' мин' : 'несколько минут'} после входа.</div>`}
+    ${lr ? `<div class="review" style="margin-top:12px"><b class="ch">${esc(revLabel(lr))}</b> ${freshHtml(lr.ts, Math.max(3600, (S.mission.reviewPeriod || 1800) * 2 + 300), {label: 'решение PRO', stale: 'перепроверка запаздывает', title: 'когда дежурный PRO решал последний раз; дольше двух периодов — перепроверка запаздывает (рынок закрыт, PRO молчит или пилот стоит)'})}<div>${esc(lr.why || '')}</div>${lr.note ? `<div class="muted">${esc(lr.note)}</div>` : ''}</div>` : `<div class="small muted" style="margin-top:12px">${rbAt ? 'Первая перепроверка идёт: дежурный PRO думает над живым рынком.' : `Перепроверок ещё не было — первая пройдёт через ${S.mission.reviewPeriod ? Math.round(S.mission.reviewPeriod / 60) + ' мин' : 'несколько минут'} после входа.`}</div>`}
+    ${wakeHtml(p.wake, true)}
     ${eg.decision || eg.ts ? `<div class="small" data-gate style="margin-top:8px" title="5.4.1: последняя проверка входа у двери по текущему плану — решение, почему, уровень"><span class="badge ${decSilent(eg) ? 'gray' : eg.decision === 'ВОЙТИ' ? 'green' : eg.decision === 'ОТМЕНИТЬ' ? 'red' : 'amber'}">${mmN} у двери: ${esc(decRu(eg.decision) || '…')}</span> ${esc(eg.why || '')}${eg.entry != null ? ` <span class="faint">— уровень ${fmtNum(eg.entry)}${eg.entry_kind ? ' (' + esc(eg.entry_kind) + ')' : ''}</span>` : ''}${eg.ts ? ` <span class="faint">· ${fmtDT(eg.ts)}</span>` : ''}${eg.next_in_s ? ` <span class="faint">· следующий взгляд через ${fmtLeft(eg.next_in_s / 60)}</span>` : ''}</div>` : ''}
     ${pos && (pf.busy || pf.progress_pct != null || lastP) ? `<div class="small" data-profit style="margin-top:6px" title="5.4.1: мысль о прибыли — в плюсе ${mmN} думает, не дожидаясь тейка: держать, выйти, выйти и перезайти или звать совет">${lastP ? `<span class="badge ${decSilent(lastP) ? 'gray' : lastP.decision === 'ДЕРЖАТЬ' ? 'green' : lastP.decision === 'СОВЕТ' ? 'amber' : 'indigo'}">${mmN} о прибыли: ${esc(decRu(lastP.decision))}</span> ${esc(lastP.why || '')}${lastP.lock_price != null ? ` <span class="faint">— триггер к ${fmtNum(lastP.lock_price)}</span>` : ''}${lastP.take != null ? ` <span class="faint">— цель ${fmtNum(lastP.take)}</span>` : ''}${lastP.reentry != null ? ` <span class="faint">— перезайти у ${fmtNum(lastP.reentry)}${lastP.reentry_kind ? ' (' + esc(lastP.reentry_kind) + ')' : ''}</span>` : ''}${lastP.ts ? ` <span class="faint">· ${fmtDT(lastP.ts)}</span>` : ''}` : `<span class="badge gray">${mmN} о прибыли</span> мыслей ещё не было`}${pf.progress_pct != null ? ` <span class="faint">· пройдено ${Math.round(pf.progress_pct)} % хода до тейка${pf.threshold_pct != null ? ' (повод от ' + Math.round(pf.threshold_pct) + ' %)' : ''}</span>` : ''}${pf.next_in_s ? ` <span class="faint">· следующая мысль не раньше чем через ${fmtLeft(pf.next_in_s / 60)}</span>` : ''}</div>` : ''}
     ${evAll.length ? `<h4 style="margin-top:14px">Хроника пилота <span class="faint" style="text-transform:none;letter-spacing:0;font-weight:500">перепроверки, решения у денег и поводы</span></h4>${evTabs}<div class="timeline">${events.join('') || '<div class="small muted" style="padding:6px 0">В этом разрезе записей пока нет.</div>'}</div>${evFoot}` : ''}
@@ -2655,7 +2831,9 @@ function renderMission(st) {
   // v5.3 W3: прокол как повод — что сканер видит сейчас (puncture_now) и что с этим сделали (puncture: событие, состояние)
   // ═══ фаза 3 · W3: прокол — кольцо стойкости против порога, роль цветом (за нас — зелёный, против — янтарь), одной строкой «что дали ИИ → триаж FLASH → решение PRO» или почему тишина ═══
   const PUNC_ROLE = {вход: ['green', 'возможный вход', 'полоса вакуума в сторону плана входа — туда цену тянет легче'], предупреждение: ['amber', 'предупреждение', 'полоса против плана входа — вход может встретить тягу навстречу'], угроза: ['amber', 'угроза', 'полоса против позиции — цену может утянуть от нас'], подтверждение: ['green', 'подтверждение', 'полоса за позицию — тяга в нашу сторону']};
-  const puncDoing = s => /PRO решил/.test(s) ? ['pro', 'PRO решил'] : /PRO решит|дежурн/.test(s) ? ['amber', 'PRO думает…'] : /триаж/.test(s) ? ['flash', 'триаж ИИ…'] : /подтянут/.test(s) ? ['green', 'подтянут трос'] : /снят/.test(s) ? ['green', 'план снят'] : /плановой/.test(s) ? ['gray', 'повод к плановой'] : /ниже порога|не тревожим|пейсинг|подождёт|не важна/.test(s) ? ['gray', 'тишина'] : ['gray', 'повод'];
+  // 5.4.4: «думает…» — только когда PRO (review_busy; старый бэкенд — «перепроверка · start» из шины) или триаж (triage_busy) реально заняты; «дежурный PRO решит через N мин» — это очередь, не раздумья
+  const prBusy = !!(p.review_busy || S.mission.reviewBusyAt), trBusy = !!p.triage_busy;
+  const puncDoing = s => /PRO решил/.test(s) ? ['pro', 'PRO решил'] : /PRO решит|дежурн/.test(s) ? (prBusy ? ['amber', 'PRO думает…'] : ['indigo', 'ждёт PRO']) : /триаж/.test(s) ? ['flash', trBusy ? 'триаж ИИ…' : 'триаж ИИ'] : /подтянут/.test(s) ? ['green', 'подтянут трос'] : /снят/.test(s) ? ['green', 'план снят'] : /плановой/.test(s) ? ['gray', 'повод к плановой'] : /ниже порога|не тревожим|пейсинг|подождёт|не важна/.test(s) ? ['gray', 'тишина'] : ['gray', 'повод'];
   const puncFlow = x => {   // цепочка чипов: ИИ дали → триаж ИИ → PRO; без повода — одна причина тишины
     const s = String(x.state || ''), r = PUNC_ROLE[x.role], out = [];
     const gave = `прокол ${x.side} ${pct(x.persistence)}${r ? ' · ' + r[1] : ''}${x.our_side ? ' (' + (x.in_pos ? 'в позиции ' : 'план ') + sideRu(x.our_side).toLowerCase() + ')' : ''}`;
@@ -2664,7 +2842,7 @@ function renderMission(st) {
       out.push(['gave', 'ИИ дали', gave + ' — блок ПРОКОЛ СКАНЕРА первым в ситуации']);
       if (x.triage) out.push(['flash', 'триаж ИИ', x.triage]); else if (/триаж/.test(s)) out.push(['flash', 'триаж ИИ', 'решает: PRO сейчас, к плановой или сам']);
       const m = s.match(/PRO решил:\s*(.+)$/);
-      if (m) out.push(['pro', 'PRO решил', m[1]]); else if (/подтянут|снят/.test(s)) out.push(['flash', 'FLASH сам', s]); else if (/плановой/.test(s)) out.push(['pro', 'PRO', 'разберёт на плановой перепроверке']); else if (x.pending || /PRO решит|дежурн/.test(s)) out.push(['pro', 'PRO', 'думает — ' + (s || 'ответ на перепроверке')]);
+      if (m) out.push(['pro', 'PRO решил', m[1]]); else if (/подтянут|снят/.test(s)) out.push(['flash', 'FLASH сам', s]); else if (/плановой/.test(s)) out.push(['pro', 'PRO', 'разберёт на плановой перепроверке']); else if (x.pending || /PRO решит|дежурн/.test(s)) out.push(['pro', 'PRO', (prBusy ? 'думает — ' : 'ждёт перепроверки — ') + (s || 'ответ на перепроверке')]);
     } else out.push(['quiet', 'ИИ не тревожим', s || 'стойкость ниже порога']);
     return out;
   };
@@ -2712,8 +2890,8 @@ function renderMission(st) {
   applyPriceLines(lines);
   loadMissionTrades(st.ticker);
   bMissionAfter(st, px, fl, phase);   // ═══ плюшки B: мини-шапка, трос, чипы разделов, тревога отсчёта, маркеры новостей ═══
-  const nav = phase === 'council' ? 'совет' : phaseTxt;
-  setSub('mission', phase === 'error' ? 'err' : phase === 'council' ? 'run' : 'ok', `${st.ticker} · ${nav}`);
+  const nav = phase === 'council' ? 'совет' : phaseTxt + (run.kind === 'stale' ? ' · не тикает' : '');   // 5.4.4: и в навигации видно, что пилот стоит
+  setSub('mission', phase === 'error' || (run.kind === 'stale' && run.level === 'err') ? 'err' : phase === 'council' ? 'run' : 'ok', `${st.ticker} · ${nav}`);
 }
 function pilotLive(st, px, fl) {   // живые поля карточки пилота без замены innerHTML: P/L, цена и % от входа, расстояния до стопа и тейка, отсчёт (структура плиток меняется только вместе с данными)
   nowLive(st, px, fl);   // ═══ фаза 3 · W3: и карточка «Сейчас» ═══
@@ -2732,13 +2910,15 @@ function pilotLive(st, px, fl) {   // живые поля карточки пи�
   const d = $('[data-dists]', host); if (d) { const dS = px != null ? pctDist(d.dataset.stop, px) : null, dT = px != null ? pctDist(d.dataset.take, px) : null; set(d, (dS != null ? 'до стопа ' + Math.abs(dS).toFixed(2) + '%' : 'стоп не задан') + (dT != null ? ' · до тейка ' + Math.abs(dT).toFixed(2) + '%' : '')); }
   pilotCountdown();
 }
-function pilotCountdown() {   // отсчёт до перепроверки: текст, кольцо и тревога — точечно, карточка не перерисовывается
+function pilotCountdown() {   // отсчёт до перепроверки: текст, кольцо и тревога — точечно, карточка не перерисовывается; 5.4.4: PRO думает — сколько думает (от review_started_ts), следующая плановая не выдаётся за текущую; пилот не тикает — «—» без тревоги (reviewAt снят в applyMissionStatus)
   const el = $('#m-countdown'); if (!el) return;
-  const rem = S.mission.reviewAt ? Math.max(0, (S.mission.reviewAt - Date.now()) / 1000) : null, t = rem == null ? '—' : fmtDur(rem);
+  const busyAt = S.mission.reviewBusyAt;
+  const rem = !busyAt && S.mission.reviewAt ? Math.max(0, (S.mission.reviewAt - Date.now()) / 1000) : null, t = busyAt ? fmtDur((Date.now() - busyAt) / 1000) : rem == null ? '—' : fmtDur(rem);
   if (el.textContent !== t) el.textContent = t;
+  const lbl = busyAt ? 'PRO перепроверяет…' : 'До перепроверки'; $$('[data-cdl]').forEach(l => { if (l.textContent !== lbl) l.textContent = lbl; });
   const rb = el.closest('.tile'); bCountdown(rb, rem || 0);
   const rf = rb && $('.ring-f', rb), rc = rb && $('.ring-c b', rb);
-  if (rf) { const c = +rf.style.getPropertyValue('--c'); const o = rem != null && S.mission.reviewPeriod ? (c - c * clamp(rem / S.mission.reviewPeriod, 0, 1)).toFixed(1) : c.toFixed(1); if (rf.style.getPropertyValue('--o') !== o) rf.style.setProperty('--o', o); }
+  if (rf) { const c = +rf.style.getPropertyValue('--c'); const o = busyAt ? '0.0' : rem != null && S.mission.reviewPeriod ? (c - c * clamp(rem / S.mission.reviewPeriod, 0, 1)).toFixed(1) : c.toFixed(1); if (rf.style.getPropertyValue('--o') !== o) rf.style.setProperty('--o', o); }
   if (rc && rc.textContent !== t) rc.textContent = t;
   const nc = $('#m-now [data-cd]'); if (nc) { if (nc.textContent !== t) nc.textContent = t; const box = nc.closest('.now-cd'); if (box) box.classList.toggle('urgent', rem != null && rem > 0 && rem < 30); }   // ═══ фаза 3 · W3: отсчёт и в «Сейчас» ═══
 }
@@ -2760,9 +2940,10 @@ function nowHtml(st, lines, phase) {
   if (pos) { if (lines.stop != null) lv.push(['stop', p.soft_stop ? 'Триггер' : 'Стоп', lines.stop, p.soft_stop ? 'мягкий стоп: у триггера ' + mm + ' решает — слить или ждать' : exSoft ? 'стоп в программе' : 'стоп на бирже']); if (pos.hard_stop != null) lv.push(['hard', exSoft ? 'Трос (в программе)' : 'Трос биржи', num(pos.hard_stop), exSoft ? 'аварийный трос в программе: за ним тик закрывает по рынку без вопросов; стопа на бирже нет — при падении программы позиция без защиты (включается в «Ключах»)' : 'аварийный трос на бирже: за ним закрытие без вопросов']); if (lines.take != null) lv.push(['take', 'Тейк', lines.take, p.soft_take ? 'мягкий тейк: у цели ' + mm + ' решает — зафиксировать или подержать' : 'цель']); else if (p.soft_take) lv.push(['take', 'Тейк', null, 'снят — ведёт триггер', 'после «подержать» прибыль запирает триггер, цели нет']); }
   else { if (lines.entry != null) lv.push(['entry', 'Вход', lines.entry, 'уровень входа по приказу']); if (lines.stop != null) lv.push(['stop', 'Стоп', lines.stop, 'стоп по приказу']); if (lines.take != null) lv.push(['take', 'Тейк', lines.take, 'цель по приказу']); }
   const lvH = `<div class="now-lv">${lv.length ? lv.map(([c, l, v, tip, note]) => `<div class="lv ${c}" title="${esc(note || tip || '')}"><span class="l">${l}</span><b>${v != null ? fmtNum(v) : '—'}</b><span class="d"${v != null ? ` data-npct="${v}"` : ''}>${note ? esc(note) : ''}</span></div>`).join('') : `<div class="lv"><span class="l">Уровни</span><b>—</b><span class="d">${phase === 'council' ? 'после приказа' : 'приказа нет'}</span></div>`}</div>`;
-  const rr = p.review_reason, per = S.mission.reviewPeriod;
-  const cd = `<div class="now-cd"><div class="l">До перепроверки</div><div class="v" data-cd>—</div><div class="s">${rr ? `<span style="color:var(--teal)" title="внеплановая перепроверка: повод для дежурного PRO">повод: ${esc(rr)}</span>` : per ? 'дежурный PRO раз в ' + Math.round(per / 60) + ' мин: ждать, войти, закрыть или звать совет' : 'дежурный PRO решает: ждать, войти, закрыть, звать совет'}</div></div>`;
-  return `<div class="card-h"><h3>Сейчас <span class="hint">самое важное: позиция, уровни, отсчёт</span></h3><span class="row">${marketBadge(mk)}${pos && p.soft_stop ? `<span class="badge ${mmCls(p)}" title="у триггера ${mm} решает — слить или ждать; ${exSoft ? 'трос в программе дальше — тик закроет без вопросов (стопа на бирже нет)' : 'трос биржи дальше — закрытие без вопросов'}">мягкий стоп</span>` : ''}${pos && p.soft_take ? `<span class="badge ${mmCls(p)}" title="у цели ${mm} решает — зафиксировать или подержать">мягкий тейк</span>` : ''}${pos && exSoft ? '<span class="badge amber" data-exsoft title="стопы только в программе (PYTHIA_EXCHANGE_STOP=0): стоп-заявок на бирже нет — при падении программы или обрыве связи позиция без защиты; трос на бирже включается в «Ключах»">трос в программе</span>' : ''}${p.pending ? '<span class="badge amber">заявка в стакане</span>' : ''}</span></div><div class="now-g"><div class="now-pos">${hero}</div>${lvH}${cd}</div>${pos ? ropeHtml(pos) : ''}`;
+  const rr = p.review_reason, per = S.mission.reviewPeriod, run = pilotRun(st);   // 5.4.4: PRO думает / пилот не тикает / рынок закрыт — отсчёта нет, так и пишем
+  const cdS = p.review_busy || S.mission.reviewBusyAt ? 'дежурный PRO думает над живым рынком — следующая плановая после его ответа' : run.kind === 'stale' ? 'пилот не тикает — перепроверки не будет, пока не пойдут тики' : run.kind === 'closed' ? 'рынок закрыт — перепроверка после открытия' : '';
+  const cd = `<div class="now-cd"><div class="l" data-cdl>До перепроверки</div><div class="v" data-cd>—</div><div class="s">${cdS ? esc(cdS) : rr ? `<span style="color:var(--teal)" title="внеплановая перепроверка: повод для дежурного PRO">повод: ${esc(rr)}</span>` : per ? 'дежурный PRO раз в ' + Math.round(per / 60) + ' мин: ждать, войти, закрыть или звать совет' : 'дежурный PRO решает: ждать, войти, закрыть, звать совет'}</div></div>`;
+  return `<div class="card-h"><h3>Сейчас <span class="hint">самое важное: позиция, уровни, отсчёт</span></h3><span class="row">${marketBadge(mk)}${run.kind === 'stale' ? `<span class="badge ${run.level === 'err' ? 'red' : 'gray'}" data-norun title="${esc(run.text)}">пилот не тикает</span>` : ''}${wakeHtml(p.wake)}${pos && p.soft_stop ? `<span class="badge ${mmCls(p)}" title="у триггера ${mm} решает — слить или ждать; ${exSoft ? 'трос в программе дальше — тик закроет без вопросов (стопа на бирже нет)' : 'трос биржи дальше — закрытие без вопросов'}">мягкий стоп</span>` : ''}${pos && p.soft_take ? `<span class="badge ${mmCls(p)}" title="у цели ${mm} решает — зафиксировать или подержать">мягкий тейк</span>` : ''}${pos && exSoft ? '<span class="badge amber" data-exsoft title="стопы только в программе (PYTHIA_EXCHANGE_STOP=0): стоп-заявок на бирже нет — при падении программы или обрыве связи позиция без защиты; трос на бирже включается в «Ключах»">трос в программе</span>' : ''}${p.pending ? '<span class="badge amber">заявка в стакане</span>' : ''}</span></div><div class="now-g"><div class="now-pos">${hero}</div>${lvH}${cd}</div>${pos ? ropeHtml(pos) : ''}`;
 }
 function nowLive(st, px, fl) {   // живые числа «Сейчас» без пересоздания: P/L с цветом, цена и % от входа, расстояния до уровней (ближе 0,35 % — плитка подсвечена), цвет каймы по стороне
   const host = $('#m-now'); if (!host || !st) return; const p = st.pilot || {}, pos = p.position;
@@ -3239,7 +3420,9 @@ function demoData() {
     frame: {headline: 'Ты и совет расходитесь только в тайминге', frame: 'По ставке и Сберу — единство. Нефть: шорт верный, но не по рынку, а от 72,3–72,6 со стопом 73,4.\nГазпром совет снял: новость трижды продана, цель 140 не подкреплена объёмом.', highlights: [{ticker: 'SBER', side: 'long', line: 'лонг от 283–284, цель 291, стоп 281,2'}, {ticker: 'BR', side: 'short', line: 'шорт от 72,3–72,6, цель 69,5, стоп 73,4'}]}, stats: {}, tokens: {prompt: 21000, completion: 6100}};
   const trades = [{id: 6, ticker: 'SBER', side: 'long', lots: 8, entry: 285.1, exit_px: 288.3, pnl: 256, opened_ts: now - 3600 * 9, closed_ts: now - 3600 * 7, why: 'тейк', mode: 'dry'}, {id: 5, ticker: 'SI', side: 'short', lots: 3, entry: 91850, exit_px: 92310, pnl: -1380, opened_ts: now - 3600 * 14, closed_ts: now - 3600 * 12, why: 'стоп', mode: 'dry'}, {id: 4, ticker: 'BR', side: 'short', lots: 2, entry: 73.4, exit_px: 72.1, pnl: 1720, opened_ts: now - 86400 * 0.7, closed_ts: now - 86400 * 0.6, why: 'тейк', mode: 'dry'}, {id: 3, ticker: 'SBER', side: 'long', lots: 10, entry: 282.9, exit_px: 286.4, pnl: 350, opened_ts: now - 86400 * 1.2, closed_ts: now - 86400 * 1.0, why: 'тейк', mode: 'dry'}, {id: 2, ticker: 'BR', side: 'short', lots: 2, entry: 72.9, exit_px: 71.6, pnl: 1890, opened_ts: now - 86400 * 2.2, closed_ts: now - 86400 * 2.0, why: 'тейк', mode: 'dry'}, {id: 1, ticker: 'GAZP', side: 'long', lots: 5, entry: 133.1, exit_px: 131.9, pnl: -600, opened_ts: now - 86400 * 3.1, closed_ts: now - 86400 * 3.0, why: 'стоп', mode: 'dry'}];
   const mission = {ticker: 'SBER', name: 'Сбербанк', asset_class: 'share', play: 'long', started_ts: now - 5400, run_id: 'mission-demo', phase: 'in_position',
-    pilot: {base: 'SBER', mode: 'dry', state: 'В_ПОЗИЦИИ', plan: null, position: {side: 'long', entry: 284.6, lots: 10, take: 291, invalidation: 281.2, hard_stop: 277, holds: 0, opened_ts: now - 3000, floating: 250}, pending: false, deposit: 300000, session_pnl: 350, trades: 1, uptime_h: 1.5, last_action: 'ВОШЁЛ: лонг 10 лот @284.6, трос 281.2', last_review: {choice: 'ЖДЁМ', why: 'цена идёт по плану, 287 — промежуточное сопротивление, тейк 291 не трогаем', ts: now - 900}, next_review_in_s: 743,
+    pilot: {base: 'SBER', mode: 'dry', state: 'В_ПОЗИЦИИ', plan: null, position: {side: 'long', entry: 284.6, lots: 10, take: 291, invalidation: 281.2, hard_stop: 277, holds: 0, opened_ts: now - 3000, floating: 250}, pending: false, deposit: 300000, session_pnl: 350, trades: 1, uptime_h: 1.5, last_action: 'ВОШЁЛ: лонг 10 лот @284.6, трос 281.2', last_review: {choice: 'ЖДЁМ', label: 'ДЕРЖАТЬ', in_pos: true, why: 'цена идёт по плану, 287 — промежуточное сопротивление, тейк 291 не трогаем', ts: now - 900}, next_review_in_s: 743,
+      // 5.4.4: пилот тикает (петля жива, связь с Т-Банком в порядке), PRO сейчас не думает, маржа есть — панель анимирует только такой пилот
+      loop_alive: true, ticking: true, last_tick_ts: now - 1, tick_ts: now - 1, price_ts: now - 1, feed: {ok: true, kind: 'ok', reason: '', since: null}, broker_refusal: null, account_limits: {buy_lots: 14, sell_lots: 40, ts: now - 60, note: ''}, review_busy: false, review_started_ts: null, wake: null,
       // 5.4.1: стопы только в программе, узлы у денег на PRO, последняя проверка входа у двери, мысль о прибыли
       exchange_stop: false, money_model: 'pro', soft_stop: true, hard_stop: 277, guard: {busy: false, holds: 0, next_in_s: null},
       entry_gate: {busy: false, next_in_s: null, decision: 'ВОЙТИ', why: 'лента подтверждает выкуп 284, продавца в стакане мало — вход не хуже приказа', ts: now - 5250, entry: null, entry_kind: 'сейчас'},
@@ -3250,7 +3433,7 @@ function demoData() {
     exec: {do: 'BUY', entry: 284.5, entry_kind: 'откат', take: 291, invalidation: 281.2, why: 'выкуп 280–282 + прибыль +7% при жёсткой ставке', plan: 'Вход лимиткой 284,5, при пробое 286 объёмом — добор 30%.\nТейк 291 (верх канала), частичная фиксация 50% на 288,5.\nСтоп 281,2 — под последним выкупом. Не двигаем вниз.\nЕсли MX уходит под 2 780 — закрываемся руками.', confidence: 68, news_ids: ['a1b2c3', 'd4e5f6'], levels: [281.2, 284.5, 286, 288.5, 291], time_note: 'движение ждём после 14:00 МСК (инфляция) и на американской сессии'},
     frame: {headline: 'Лонг Сбера от выкупа к верху канала', frame: 'Идея простая: прибыль растёт, ставка держит маржу, покупатель дважды выкупил 280–282.\nЦель 291, стоп 281,2 — соотношение 2,3 к 1.', highlights: [{ticker: 'SBER', side: 'long', line: 'вход 284,5 · тейк 291 · стоп 281,2'}]},
     texts: {analysis: 'Досье SBER: цена 284,9, объём выше среднего на 18%, стакан с перевесом bid 1,4. Вайкофф — фаза D после спринга на 280,4. Курамото: лидер MX, r=0,71, Сбер синхронен с индексом. Бифуркация: спокойно, критичности нет.\n\nНовости: ставка жёсткая (плюс для маржи), прибыль +7%. Астро-фон нейтральный.', critique: 'Объём на выкупе — частично закрытие шортов. Стакан может быть спуфингом. Но тренд, новости и сезонность в одну сторону; главный риск — индекс.', verdict: 'BUY. Вход 284,5 лимиткой, тейк 291, стоп 281,2. Уверенность 68. Можно входить прямо сейчас — главное войти верно, а не оттягивать.'},
-    news: [news[0], news[1]], reviews: [{ts: now - 2700, choice: 'ЖДЁМ', why: 'позиция только открыта, движения нет', note: 'Сижу спокойно.'}, {ts: now - 900, choice: 'ЖДЁМ', why: 'цена идёт по плану, 287 — промежуточное сопротивление', note: 'Тейк 291 не трогаем. При 288,5 половину зафиксирую.'}],
+    news: [news[0], news[1]], reviews: [{ts: now - 2700, choice: 'ЖДЁМ', label: 'ДЕРЖАТЬ', in_pos: true, price: 285.2, why: 'позиция только открыта, движения нет', note: 'Сижу спокойно.'}, {ts: now - 900, choice: 'ЖДЁМ', label: 'ДЕРЖАТЬ', in_pos: true, price: 287.1, why: 'цена идёт по плану, 287 — промежуточное сопротивление', note: 'Тейк 291 не трогаем. При 288,5 половину зафиксирую.'}],
     handoffs: [{ts: now - 5400, reason: 'запуск: совет по SBER, режим «только лонг»', kind: 'council'}, {ts: now - 1500, reason: 'резкий ход: +1.10% за 10 мин (цена 287.4)', kind: 'shock'}, {ts: now - 1200, reason: 'прокол сканера вверх 97 % (подтверждение: полоса 287.4–287.9, в позиции long)', kind: 'puncture', deferred: true, triage: 'ПЛАНОВО: в нашу сторону — подождёт плановой'}], trades: {count: 2, pnl: 606}, price: 287.1, note: 'сухой брокер: заявки пишутся в лог', error: null, live: true, deposit: 300000, exec_ts: now - 5300,
     explain: [{ts: now - 5300, kind: 'council', title: 'Совет вынес приказ: BUY сейчас, тейк 291, стоп 281.2', text: 'Совет сошёлся на лонге: отчётность сильная, спринг на 280,4 выкуплен, стакан с перевесом покупателя. Вход по рынку, чтобы не оттягивать: главное войти верно. Стоп 281,2 — там идея мертва, тейк 291 — верх бокса. Пилот берёт столько лотов, сколько даёт биржа с плечом, и ставит аварийный трос на бирже чуть ниже триггера.', refs: {}, ok: true, model: 'flash'},
       {ts: now - 5200, kind: 'entry', title: 'Вход исполнен: long 8 лот @284.5', text: 'Вошли лонгом восемью лотами по 284,5 — цена дала войти без проскальзывания. Триггер мягкого стопа 281,2: у него пилот не бьёт стоп вслепую, а спросит FLASH, слить или подождать. Аварийный трос биржи лежит дальше, на 277. Дальше следим за 287 — промежуточное сопротивление.', refs: {}, ok: true, model: 'flash'},
@@ -3712,10 +3895,11 @@ const Pb = {
   tick() {   // локальные проверки свежести — при каждом снимке и раз в 5 с
     try {
       const st = S.state || {}, now = Date.now(), ms = S.mission.status, mk = st.market || {}, srv = ((st.health || {}).problems) || [];
-      const has = k => srv.some(p => p.kind === k);
       if (!DEMO && S.ws && S.ws.readyState === 1 && S.stateAt && now - S.stateAt > 15000) this.set('stale', {kind: 'stale', level: 'warn', act: 'refresh', text: `Снимок состояния не обновлялся ${Math.round((now - S.stateAt) / 1000)} с при живом потоке — опрос завис или сервер занят; «Обновить» запросит снимок сейчас`}); else this.clear('stale');
-      const pst = (ms && ms.pilot) || {}, pts = num(pst.price_ts);
-      if (ms && ms.live && pts && mk.open !== false && !has('data') && now / 1000 - pts > 60) this.set('price', {kind: 'data', level: 'warn', act: 'mission', text: `Цена ${ms.ticker} не обновлялась ${Math.round(now / 1000 - pts)} с при открытом рынке — котировки не идут (сеть, токен, лимит запросов?); пилот решает по старой цене`}); else this.clear('price');
+      // 5.4.4: пилот — не тикает, связь с Т-Банком, отказ биржи, маржа; цена протухла или (пилот без единого тика) «нет тиков» — вместо молчания
+      const pp = pilotProblems(ms, mk, srv, now / 1000, S._plMem || (S._plMem = {})), want = new Set(pp.map(x => x.id));
+      Object.keys(this.local).filter(id => (id === 'price' || id.startsWith('pl:')) && !want.has(id)).forEach(id => this.clear(id));
+      pp.forEach(x => this.set(x.id, x));
       const sc = ms && ms.scan, n = sc ? (num(sc.ticks) || 0) : 0;
       if (sc && sc.running && n < 9600) { if (n !== S._scanTicks) { S._scanTicks = n; S._scanAt = now; } const stall = S._scanAt && now - S._scanAt > 45000; S.mission.scanStall = stall ? Math.round((now - S._scanAt) / 1000) : 0; if (stall) this.set('scan', {kind: 'scan', level: 'warn', act: 'mission', text: `Сканер стакана ${ms.ticker} значится «идёт», но тики не приходят ${S.mission.scanStall} с — стакан Tinkoff молчит или задача сканера зависла; «Стоп», затем «Запустить» перезапустят`}); else this.clear('scan'); }
       else { S._scanTicks = null; S._scanAt = 0; S.mission.scanStall = 0; this.clear('scan'); }
@@ -3811,13 +3995,13 @@ sessTick(); setInterval(sessTick, 30000);
 // ═══ плюшки A: mini-inds (≤360: три пилюли статуса → одна с точками и расшифровкой) ═══
 function syncMiniInds() {
   const app = ((S.state || {}).app) || {};
-  $('#md-ds').className = 'md ' + (app.deepseek ? 'ok' : 'bad'); $('#md-tk').className = 'md ' + (app.tinkoff ? 'ok' : 'bad'); $('#md-mode').className = 'md ' + (app.dry ? 'dry' : 'live');
+  $('#md-ds').className = 'md ' + (app.deepseek ? 'ok' : 'bad'); $('#md-tk').className = 'md ' + tkLink(S.state || {}).md;   // 5.4.4 $('#md-mode').className = 'md ' + (app.dry ? 'dry' : 'live');
   { const tg = tgState(), e = $('#md-tg'); if (e) e.className = 'md ' + ({ok: 'ok', bad: 'bad', wait: 'wait'}[tg.lvl] || ''); }   // фаза 4 · W3
 }
 $('#ind-mini').onclick = () => togglePop('mini-pop', $('#ind-mini'), () => {
   const app = ((S.state || {}).app) || {}, mkt = ((S.state || {}).market) || {}, ws = $('#ind-ws').className.replace('ind ', '');
   const k = (n, col, v) => `<div class="k"><span><span class="dotk" style="background:${col};border-radius:50%"></span>${n}</span><b>${v}</b></div>`;
-  return `<div class="ph">Состояние</div>${k('DeepSeek', app.deepseek ? 'var(--green)' : 'var(--red)', app.deepseek ? 'ключ задан' : 'нет ключа')}${k('Tinkoff', app.tinkoff ? 'var(--green)' : 'var(--red)', app.tinkoff ? 'токен задан' : 'нет токена')}${(tg => k('Telegram', tg.col, esc(tg.text)))(tgState())}${k('Биржа', mkt.open === true ? 'var(--green)' : mkt.open === false ? 'var(--amber)' : 'var(--faint)', marketText(mkt))}${k('Брокер', app.dry ? 'var(--accent)' : 'var(--red)', app.dry ? 'сухой режим' : 'БОЕВОЙ')}${k('Поток', ws === 'ok' ? 'var(--green)' : ws === 'bad' ? 'var(--red)' : ws === 'wait' ? 'var(--amber)' : 'var(--faint)', ws === 'ok' ? 'подключён' : ws === 'bad' ? 'нет связи' : ws === 'wait' ? 'переподключаюсь' : DEMO ? 'демо' : '—')}<div class="pn">Ключи задаются кнопкой «Ключи».</div>`;
+  return `<div class="ph">Состояние</div>${k('DeepSeek', app.deepseek ? 'var(--green)' : 'var(--red)', app.deepseek ? 'ключ задан' : 'нет ключа')}${(t => k('Tinkoff', t.md === 'ok' ? 'var(--green)' : t.md === 'wait' ? 'var(--amber)' : 'var(--red)', esc(t.text)))(tkLink(S.state || {}))}${(tg => k('Telegram', tg.col, esc(tg.text)))(tgState())}${k('Биржа', mkt.open === true ? 'var(--green)' : mkt.open === false ? 'var(--amber)' : 'var(--faint)', marketText(mkt))}${k('Брокер', app.dry ? 'var(--accent)' : 'var(--red)', app.dry ? 'сухой режим' : 'БОЕВОЙ')}${k('Поток', ws === 'ok' ? 'var(--green)' : ws === 'bad' ? 'var(--red)' : ws === 'wait' ? 'var(--amber)' : 'var(--faint)', ws === 'ok' ? 'подключён' : ws === 'bad' ? 'нет связи' : ws === 'wait' ? 'переподключаюсь' : DEMO ? 'демо' : '—')}<div class="pn">Ключи задаются кнопкой «Ключи».</div>`;
 });
 $('#ind-mini').onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('#ind-mini').click(); } };
 
@@ -4019,11 +4203,14 @@ function bHoldOff() { const b = $('#c-yes'); if (b && b._bHoldOff) { b._bHoldOff
 
 // ═══ плюшки B: mission-live-signals — вспышка цены, морфинг фазы, тревога отсчёта, трос ползёт; level-cross-alert — касание уровня ═══
 function bMissionReset() { S._phase = undefined; S._lastPx = null; S._prevPx = null; S._pxDir = ''; S._lvSide = {}; S.hitAt = {}; S._newsKey = ''; }
-function bPhaseSet(phase, label) {   // бейдж фазы: при смене — плавная перекраска (меняем класс, не innerHTML) и одно кольцо-пульс; label — подпись точнее фазы (жду пробития, добираю, FLASH у троса)
-  const host = $('#m-phase'); if (!host) return; const el = $('.phase', host); const txt = label || PHASE_RU[phase] || phase;
-  if (!el) { host.innerHTML = `<span class="phase ${esc(phase)}"><span class="d"></span>${esc(txt)}</span>`; S._phase = phase; S._phaseTxt = txt; return; }
-  if (S._phase === phase && S._phaseTxt === txt) return;
-  el.className = 'phase ' + phase; el.lastChild.textContent = txt; S._phase = phase; S._phaseTxt = txt; bFlash(el, 'pop', 900);
+function bPhaseSet(phase, label, run) {   // бейдж фазы: при смене — плавная перекраска (меняем класс, не innerHTML) и одно кольцо-пульс; label — подпись точнее фазы (жду пробития, добираю, FLASH у троса); 5.4.4: run — pilotRun: пилот не работает — точка без пульса (still), не тикает — серым, связь мертва — красным
+  const host = $('#m-phase'); if (!host) return; const el = $('.phase', host);
+  const txt = (label || PHASE_RU[phase] || phase) + (run && run.kind === 'stale' ? ' · не тикает' : ''), cls = 'phase ' + phase + phaseStill(run), tip = run && !run.on ? run.text : '';
+  if (!el) { host.innerHTML = `<span class="${esc(cls)}" title="${esc(tip)}"><span class="d"></span>${esc(txt)}</span>`; S._phase = phase; S._phaseTxt = txt; S._phaseCls = cls; return; }
+  if (el.title !== tip) el.title = tip;
+  if (S._phase === phase && S._phaseTxt === txt && S._phaseCls === cls) return;
+  const moved = S._phase !== phase || S._phaseTxt !== txt;
+  el.className = cls; el.lastChild.textContent = txt; S._phase = phase; S._phaseTxt = txt; S._phaseCls = cls; if (moved) bFlash(el, 'pop', 900);
 }
 function marketText(mk) {   // рыночные часы: «открыта · основная» / «закрыта до 10:00 МСК»
   mk = mk || {}; if (mk.open === true) return 'открыта' + (mk.session && mk.session !== 'закрыто' ? ' · ' + mk.session : '');
@@ -4094,7 +4281,8 @@ function bMiniFill(st, px, fl, phase) {   // каркас один раз, да�
   const txt = (sel, t) => { const n = $(sel, el); if (n && n.textContent !== t) n.textContent = t; };
   const cls = (sel, c) => { const n = $(sel, el); if (n && n.className !== c) n.className = c; };
   txt('.tk', st.ticker || ''); txt('.px', lp != null ? fmtNum(lp) : '—'); txt('.fl', fl == null ? '' : fmtPnl(fl)); cls('.fl', 'fl ' + (fl == null ? 'muted' : fl >= 0 ? 'pos' : 'neg'));
-  txt('.phase .pt', PHASE_RU[phase] || phase); cls('.phase', 'phase ' + phase);
+  const run = S.mission.run;   // 5.4.4: пилот не работает — точка без пульса, не тикает — серым/красным (как бейдж фазы)
+  txt('.phase .pt', (PHASE_RU[phase] || phase) + (run && run.kind === 'stale' ? ' · не тикает' : '')); cls('.phase', 'phase ' + phase + phaseStill(run));
 }
 function bMiniWatch() {
   const head = $('#m-head'); if (!head) return; if (S._miniIO) { try { S._miniIO.disconnect(); } catch (e) {} }
