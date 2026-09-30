@@ -691,16 +691,19 @@ def test_wait_texts_are_neutral(free):
     wait, _ = mission._validate_exec({"do": "WAIT", "wait_for": "закрепление выше 101", "why": "мутно"}, "auto", 100)
     assert p.adopt_forecast({"exec": wait})
     m.exec, m.exec_ts = wait, time.time()
-    assert "WAIT — совет ждал: закрепление выше 101" in mission._exec_text(m) and "перевеса нет" not in mission._exec_text(m)
+    assert "Ориентир совета (не условие): закрепление выше 101" in mission._exec_text(m) and "перевеса нет" not in mission._exec_text(m)
     sit = p._situation_text(100.0)
     # ревью 5.4.2: выбор — из списка перепроверки (режим игры, НОВЫЙ_АНАЛИЗ), а не зашитые три слова
-    assert ("ПРИКАЗ СОВЕТА (0 мин назад): вне рынка; совет ждал: закрепление выше 101. Это прошлое мнение, а не запрет: "
-            "реши заново — КУПИТЬ_СЕЙЧАС | ЖДЁМ | ПРОДАТЬ_СЕЙЧАС | НОВЫЙ_АНАЛИЗ") in sit, sit
+    # v5.4.3: ориентир совета второй раз в ситуации не повторяется (он в блоке приказа)
+    opts = mission.prompts_mission.review_options("auto", False)
+    assert "ПРОДАТЬ_СЕЙЧАС" in opts and "КУПИТЬ_СЕЙЧАС" in opts and "НОВЫЙ_АНАЛИЗ" in opts
+    assert ("ПРИКАЗ СОВЕТА (0 мин назад): вне рынка — прошлое мнение, не запрет. Реши заново — " + opts) in sit, sit
+    assert "закрепление выше 101" not in sit, sit
     m2, p2 = make_pilot(play="long")
     assert p2.adopt_forecast({"exec": wait})
     m2.exec, m2.exec_ts = wait, time.time()
     sit2 = p2._situation_text(100.0)
-    assert "реши заново — КУПИТЬ_СЕЙЧАС | ЖДЁМ | НОВЫЙ_АНАЛИЗ" in sit2 and "ПРОДАТЬ" not in sit2, sit2
+    assert ("Реши заново — " + mission.prompts_mission.review_options("long", False)) in sit2 and "ПРОДАТЬ" not in sit2, sit2
 
 
 # ══ ревью 5.4.2 (часть 2) ══════════════════════════════════════════════════════════════════════════════════════════

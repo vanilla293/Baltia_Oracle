@@ -197,10 +197,10 @@ def test_adopt_wait_leaves_pilot_out_of_market_and_exec_text_shows_it():
     assert abs(p.review_ts - time.time() - ai_pilot.wait_review_sec()) < 5   # v5.4.2: PYTHIA_WAIT_REVIEW_SEC, не REVIEW_SEC
     m.exec, m.exec_ts = ex1, time.time()
     txt = mission._exec_text(m)
-    assert "WAIT — совет ждал: закрепление выше 101" in txt and "перевеса нет" in txt   # «перевеса нет» — слова ИИ (why)
+    assert "WAIT — вне рынка. Ориентир совета (не условие): закрепление выше 101" in txt and "перевеса нет" in txt   # «перевеса нет» — слова ИИ (why)
     sit = p._situation_text(100.0)
-    assert "ПРИКАЗ СОВЕТА (0 мин назад): вне рынка; совет ждал: закрепление выше 101" in sit, sit
-    assert "прошлое мнение, а не запрет" in sit and "войти можешь сам, если перевес появился" not in sit
+    assert "ПРИКАЗ СОВЕТА (0 мин назад): вне рынка — прошлое мнение, не запрет" in sit, sit   # v5.4.3: ориентир — в блоке приказа
+    assert "прошлое мнение, не запрет" in sit and "войти можешь сам, если перевес появился" not in sit
     assert mission.status("TEST")["phase"] == "idle" and mission.status("TEST")["exec"]["do"] == "WAIT"
 
     async def scenario():
