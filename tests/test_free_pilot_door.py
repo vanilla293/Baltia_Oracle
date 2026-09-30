@@ -2,7 +2,8 @@
 """ПИФИЯ v5.4.2 «СВОБОДНЫЙ ПИЛОТ»: дверь, перепроверка, мысль о прибыли и приказ совета на фейках — код не решает за ИИ.
 
 Молчание / таймаут / непонятный ответ — не «ЖДАТЬ»/«ДЕРЖАТЬ»/«ЖДЁМ» от имени ИИ и не вход вслепую: запись кода
-(НЕТ_ОТВЕТА / НЕ_РАЗОБРАН, silent, source «код») и скорый повтор (PYTHIA_SILENT_RETRY_SEC). Слово решения — по словарю
+(НЕТ_ОТВЕТА / НЕ_РАЗОБРАН, silent, source «код»); 5.4.4 — без быстрого повтора (у двери — после ответа
+дежурного PRO на перепроверке, в мысли о прибыли — не раньше PYTHIA_PROFIT_THINK_COOL_SEC). Слово решения — по словарю
 узла (ai_v5.decision_of): «BUY» у лонга — ВОЙТИ, «НЕ ВХОДИТЬ» — не разобрано. Свежее решение PRO по живому рынку
 (перепроверка, уровень от двери, перезаход) исполняется без второго вопроса у двери; приказ совета и протухшее / уехавшее
 решение — через дверь. Дрейф за время раздумий — новый вопрос, а не засада по старой цене. Ни сети, ни ключей, ни data/."""
@@ -213,7 +214,9 @@ def test_validate_exec_synonyms_placeholders_and_breakout_rule():
 
 
 # ── дверь: молчание, слово решения, свежее решение, приказ совета, дрейф ───────────────────────────────────────────
-def test_door_silence_is_no_decision_and_retries_soon(free):
+def test_door_silence_is_no_decision_and_waits_for_review(free):
+    """5.4.4 (воля владельца 30.09: PRO — раз в 30 мин и по рыночным триггерам): молчание у двери — без быстрого
+    повтора через PYTHIA_SILENT_RETRY_SEC; следующий вопрос у двери — после ответа дежурного PRO на перепроверке."""
     fake = free
 
     async def scenario():
@@ -226,22 +229,21 @@ def test_door_silence_is_no_decision_and_retries_soon(free):
         assert g["decision"] == "НЕТ_ОТВЕТА" and g["silent"] and g["source"] == "код" and "решения не было" in g["why"], g
         assert g["entry"] is None and g["wait_minutes"] is None and not g["council"], "поля ответа не читаются"
         assert all(x["decision"] != "ЖДАТЬ" for x in p.gates), "ЖДАТЬ за ИИ не записан"
-        retry = float(config.PYTHIA_SILENT_RETRY_SEC)
-        assert 0 < p.plan["gate_after"] - time.time() <= retry and p.plan["gate_silent"] == 1
+        assert not p.plan.get("gate_after") and p.plan.get("gate_review_ts") and p.plan["gate_silent"] == 1, p.plan
         assert fake.calls[-1][2] == float(config.PYTHIA_ENTRY_TIMEOUT_SEC), "срок попытки — PYTHIA_ENTRY_TIMEOUT_SEC"
         assert fake.errors and fake.errors[-1][0] == "mission_entry"
         await tick(p, 100.0)
-        assert fake.count("mission_entry") == 1, "до срока повтора PRO не спрашиваем"
+        assert fake.count("mission_entry") == 1, "до ответа перепроверки PRO у двери не спрашиваем"
         assert "не ответил у двери" in p.last_action and "велел ждать" not in p.last_action, p.last_action
         assert "ЖДАТЬ" not in p._gates_text(p.plan) and "решения не было" in p._gate_line(p.plan)
         assert "велел ждать" not in p._gate_line(p.plan)
-        # второе молчание подряд — счёт, исполнения по молчанию нет
-        p.plan["gate_after"] = 0.0
+        # второе молчание подряд (после ответа перепроверки) — счёт, исполнения по молчанию нет
+        p._last_review_ts = time.time() + 1.0
         fake.queue("mission_entry", FakeMoney.SILENT)
         await tick(p, 100.0)
         assert p.pending is None and p.plan["gate_silent"] == 2 and "дверь молчит 2 раз подряд" in p.gates[-1]["applied"]
         # настоящий ответ сбрасывает счёт; повторный вопрос видит прошлое молчание как «ответа не было»
-        p.plan["gate_after"] = 0.0
+        p._last_review_ts = time.time() + 2.0
         fake.queue("mission_entry", {"decision": "ВОЙТИ", "why": "стакан ожил"})
         await tick(p, 100.0)
         assert p.pending and "gate_silent" not in p.plan and "не ответил у двери" in fake.last_user("mission_entry")
@@ -264,7 +266,8 @@ def test_door_word_by_plan_side(free, side, word, enter):
             assert p.pending and g["decision"] == "ВОЙТИ", (word, g)
         else:
             assert p.pending is None and g["decision"] == "НЕ_РАЗОБРАН" and g["silent"] and p.plan, (word, g)
-            assert 0 < p.plan["gate_after"] - time.time() <= float(config.PYTHIA_SILENT_RETRY_SEC)
+            # 5.4.4: без быстрого повтора — следующий вопрос у двери после ответа дежурного PRO на перепроверке
+            assert p.plan.get("gate_review_ts") and not p.plan.get("gate_after"), p.plan
 
     asyncio.run(scenario())
 
@@ -293,8 +296,9 @@ def test_fresh_review_plan_enters_without_door_stale_and_drifted_go_through_door
         fake.queue("mission_entry", {"decision": "ЖДАТЬ", "why": "уехала"})
         await tick(p3, 101.5)
         assert fake.count("mission_entry") == 2 and p3.pending is None
-        # после ЖДАТЬ без уровня — снова дверь, а не «свежий вход» (ответ двери новее решения перепроверки)
-        p3.plan["gate_after"] = 0.0
+        # после ЖДАТЬ без уровня — снова дверь, а не «свежий вход» (ответ двери новее решения перепроверки);
+        # 5.4.4: и только после ответа дежурного PRO на перепроверке
+        p3._last_review_ts = time.time() + 1.0
         fake.queue("mission_entry", {"decision": "ВОЙТИ", "why": "теперь да"})
         await tick(p3, 100.2)
         assert fake.count("mission_entry") == 3 and p3.pending
@@ -596,19 +600,21 @@ def test_profit_exit_words(free, word):
     asyncio.run(scenario())
 
 
-def test_profit_silence_and_garbage_are_no_decision_with_quick_retry(free):
+def test_profit_silence_and_garbage_are_no_decision_without_quick_retry(free):
+    """5.4.4 (воля владельца 30.09): молчание и непонятный ответ мысли о прибыли — без быстрого повтора через
+    PYTHIA_SILENT_RETRY_SEC: следующая мысль — по поводу не раньше PYTHIA_PROFIT_THINK_COOL_SEC."""
     fake = free
 
     async def scenario():
         m, p = make_pilot()
         pos = await open_long(p, fake)
         inv0, take0 = pos["invalidation"], pos["take"]
-        retry = float(config.PYTHIA_SILENT_RETRY_SEC)
+        cool = float(config.PYTHIA_PROFIT_THINK_COOL_SEC)
         fake.queue("mission_profit", FakeMoney.SILENT)
         await tick(p, pos["entry"] + 7.0)
         x = p.profits[-1]
         assert x["decision"] == "НЕТ_ОТВЕТА" and x["silent"] and x["source"] == "код" and p.position is pos, x
-        assert pos["invalidation"] == inv0 and pos["take"] == take0 and 0 < pos["profit_next"] - time.time() <= retry
+        assert pos["invalidation"] == inv0 and pos["take"] == take0 and cool - 10 <= pos["profit_next"] - time.time() <= cool
         assert [c[2] for c in fake.calls if c[0] == "mission_profit"][-1] == float(config.PYTHIA_PROFIT_TIMEOUT_SEC)
         assert "ДЕРЖАТЬ" not in p._profits_text(pos) and "решения не было" in p._profits_text(pos)
         pos["profit_next"] = 0.0
@@ -616,7 +622,7 @@ def test_profit_silence_and_garbage_are_no_decision_with_quick_retry(free):
         await tick(p, pos["entry"] + 7.2)
         x = p.profits[-1]
         assert x["decision"] == "НЕ_РАЗОБРАН" and x["lock_price"] is None and pos["invalidation"] == inv0, x
-        assert 0 < pos["profit_next"] - time.time() <= retry
+        assert cool - 10 <= pos["profit_next"] - time.time() <= cool
 
     asyncio.run(scenario())
 

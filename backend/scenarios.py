@@ -2179,11 +2179,11 @@ async def s33_gate_cancel(sc: Scene) -> None:
 
 async def s34_gate_silent(sc: Scene) -> None:
     """PRO у двери молчит (таймаут попытки PYTHIA_ENTRY_TIMEOUT_SEC) → v5.4.2: это не решение ИИ — запись кода НЕТ_ОТВЕТА
-    (не «ЖДАТЬ»), входа и отмены нет, повтор через PYTHIA_SILENT_RETRY_SEC, ошибка в панель проблем; до срока тик PRO не
-    спрашивает и не пишет «ответ ЖДАТЬ» (5.4.3; было «велел ждать»); срок вышел → повтор → ВОЙТИ → вход. Непонятный
-    ответ — НЕ_РАЗОБРАН, так же; молчания подряд считаются, исполнения по молчанию нет."""
+    (не «ЖДАТЬ»), входа и отмены нет, ошибка в панель проблем; 5.4.4 (воля владельца 30.09: PRO — раз в 30 мин и по
+    рыночным триггерам): без быстрого повтора — у двери спросим снова после ответа дежурного PRO на перепроверке; до него
+    тик PRO не спрашивает и не пишет «ответ ЖДАТЬ» (5.4.3; было «велел ждать»); перепроверка ответила → вопрос → ВОЙТИ →
+    вход. Непонятный ответ — НЕ_РАЗОБРАН, так же; молчания подряд считаются, исполнения по молчанию нет."""
     sc.patch(config, "PYTHIA_ENTRY_TIMEOUT_SEC", 1)
-    sc.patch(config, "PYTHIA_SILENT_RETRY_SEC", 30)
     sc.patch(fake_ai, "silent_sleep", 0.2)        # фейк «не ответил за срок попытки» — TimeoutError, как у ai_v5
     assert sc.p.adopt_forecast(sc.ex("BUY"))
     fake_ai.queue("mission_entry", FakeAI.SILENT)
@@ -2192,15 +2192,17 @@ async def s34_gate_silent(sc: Scene) -> None:
     g = sc.p.gates[-1]
     assert g["decision"] == "НЕТ_ОТВЕТА" and g["silent"] and g["source"] == "код" and "не ответил у двери" in g["why"] \
         and "таймаут" in g["why"] and "решения не было" in g["why"], g
-    assert sc.p.plan.get("gate_after", 0) > time.time() + 20 and sc.p.state == "ЗАСАДА", (sc.p.plan, sc.p.state)
+    assert not sc.p.plan.get("gate_after") and sc.p.plan.get("gate_review_ts") and sc.p.state == "ЗАСАДА", \
+        (sc.p.plan, sc.p.state)
     assert fake_ai.errors and fake_ai.errors[-1][0] == "mission_entry", fake_ai.errors
     st = sc.p.status()["entry_gate"]
-    assert st["busy"] is False and 0 < st["next_in_s"] <= 30 and st["decision"] == "НЕТ_ОТВЕТА", st
-    await sc.tick(100.0)                          # срок не вышел — не спрашиваем
+    assert st["busy"] is False and st["next_in_s"] is None and st["wait_review"] is True \
+        and st["decision"] == "НЕТ_ОТВЕТА", st
+    await sc.tick(100.0)                          # перепроверка не отвечала — не спрашиваем
     assert fake_ai.count("mission_entry") == 1 and "не ответил у двери" in sc.p.last_action \
         and "ответ ЖДАТЬ" not in sc.p.last_action and "велел" not in sc.p.last_action, sc.p.last_action
     assert "ЖДАТЬ" not in sc.p._gates_text(sc.p.plan) and "решения не было" in sc.p._situation_text(100.0)
-    sc.p.plan["gate_after"] = 0.0                 # срок вышел
+    sc.p._last_review_ts = time.time() + 1.0      # дежурный PRO ответил на перепроверке
     fake_ai.queue("mission_entry", {"decision": "ВОЙТИ", "why": "стакан ожил"})
     await sc.tick(100.0)
     assert fake_ai.count("mission_entry") == 2 and sc.p.pending, sc.p.last_action
@@ -2213,11 +2215,11 @@ async def s34_gate_silent(sc: Scene) -> None:
     assert sc.p.adopt_forecast(sc.ex("BUY"))
     fake_ai.queue("mission_entry", FakeAI.SILENT, {"decision": "МОЖЕТ БЫТЬ", "why": "?"})
     await sc.tick(100.0)
-    sc.p.plan["gate_after"] = 0.0
+    sc.p._last_review_ts = time.time() + 2.0
     await sc.tick(100.0)
     g = sc.p.gates[-1]
     assert sc.p.pending is None and g["silent"] and g["decision"] == "НЕ_РАЗОБРАН" and "непонятно" in g["why"] \
-        and sc.p.plan.get("gate_after", 0) > time.time() and sc.p.plan["gate_silent"] == 2, g
+        and sc.p.plan.get("gate_review_ts") and sc.p.plan["gate_silent"] == 2, g
     assert "дверь молчит 2 раз подряд" in g["applied"] and sc.p.position is None, g
     # V: стоп-кран сессии сработал, ПОКА PRO думал у двери (закрытие с убытком в другой задаче) → ВОЙТИ не исполняется
     sc.p.plan = None
@@ -2238,8 +2240,8 @@ async def s34_gate_silent(sc: Scene) -> None:
     assert len(sc.broker.placed) == n_e and sc.p.pending is None and "стоп-кран" in sc.p.gates[-1]["applied"], (sc.broker.placed[n_e:], sc.p.gates[-1])
     assert not sc.p.plan.get("approved_until"), "стоп-кран — не временный запрет: одобрение не хранится"
     sc.p.session_risk = trader_risk.SessionRisk(DEPOSIT)
-    sc.note = ("молчание → НЕТ_ОТВЕТА (не ЖДАТЬ), повтор через SILENT_RETRY → ВОЙТИ → позиция; непонятный ответ — НЕ_РАЗОБРАН, "
-               "счёт подряд; стоп-кран во время раздумий — входа нет")
+    sc.note = ("молчание → НЕТ_ОТВЕТА (не ЖДАТЬ), повтор после ответа перепроверки → ВОЙТИ → позиция; непонятный ответ — "
+               "НЕ_РАЗОБРАН, счёт подряд; стоп-кран во время раздумий — входа нет")
 
 async def s35_profit_exit(sc: Scene) -> None:
     """Мысль о прибыли (5.4.1): пройдено ≥ 60 % хода от входа до тейка → PRO думает; ВЫЙТИ → закрыто в плюс по рынку,
@@ -2326,8 +2328,8 @@ async def s36_profit_reenter(sc: Scene) -> None:
 async def s37_profit_council(sc: Scene) -> None:
     """СОВЕТ из мысли о прибыли: триггер подтянут к lock_price (прибыль заперта, трос от него не ниже входа), тейк → цель,
     полный совет без очереди (handoff kind profit) → совет HOLD держит с новыми уровнями; ДЕРЖАТЬ с lock ниже входа —
-    не принят; молчание PRO → v5.4.2: НЕТ_ОТВЕТА (запись кода, не «ДЕРЖАТЬ» за ИИ), позиция как есть, скорый повтор,
-    ошибка в панель."""
+    не принят; молчание PRO → v5.4.2: НЕТ_ОТВЕТА (запись кода, не «ДЕРЖАТЬ» за ИИ), позиция как есть, ошибка в панель;
+    5.4.4 — без быстрого повтора: следующая мысль не раньше PYTHIA_PROFIT_THINK_COOL_SEC."""
     pos = await sc.open_position("long", inv=98.0, take=110.0)
     entry = pos["entry"]
     sc.p._last_reanalyze_ts = time.time()         # советы «только что» — мысль обязана пройти без очереди
@@ -2358,7 +2360,7 @@ async def s37_profit_council(sc: Scene) -> None:
     await sc.tick(109.0)
     await sc.wait_profit()
     assert pos["invalidation"] == 105.0 and "не принят" in sc.p.profits[-1]["applied"], sc.p.profits[-1]
-    # v5.4.2: молчание → не «ДЕРЖАТЬ» за ИИ: запись кода НЕТ_ОТВЕТА, позиция как есть, повтор через PYTHIA_SILENT_RETRY_SEC
+    # v5.4.2: молчание → не «ДЕРЖАТЬ» за ИИ: запись кода НЕТ_ОТВЕТА, позиция как есть; 5.4.4 — без быстрого повтора
     sc.patch(config, "PYTHIA_PROFIT_TIMEOUT_SEC", 1)
     sc.patch(fake_ai, "silent_sleep", 0.2)        # фейк «не ответил за срок попытки» — TimeoutError, как у ai_v5
     pos["profit_next"] = 0.0
@@ -2368,11 +2370,12 @@ async def s37_profit_council(sc: Scene) -> None:
     x = sc.p.profits[-1]
     assert x["decision"] == "НЕТ_ОТВЕТА" and x["silent"] and x["source"] == "код" and "не ответил" in x["why"] \
         and "решения не было" in x["why"] and sc.p.position is pos and pos["invalidation"] == 105.0, x
-    retry = float(config.PYTHIA_SILENT_RETRY_SEC)
-    assert pos["profit_next"] - time.time() <= retry + 1, "скорый повтор, а не полный кулдаун"
+    cool = float(config.PYTHIA_PROFIT_THINK_COOL_SEC)
+    assert pos["profit_next"] - time.time() >= cool - 10, "5.4.4: без быстрого повтора — полный пейсинг мысли"
     assert fake_ai.errors and fake_ai.errors[-1][0] == "mission_profit", fake_ai.errors
     assert "ДЕРЖАТЬ" not in sc.p._profits_text(pos).splitlines()[-1], "в промпт молчание идёт как «ответа не было»"
-    sc.note = "СОВЕТ → триггер 104 (трос не ниже входа), цель 111, совет HOLD 105/112; lock ниже входа не принят; молчание → НЕТ_ОТВЕТА, повтор"
+    sc.note = ("СОВЕТ → триггер 104 (трос не ниже входа), цель 111, совет HOLD 105/112; lock ниже входа не принят; "
+               "молчание → НЕТ_ОТВЕТА, без быстрого повтора")
 
 
 async def s38_shock_profit(sc: Scene) -> None:
@@ -2694,6 +2697,88 @@ async def s43_wait_alarm_kept(sc: Scene) -> None:
                "PRO один раз; КУПИТЬ снял будильник")
 
 
+async def s44_conditional_enter(sc: Scene) -> None:
+    """5.4.4 (C5): приказ совета «сейчас» → PRO у двери отвечает ВОЙТИ, но с условием: «войти на откате к 99.3» (entry
+    99.3, entry_kind откат) при цене 100 — это ожидание уровня, а не вход по текущей цене: засада переставлена на 99.3
+    (план gate_level), заявки нет; цена дошла до уровня — вход без второго вопроса у двери (уровень назвал сам PRO, решение
+    свежее). Уровень у самой цены (не дальше max(0.1 %, 2 шагов цены)) — обычный ВОЙТИ по текущей цене."""
+    b = sc.broker
+    assert sc.p.adopt_forecast(sc.ex("BUY", None, 110.0, 98.0)), sc.p.last_action
+    fake_ai.queue("mission_entry", {"decision": "ВОЙТИ", "entry": 99.3, "entry_kind": "откат",
+                                    "why": "войти на откате к 99.3 — там лимитный покупатель"})
+    await sc.tick(100.0)
+    assert fake_ai.count("mission_entry") == 1 and sc.p.pending is None and not b.placed, sc.p.last_action
+    plan = sc.p.plan
+    assert plan and plan["entry"] == 99.3 and plan["kind"] == "откат" and plan["src"] == "gate_level", plan
+    g = sc.p.gates[-1]
+    assert g["decision"] == "ВОЙТИ" and "условный ВОЙТИ: уровень откат @99.3 далеко от цены 100" in g["applied"], g
+    assert "ВОЙТИ с условием" in sc.p.last_action and sc.p.state == "ЗАСАДА", (sc.p.last_action, sc.p.state)
+    await sc.tick(99.7)                           # выше уровня — ждём, PRO у двери не дёргаем
+    assert fake_ai.count("mission_entry") == 1 and sc.p.pending is None, sc.p.last_action
+    await sc.tick(99.32)                          # уровень → вход по решению PRO без второго вопроса
+    assert fake_ai.count("mission_entry") == 1 and sc.p.pending and sc.p.pending["side"] == "long", sc.p.last_action
+    await sc.tick(99.32)
+    assert sc.p.position and sc.p.position["entry"] < 99.5, sc.p.position
+    # уровень у самой цены — обычный ВОЙТИ по текущей цене
+    await sc.p._close_all(99.4, "тест: освободить", reanalyze=False)
+    sc.p.pnls, sc.p.session_risk = [], trader_risk.SessionRisk(DEPOSIT)
+    assert sc.p.adopt_forecast(sc.ex("BUY", None, 110.0, 98.0)), sc.p.last_action
+    fake_ai.queue("mission_entry", {"decision": "ВОЙТИ", "entry": 99.95, "entry_kind": "откат",
+                                    "why": "откат уже здесь, лента выкупает"})
+    await sc.tick(100.0)
+    assert sc.p.pending and "условный" not in sc.p.gates[-1]["applied"], (sc.p.last_action, sc.p.gates[-1])
+    await sc.settle_ai()
+    assert any(e["title"] == f"{MM()} у двери: ВОЙТИ" for e in sc.xevents()), [e["title"] for e in sc.xevents()]
+    sc.note = "ВОЙТИ «на откате к 99.3» при 100 → засада у 99.3, не рыночный вход → у уровня вход без второго вопроса"
+
+
+async def s45_drift_once(sc: Scene) -> None:
+    """5.4.4 (D2): тренд, приказ совета «сейчас»; пока PRO думает у двери, цена каждый раз проходит 1.2 % в сторону
+    сделки. Первый ВОЙТИ — один переспрос с пометкой кода о дрейфе (не засада по старой цене и не молча выброшенный
+    ответ); второй ВОЙТИ дан уже после пометки — исполняется, раз цена не за тейком/стопом и (тейк − цена)/(цена − стоп)
+    ≥ 1: заявка без третьего вопроса. Тот же тренд у близкого тейка: отношение < 1 — «ход отыгран: вход не исполнен», план
+    снят, повод — к плановой перепроверке (PRO не дёргаем раньше)."""
+    orig = fake_ai.money_json
+
+    async def trending(system, user, *, route, max_tokens=None):
+        if route == "mission_entry":              # пока PRO думает у двери, тренд уносит цену на +1.2 %
+            px = round(sc.p.prices[-1] * 1.012, 4)
+            FakeTinkoff.price = px
+            sc.p.prices.append(px)
+        return await orig(system, user, route=route, max_tokens=max_tokens)
+    sc.patch(fake_ai, "money_json", trending)
+    assert sc.p.adopt_forecast(sc.ex("BUY", None, 110.0, 97.0)), sc.p.last_action
+    fake_ai.queue("mission_entry", {"decision": "ВОЙТИ", "why": "импульс, покупатель жмёт"},
+                  {"decision": "ВОЙТИ", "why": "импульс жив и после дрейфа"})
+    await sc.tick(100.0)                          # 1-й вопрос: ВОЙТИ, а цена уже 101.2 → один переспрос
+    assert fake_ai.count("mission_entry") == 1 and not sc.broker.placed, sc.p.last_action
+    assert "ВОЙТИ — переспрашиваю из-за дрейфа (1 раз)" in sc.p.last_action and sc.p.plan["drift_asked"] == 1
+    await sc.tick(sc.p.prices[-1])                # 2-й вопрос с пометкой кода: ВОЙТИ, цена ещё +1.2 % → по отношению
+    assert fake_ai.count("mission_entry") == 2 and sc.p.pending, sc.p.last_action
+    assert "ПОМЕТКА КОДА: с момента решения цена прошла 1.20 % в сторону сделки" in fake_ai.last_user["mission_entry"]
+    g = sc.p.gates[-1]
+    assert "ВОЙТИ исполнен после дрейфа" in g["applied"] and "(тейк−цена)/(цена−стоп) = 1.4" in g["applied"], g
+    await sc.tick(sc.p.prices[-1])
+    assert sc.p.position and fake_ai.count("mission_entry") == 2, sc.p.last_action
+    # тейк близко: второй ВОЙТИ после пометки — отношение < 1 → ход отыгран, план снят, повод к плановой
+    await sc.p._close_all(sc.p.prices[-1], "тест: освободить", reanalyze=False)
+    sc.p.pnls, sc.p.session_risk = [], trader_risk.SessionRisk(DEPOSIT)
+    px0 = sc.p.prices[-1]
+    assert sc.p.adopt_forecast(sc.ex("BUY", None, round(px0 * 1.035, 2), round(px0 * 0.97, 2))), sc.p.last_action
+    rv = sc.p.review_ts                           # плановая перепроверка по приказу — её «ход отыгран» не подтягивает
+    fake_ai.queue("mission_entry", {"decision": "ВОЙТИ", "why": "идём"}, {"decision": "ВОЙТИ", "why": "всё ещё идём"})
+    await sc.tick(px0)
+    await sc.tick(sc.p.prices[-1])
+    assert fake_ai.count("mission_entry") == 4 and sc.p.plan is None and sc.p.pending is None, sc.p.last_action
+    g = sc.p.gates[-1]
+    assert "ход отыгран: вход не исполнен" in g["applied"] and "(тейк−цена)/(цена−стоп) = 0." in g["applied"], g
+    assert "ход отыгран" in (sc.p._review_reason or "") and sc.p.review_ts == rv, "повод к плановой — PRO раньше не зовём"
+    await sc.settle_ai()
+    assert any(e["title"] == "Ход отыгран: вход не исполнен" for e in sc.xevents()), [e["title"] for e in sc.xevents()]
+    sc.note = ("тренд +1.2 % за каждую мысль двери: ВОЙТИ → один переспрос → ВОЙТИ исполнен (отношение 1.4); "
+               "близкий тейк → «ход отыгран», план снят, повод к плановой")
+
+
 SCENARIOS: list[tuple[str, Callable[[Scene], Awaitable[None]]]] = [
     ("гэп_за_трос", s01_gap_hard), ("гэп_за_триггер", s02_gap_trigger), ("мёртвый_рынок", s03_dead_market),
     ("рынок_закрыт", s04_market_closed), ("частичка_30042", s05_partial_then_30042),
@@ -2719,6 +2804,8 @@ SCENARIOS: list[tuple[str, Callable[[Scene], Awaitable[None]]]] = [
     ("ждём_будильник", s42_wait_alarm),
     # ревью 5.4.3: будильник снимается только явным решением, проход за раздумья — повод, без пинг-понга у уровня
     ("будильник_держит", s43_wait_alarm_kept),
+    # 5.4.4 (X2): условный ВОЙТИ у двери — засада у уровня; дрейф — не больше одного переспроса, второй ВОЙТИ исполняется
+    ("вход_условный", s44_conditional_enter), ("дрейф_один_переспрос", s45_drift_once),
 ]
 
 
@@ -2795,4 +2882,5 @@ if __name__ == "__main__":
           "v5.4.1: PRO у двери ЖДАТЬ/ОТМЕНИТЬ/молчит, мысль о прибыли ВЫЙТИ/ПЕРЕЗАЙТИ/СОВЕТ, рывок в плюсе, приказ WAIT, "
           "стопы только в программе; ревью 5.4.2: совет «держать» — HOLD без добора, молчание у троса/тейка — запись кода; "
           "v5.4.3: ЖДЁМ с уровнем — будильник, проход цены → PRO решает заново; ревью 5.4.3: ЖДЁМ без entry будильник "
-          "не снимает, проход за раздумья — повод, пила у уровня не будит повторно)")
+          "не снимает, проход за раздумья — повод, пила у уровня не будит повторно; 5.4.4: условный ВОЙТИ у двери — "
+          "засада у уровня, дрейф — один переспрос, второй ВОЙТИ по отношению исполнен или «ход отыгран»)")

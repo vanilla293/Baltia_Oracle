@@ -342,7 +342,9 @@ def test_entry_gate_wait_with_level_then_enter(offline, monkeypatch):
     asyncio.run(scenario())
 
 
-def test_entry_gate_wait_without_level_uses_wait_minutes_or_cooldown(offline, monkeypatch):
+def test_entry_gate_wait_without_level_uses_wait_minutes_or_waits_for_review(offline, monkeypatch):
+    """5.4.4 (воля владельца 30.09: PRO — раз в 30 мин и по рыночным триггерам): ЖДАТЬ без уровня и срока — не повтор
+    через PYTHIA_ENTRY_CHECK_COOL_SEC, а следующий вопрос у двери после ответа дежурного PRO на перепроверке."""
     fake = offline
     monkeypatch.setattr(config, "PYTHIA_ENTRY_CHECK_COOL_SEC", 120)
     monkeypatch.setattr(config, "PYTHIA_ENTRY_FRESH_SEC", 0)   # v5.4.2: у уровня дверь спрашивается снова (как 5.4.1)
@@ -359,27 +361,37 @@ def test_entry_gate_wait_without_level_uses_wait_minutes_or_cooldown(offline, mo
         assert fake.count("mission_entry") == 1 and "PRO у двери ответ ЖДАТЬ, повтор в" in p.last_action \
             and "велел" not in p.last_action and "подождать открытия США" not in p.last_action and p.state == "ЗАСАДА"
         assert 880 <= p.status()["entry_gate"]["next_in_s"] <= 900
-        # ЖДАТЬ без уровня и без срока → PYTHIA_ENTRY_CHECK_COOL_SEC
+        # ЖДАТЬ без уровня и без срока → 5.4.4: до ответа дежурного PRO на перепроверке
         plan["gate_after"] = 0.0
         fake.queue("mission_entry", {"decision": "ЖДАТЬ", "why": "мутно"})
         await tick(p, 100.0)
-        assert plan["entry"] is None and 110 <= plan["gate_after"] - time.time() <= 120, plan
+        assert plan["entry"] is None and plan.get("gate_review_ts") and not plan.get("gate_after"), plan
+        await tick(p, 100.0)
+        assert fake.count("mission_entry") == 2, "до ответа перепроверки у двери не спрашиваем"
         # уровень принят, а кривой стоп (выше уровня) — нет: план хранит прежний стоп
-        plan["gate_after"] = 0.0
+        p._last_review_ts = time.time() + 1.0
         fake.queue("mission_entry", {"decision": "ЖДАТЬ", "why": "на откате", "entry": 99.0, "entry_kind": "откат", "invalidation": 99.5})
         await tick(p, 100.0)
         assert plan["entry"] == 99.0 and plan["kind"] == "откат" and plan["invalidation"] == 98.0, plan
         assert "не с той стороны" in p.last_action and "gate_after" not in plan, p.last_action
-        # уровень, при котором стоп плана оказывается не с той стороны (прорыв 97 при стопе 98) — отвергнут, срок COOL
+        # уровень, при котором стоп плана оказывается не с той стороны (прорыв 97 при стопе 98) — отвергнут; без уровня
+        # и срока — 5.4.4: до ответа перепроверки
         plan["gate_after"] = 0.0
         fake.queue("mission_entry", {"decision": "ЖДАТЬ", "why": "ниже", "entry": 97.0, "entry_kind": "откат"})
         await tick(p, 99.02)                                        # у уровня 99 — вторая проверка
-        assert plan["entry"] == 99.0 and "отвергнут" in p.last_action and 110 <= plan["gate_after"] - time.time() <= 120, p.last_action
-        # срок ЖДАТЬ зажат снизу минутой и сверху 4 часами
-        plan["gate_after"] = 0.0
+        assert plan["entry"] == 99.0 and "отвергнут" in p.last_action and plan.get("gate_review_ts") \
+            and not plan.get("gate_after"), p.last_action
+        # срок ЖДАТЬ зажат снизу (5.4.4: 10 мин) и сверху 4 часами
+        p._last_review_ts = time.time() + 2.0
         fake.queue("mission_entry", {"decision": "ЖДАТЬ", "why": "долго", "wait_minutes": 600})
-        await tick(p, 100.0)
-        assert plan["gate_after"] - time.time() <= ai_pilot.GATE_WAIT_MAX_SEC + 1
+        await tick(p, 99.02)                                        # у уровня 99 — вопрос у двери
+        assert fake.count("mission_entry") == 5, p.last_action
+        assert ai_pilot.GATE_WAIT_MAX_SEC - 5 <= plan["gate_after"] - time.time() <= ai_pilot.GATE_WAIT_MAX_SEC + 1
+        p._last_review_ts = time.time() + 3.0
+        plan["gate_after"] = 0.0
+        fake.queue("mission_entry", {"decision": "ЖДАТЬ", "why": "минуту", "wait_minutes": 1})
+        await tick(p, 99.02)
+        assert 590 <= plan["gate_after"] - time.time() <= 601, "5.4.4: срок у двери не короче 10 мин"
 
     asyncio.run(scenario())
 
@@ -417,22 +429,22 @@ def test_entry_gate_silence_and_unknown_answer_block_entry_then_retry(offline, m
         assert p.adopt_forecast(ex("BUY"))
         fake.queue("mission_entry", FakeMoney.SILENT)
         await tick(p, 100.0)
-        # v5.4.2: молчание — не ЖДАТЬ от имени ИИ: запись кода НЕТ_ОТВЕТА, повтор через PYTHIA_SILENT_RETRY_SEC (не COOL)
-        retry = float(config.PYTHIA_SILENT_RETRY_SEC)
-        assert p.pending is None and p.plan and retry - 10 <= p.plan["gate_after"] - time.time() <= retry
+        # v5.4.2: молчание — не ЖДАТЬ от имени ИИ: запись кода НЕТ_ОТВЕТА; 5.4.4 — без быстрого повтора: следующий
+        # вопрос у двери после ответа дежурного PRO на перепроверке
+        assert p.pending is None and p.plan and p.plan.get("gate_review_ts") and not p.plan.get("gate_after"), p.plan
         g = p.gates[-1]
         assert g["decision"] == "НЕТ_ОТВЕТА" and g["silent"] and g["source"] == "код" and "PRO не ответил" in g["why"] \
             and "таймаут" in g["why"] and "решения не было" in g["why"], g
         assert fake.errors and fake.errors[-1][0] == "mission_entry"
         await tick(p, 100.0)
-        assert fake.count("mission_entry") == 1, "до срока PRO не спрашиваем"
+        assert fake.count("mission_entry") == 1, "до ответа перепроверки PRO у двери не спрашиваем"
         assert "не ответил у двери" in p.last_action and "велел ждать" not in p.last_action, p.last_action
-        p.plan["gate_after"] = 0.0
+        p._last_review_ts = time.time() + 1.0
         fake.queue("mission_entry", {"decision": "?!"})
         await tick(p, 100.0)
         assert p.pending is None and p.gates[-1]["silent"] and p.gates[-1]["decision"] == "НЕ_РАЗОБРАН" \
             and "непонятно" in p.gates[-1]["why"] and len(fake.errors) == 2
-        p.plan["gate_after"] = 0.0
+        p._last_review_ts = time.time() + 2.0
         fake.queue("mission_entry", {"decision": "войти", "why": "ок"})
         await tick(p, 100.0)
         assert p.pending and fake.count("mission_entry") == 3
@@ -638,7 +650,8 @@ def test_profit_council_and_silence(offline, monkeypatch):
         pos["opened_ts"] = time.time()
         assert p.adopt_forecast(ex("SELL", None, 95.0, 108.0)) is True and p.plan["side"] == "short"
         p.plan = None
-        # v5.4.2: молчание → не «ДЕРЖАТЬ» за ИИ: запись кода НЕТ_ОТВЕТА, позиция как есть, скорый повтор, ошибка в панель
+        # v5.4.2: молчание → не «ДЕРЖАТЬ» за ИИ: запись кода НЕТ_ОТВЕТА, позиция как есть, ошибка в панель; 5.4.4 —
+        # без быстрого повтора: следующая мысль не раньше PYTHIA_PROFIT_THINK_COOL_SEC
         pos["profit_next"] = 0.0
         inv0 = pos["invalidation"]
         fake.queue("mission_profit", FakeMoney.SILENT)
@@ -646,8 +659,8 @@ def test_profit_council_and_silence(offline, monkeypatch):
         x = p.profits[-1]
         assert x["decision"] == "НЕТ_ОТВЕТА" and x["silent"] and x["source"] == "код" and "PRO не ответил" in x["why"] \
             and p.position is pos and pos["invalidation"] == inv0, x
-        retry = float(config.PYTHIA_SILENT_RETRY_SEC)
-        assert retry - 10 <= pos["profit_next"] - time.time() <= retry, pos["profit_next"] - time.time()
+        cool = float(config.PYTHIA_PROFIT_THINK_COOL_SEC)
+        assert cool - 10 <= pos["profit_next"] - time.time() <= cool, pos["profit_next"] - time.time()
         assert fake.errors[-1][0] == "mission_profit"
 
     asyncio.run(scenario())

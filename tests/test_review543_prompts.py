@@ -469,7 +469,9 @@ def test_code_guard_hold_until_price_is_a_trigger_not_an_exit(fake):
 
 def test_code_door_wait_with_level_and_term(fake):
     """Дверь: ЖДАТЬ с уровнем и сроком — у уровня до срока ни входа, ни вопроса; после срока — вход у уровня без
-    второго вопроса (свежий ответ двери); ЖДАТЬ без того и другого — вопрос снова через PYTHIA_ENTRY_CHECK_COOL_SEC."""
+    второго вопроса (свежий ответ двери); ЖДАТЬ без того и другого — 5.4.4 (воля владельца 30.09: PRO — раз в 30 мин
+    и по рыночным триггерам): вопрос снова только после ответа дежурного PRO на перепроверке (было — через
+    PYTHIA_ENTRY_CHECK_COOL_SEC; обещание в тексте промпта двери правит владелец промптов)."""
     async def scenario():
         m, p = make_pilot()
         assert p.adopt_forecast(order("BUY", None, 110.0, 98.0))
@@ -484,12 +486,17 @@ def test_code_door_wait_with_level_and_term(fake):
         p.plan["gate_after"] = 0.0                                 # срок вышел, уровень держится — вход без двери
         await tick(p, 99.4, 2)
         assert fake.count("mission_entry") == 1 and p.broker.placed, p.last_action
-        # без уровня и срока — повтор через PYTHIA_ENTRY_CHECK_COOL_SEC
+        # без уровня и срока — 5.4.4: следующий вопрос у двери после ответа дежурного PRO на перепроверке
         m2, p2 = make_pilot()
         assert p2.adopt_forecast(order("BUY", None, 110.0, 98.0))
         fake.queue("mission_entry", {"decision": "ЖДАТЬ", "why": "спред 3×"})
         await tick(p2, 100.0)
-        assert 290 <= p2.plan["gate_after"] - time.time() <= 301, p2.plan
+        assert p2.plan.get("gate_review_ts") and not p2.plan.get("gate_after"), p2.plan
+        await tick(p2, 100.0)
+        assert fake.count("mission_entry") == 2, "до ответа перепроверки у двери не спрашиваем"
+        p2._last_review_ts = time.time() + 1.0
+        await tick(p2, 100.0)
+        assert fake.count("mission_entry") == 3, "перепроверка ответила — у двери снова спрашивают"
 
     asyncio.run(scenario())
 
