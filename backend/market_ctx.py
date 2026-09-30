@@ -21,6 +21,12 @@ build()  — полное досье биржи (pipeline.collect_dossier → re
            gather), тяжёлая синхронная математика — в потоках (to_thread).
            Толкования методов даются в форме «школа читает это так», без
            приказов; числа и факты — как есть, нули не выдумываются.
+           Ревью 5.4.3 (закон 3): гейт Курамото («вход опасен / разрешён»,
+           «ходам доверять»), причина оракула («— ждём», «наблюдаем», «вход
+           только по …») и директива («ВНЕ РЫНКА», зоны-советы) идут фактом;
+           правила машин 4.x — отдельной строкой «обычно читают так»; поза
+           классификатора микроструктуры («готовить вход», «ждать разворот»,
+           «входы запрещены») — толкованием класса (POSTURE_SCHOOL), не цитатой.
 light()  — лёгкий снимок для перепроверки: цена, стакан, лента (Tinkoff) +
            рентген и Майя из свежего стакана; без токена — MOEX.
 Self-тест (без сети): python3 -m backend.market_ctx
@@ -30,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import re
 import time
 
 from . import (aether, ai_v5, astro, bifurcation, compress, instruments,
@@ -130,6 +137,15 @@ async def _guard(name: str, aw, errors: list[str], *, timeout: float = LAYER_TIM
 
 
 # ── рендеры слоёв ──────────────────────────────────────────────────────────────
+# ревью 5.4.3 (закон 3): гейт 4.x писал в данные приказы («вход по такому ходу опасен / разрешён», «ходам доверять»);
+# теперь — факт (r̄ и где он относительно порогов), толкование школы — отдельной строкой «обычно читают так», без приказов
+def _kuramoto_school() -> str:
+    return (f"Обычно читают так (гейт 4.x — толкование, не приказ): r̄ < {kuramoto.R_TRAP:g} — поводыри вразнобой, "
+            "одиночный ход тикера без хора школа считает подозрительным (возможной ловушкой); "
+            f"r̄ ≥ {kuramoto.R_HERD:g} — стадный захват, каскады обычно ходят широко; между порогами — сцепка обычная, "
+            "без стадного ускорения.")
+
+
 def render_kuramoto(kur) -> str:
     if not isinstance(kur, dict) or kur.get("r") is None:
         return "Курамото: графа нет (мало рядов/баров) — сцепка поводырей неизвестна."
@@ -137,15 +153,15 @@ def render_kuramoto(kur) -> str:
     coup = kur.get("coupling") or {}
     coup_s = ", ".join(f"{k} {v:.2f}" for k, v in sorted(coup.items(), key=lambda kv: -kv[1]))
     if r < kuramoto.R_TRAP:
-        sense = (f"r̄<{kuramoto.R_TRAP}: хор поводырей вразнобой — одиночный ход тикера без хора "
-                 "= ловушка, вход по такому ходу опасен")
+        where = f"ниже порога рассинхрона {kuramoto.R_TRAP:g}"
     elif r >= kuramoto.R_HERD:
-        sense = f"r̄≥{kuramoto.R_HERD}: стадный захват — хор в фазе, каскады ходят широко, ходы доверять"
+        where = f"не ниже порога стадного захвата {kuramoto.R_HERD:g}"
     else:
-        sense = "сцепка обычная: хор жив, вход по ходу разрешён, но без стадного ускорения"
+        where = f"между порогами {kuramoto.R_TRAP:g} и {kuramoto.R_HERD:g}"
+    word = str(kur.get("word") or "").split(" — ")[0]          # ярлык машины без её толкования (оно — в школе)
     return (f"КУРАМОТО (1h, {KUR_DAYS}д, {kur.get('n')} рядов × {kur.get('bars')} баров): "
-            f"r̄={r:.2f} (мин {kur.get('r_min')}) — {kur.get('word')}. Вожак: {kur.get('leader')}. "
-            f"Сцепка: {coup_s}.\nГейт-смысл: {sense}.")
+            f"r̄={r:.2f} (мин {kur.get('r_min')}; {where}) — {word}. Вожак: {kur.get('leader')}. "
+            f"Сцепка: {coup_s}.\n{_kuramoto_school()}")
 
 
 def render_bifurcation(bif) -> str:
@@ -333,13 +349,36 @@ def render_xray(xr, ob=None, tape=None, *, norm=None, vol_norm=None, n_prices: i
         XRAY_SCHOOL])
 
 
+# ревью 5.4.3 (закон 3): «поза» классификатора 4.x (microstructure.classify) — приказы в обе стороны («готовить вход»,
+# «вход … ДО тика цены», «не выходить», «ждать разворот», «рыночные входы запрещены») даже в кавычках оставались
+# приказом в данных. Теперь по ярлыку класса (actor) — толкование школы без повелительных слов; незнакомый класс —
+# только ярлык и сигналы (факты), позу не цитируем
+POSTURE_SCHOOL = {
+    "КИТ грузит айсберг": "абсорбция при токсичном потоке — крупный игрок набирает против ленты; когда набор кончается, "
+                          "цена обычно уходит в сторону впитывания",
+    "МАРКЕТМЕЙКЕР: ложный клевок": "прокол экстремума без реальных продаж по CVD — вынос стопов (Stop-Hunt): после него "
+                                   "цена обычно возвращается, крупный игрок набирает у дна прокола",
+    "МАРКЕТМЕЙКЕР расчищает трубу": "спред сжат (Казимир) и лимитки снимают — пружина: резкий ход в сторону вакуума "
+                                    "обычно начинается раньше, чем его видно в цене",
+    "истощение у растяжки VWAP": "агрессор выдохся на растяжении от VWAP — импульс обычно гаснет, цену тянет к VWAP",
+    "МАРКЕТМЕЙКЕР рисует иллюзию": "стены стакана давят в одну сторону, а деньги ленты (CVD) идут в другую — цена обычно "
+                                   "идёт за CVD",
+    "ИНФАРКТ СПРЕДА": "спред разорван — рыночная заявка платит весь разрыв (проскальзывание в разы больше нормы)",
+}
+
+
 def _posture_note(xr: dict) -> str:
     """v5.4.3: «поза» классификатора 4.x — толкование школы, а не приказ (закон 3). Без сигналов классификатор
     по умолчанию писал «ждать чистый сетап» — это стояло в user-части каждого узла у денег как скрытый толчок
-    к ожиданию; теперь без сигналов позы нет, с сигналами — цитатой «обычно читают так»."""
+    к ожиданию; теперь без сигналов позы нет. Ревью 5.4.3: с сигналами — не цитата позы (в ней приказ), а
+    толкование класса из POSTURE_SCHOOL; класс незнаком — толкования нет (ярлык и сигналы уже в строке)."""
     if not (xr.get("signals") or []):
         return "явного давления крупного игрока классификатор не видит"
-    return f"школа микроструктуры обычно читает так (толкование, не приказ): «{xr.get('posture')}»"
+    actor = str(xr.get("actor") or "")
+    for key, reading in POSTURE_SCHOOL.items():
+        if actor.startswith(key):
+            return f"школа микроструктуры обычно читает так (толкование, не приказ): {reading}"
+    return "толкования этого класса у школы нет — только ярлык и сигналы"
 
 
 # ── календарь среды: Матьё + тег плотности ─────────────────────────────────────
@@ -416,6 +455,53 @@ def render_sync(sr, n_leaders: int = 0, n_own: int = 0) -> str:
 # ── свод голосов 4.x: оракул + директива ───────────────────────────────────────
 ORACLE_CALIBRATION = ("Калибровка: заявленные проценты приведены к измеренной точности на "
                       "истории (около монеты), выше ~60% не бывает.")
+# ревью 5.4.3 (закон 3): правила машин 4.x — толкование школы отдельной строкой, а не приказ в данных
+ORACLE_SCHOOL = ("Обычно читают так (правила машин 4.x — толкование, не приказ): ПАРЛАМЕНТ — сторона по взвешенным "
+                 "голосам, слабое согласие машина пишет как flat; У ПОРОГА — давление слома есть, сторону машина "
+                 "называет только при сильном согласии голосов, иначе flat; СИНГУЛЯРНОСТЬ (OVERRIDE) — машина идёт за "
+                 "вектором слома, голоса записаны, но не решают; кислота (среда по α Хилла и φ Пригожина) — права "
+                 "голосов сжаты к монете; ХАОС (инфаркт спреда) — машина стороны не называет; зоны карты давлений — "
+                 "чтение стакана школой.")
+# причина оракула 4.x несёт приказы машины («— ждём», «наблюдаем», «вход только по …», «вето всему») — в промпт идёт
+# факт состояния без них (сами правила — в ORACLE_SCHOOL); oracle.py — библиотека 4.x, её строки не переписываем
+_ORACLE_ORDERS = (
+    (re.compile(r"\s*—\s*вход только по сильному согласию парламента\s*\(([^)]*)\)"), r"; согласие парламента \1"),
+    (re.compile(r"\s*[:—,]\s*вход только по [^,;:—]*"), ""),
+    (re.compile(r"\s*—\s*вето всему(?:\s*,\s*наблюдаем)?"), ""),
+    (re.compile(r"\s*[:—,]\s*ждём(?: вектор сингулярности)?"), ""),
+    (re.compile(r"\s*[:—,]\s*наблюдаем"), ""),
+)
+_ORDER_WORDS = ("ждём", "наблюдаем", "вход только", "вето", "вне рынка")
+
+
+def oracle_reason_fact(reason) -> str:
+    """Причина оракула 4.x без приказа машины: «[У ПОРОГА] у порога: давление есть, сторона не названа, согласия нет —
+    ждём» → «[У ПОРОГА] у порога: давление есть, сторона не названа, согласия нет». Факты и числа остаются как есть."""
+    s = str(reason or "").strip()
+    for rx, rep in _ORACLE_ORDERS:
+        s = rx.sub(rep, s)
+    return s.strip(" ,;:—") or "—"
+
+
+def _directive_line(dv: dict) -> str:
+    """Карта давлений 4.x (directive.py) фактом: сторона голосов (или «своего перекоса по голосам нет» — без «ВНЕ
+    РЫНКА»), уверенность по своей шкале, режим (ярлык без совета школы), голоса и источники; зоны стакана — цитатой
+    «обычно читает так» (это чтение школы, а не зоны-приказ)."""
+    vt = dv.get("votes") or {}
+    side = {"long": "сторона голосов — лонг (вверх)", "short": "сторона голосов — шорт (вниз)"}.get(
+        str(dv.get("dir") or ""), "своего перекоса по голосам нет")
+    # v5.4.3: машина при флете писала «только чистые сетапы, мелочь игнорируем» и «нет перевеса — вне рынка, ждём
+    # чистый сетап» — это совет школы, а не факт: режим — ярлыком до « — », зоны с приказом ожидания не идут вовсе
+    regime = str(dv.get("regime") or "").split(" — ")[0]
+    zones = [str(z) for z in (dv.get("entry"), dv.get("stop"), dv.get("invalidation"))
+             if z and z != "—" and not any(w in str(z).lower() for w in _ORDER_WORDS)]
+    return (f"карта давлений 4.x («директива», не приказ): {side}, уверенность "
+            f"{_f(dv.get('confidence'), 0.0) * 100:.0f}% по своей шкале{' (сильная)' if dv.get('strong') else ''}, "
+            f"режим {regime}, голоса стакан {_f(vt.get('стакан'), 0.0):+.2f} / "
+            f"волна {_f(vt.get('волна'), 0.0):+.2f} / небо {_f(vt.get('небо'), 0.0):+.2f} "
+            f"(источники: {', '.join(dv.get('sources') or []) or 'нет'})"
+            + ("; школа обычно читает стакан так (толкование, не приказ): «" + "»; «".join(zones) + "»" if zones else "")
+            + ".")
 
 
 def render_oracle(v, dv) -> str:
@@ -435,7 +521,7 @@ def render_oracle(v, dv) -> str:
                  + f", права парламента {v.get('parliament_rights')}; окно бифуркации "
                  f"{'открыто' if v.get('window_open') else 'закрыто'}; ожидаемый ход "
                  f"{_f(v.get('expected_move_frac'), 0.0) * 100:.2f}%; предсказуемость "
-                 f"{v.get('predictability')}; причина: {v.get('reason')}")
+                 f"{v.get('predictability')}; состояние машины: {oracle_reason_fact(v.get('reason'))}")
         voices = v.get("voices") or {}
         if voices:
             vs = sorted(voices.items(), key=lambda kv: -_f((kv[1] or {}).get("w"), 0.0))
@@ -447,22 +533,13 @@ def render_oracle(v, dv) -> str:
     else:
         L.append("оракул: слой недоступен: " + (v if isinstance(v, str) and v else "расчёта нет"))
     if isinstance(dv, dict) and dv.get("dir"):
-        vt = dv.get("votes") or {}
-        # v5.4.3: машина 4.x при флете писала «только чистые сетапы, мелочь игнорируем» и «нет перевеса — вне
-        # рынка, ждём чистый сетап» — это совет школы, а не факт (закон 3): в промпт — только режим и зоны-числа
-        regime = str(dv.get("regime") or "").split(" — ")[0]
-        zones = [str(z) for z in (dv.get("entry"), dv.get("stop"), dv.get("invalidation"))
-                 if z and z != "—" and "ждём" not in str(z)]
-        L.append(f"директива — {dv.get('dir_word')}, уверенность "
-                 f"{_f(dv.get('confidence'), 0.0) * 100:.0f}% по своей шкале"
-                 f"{' (сильная)' if dv.get('strong') else ''}, "
-                 f"режим {regime}, голоса стакан {_f(vt.get('стакан'), 0.0):+.2f} / "
-                 f"волна {_f(vt.get('волна'), 0.0):+.2f} / небо {_f(vt.get('небо'), 0.0):+.2f} "
-                 f"(источники: {', '.join(dv.get('sources') or []) or 'нет'}); зоны: "
-                 + ("; ".join(zones) if zones else "своего перекоса по голосам нет") + ".")
+        L.append(_directive_line(dv))
     else:
-        L.append("директива: слой недоступен: " + (dv if isinstance(dv, str) and dv else "расчёта нет"))
+        L.append("карта давлений 4.x («директива»): слой недоступен: "
+                 + (dv if isinstance(dv, str) and dv else "расчёта нет"))
     L.append(ORACLE_CALIBRATION)
+    if (isinstance(v, dict) and v.get("state")) or (isinstance(dv, dict) and dv.get("dir")):
+        L.append(ORACLE_SCHOOL)                  # толкование — только когда есть что толковать
     return "\n".join(L)
 
 
@@ -958,16 +1035,64 @@ if __name__ == "__main__":
     kur = kuramoto.graph({"MX": xs, "BR": ys, "TEST": zs})
     assert kur and "r" in kur
     kt = render_kuramoto(kur)
-    assert "КУРАМОТО" in kt and "Гейт-смысл" in kt and kur["leader"] in kt
+    assert "КУРАМОТО" in kt and "Обычно читают так (гейт 4.x" in kt and kur["leader"] in kt and "Гейт-смысл" not in kt
     assert "графа нет" in render_kuramoto(None)
+    # ревью 5.4.3 (закон 3): гейт 4.x — факт (r̄ и порог) + толкование школы, без «опасен / разрешён / доверять»
+    for r_, where_ in ((0.2, "ниже порога рассинхрона"), (0.6, "между порогами"), (0.9, "не ниже порога стадного")):
+        k_ = render_kuramoto({"r": r_, "r_min": 0.1, "n": 3, "bars": 300, "leader": "MX", "coupling": {"MX": 1.2},
+                              "word": "РАССИНХРОН: поводыри вразнобой — одиночные ходы подозрительны"})
+        assert where_ in k_ and "Обычно читают так" in k_ and "одиночные ходы подозрительны" not in k_.split("\n")[0], k_
+        for bad in ("опасен", "разрешён", "доверять", "вход по"):
+            assert bad not in k_, (bad, k_)
+    # свод голосов: причина оракула без приказов машины, директива без «ВНЕ РЫНКА», зоны — цитатой школы
+    for reason_, want_ in (("[ХАОС] инфаркт спреда — вето всему, наблюдаем", "[ХАОС] инфаркт спреда"),
+                           ("[У ПОРОГА] у порога, но среда — кислота (α=1.50≤2: дисперсия бесконечна): вход только по "
+                            "вектору сингулярности, ждём", "[У ПОРОГА] у порога, но среда — кислота (α=1.50≤2: дисперсия "
+                            "бесконечна)"),
+                           ("[У ПОРОГА] у порога, сторона слома не названа — вход только по сильному согласию парламента "
+                            "(0.42)", "[У ПОРОГА] у порога, сторона слома не названа; согласие парламента 0.42"),
+                           ("[У ПОРОГА] у порога: давление есть, сторона не названа, согласия нет — ждём",
+                            "[У ПОРОГА] у порога: давление есть, сторона не названа, согласия нет"),
+                           ("[ПАРЛАМЕНТ] парламент ОТСТРАНЁН (α=1.50≤2) — ждём вектор сингулярности",
+                            "[ПАРЛАМЕНТ] парламент ОТСТРАНЁН (α=1.50≤2)"),
+                           ("[ПАРЛАМЕНТ] парламент: P(вверх)=0.55 по 5 голосам", "[ПАРЛАМЕНТ] парламент: P(вверх)=0.55 по 5 голосам")):
+        assert oracle_reason_fact(reason_) == want_, (oracle_reason_fact(reason_), want_)
+    v_flat = {"state": "У ПОРОГА", "dir": "flat", "p_long": 0.5, "confidence": 0.0, "mode": "momentum",
+              "reason": "[У ПОРОГА] у порога: давление есть, сторона не названа, согласия нет — ждём", "voices": {}}
+    dv_flat = {"dir": "flat", "dir_word": "ВНЕ РЫНКА", "confidence": 0.0, "regime": "флет/шум — только чистые сетапы, "
+               "мелочь игнорируем", "votes": {}, "sources": [], "entry": "нет перевеса — вне рынка, ждём чистый сетап",
+               "stop": "—", "invalidation": "—"}
+    ro_f = render_oracle(v_flat, dv_flat)
+    assert "своего перекоса по голосам нет" in ro_f and "режим флет/шум," in ro_f and "Обычно читают так" in ro_f, ro_f
+    for bad in ("ВНЕ РЫНКА", "вне рынка", "ждём", "наблюдаем", "чистые сетапы", "директива —", "причина:"):
+        assert bad not in ro_f, (bad, ro_f)
+    dv_long = dict(dv_flat, dir="long", dir_word="ЛОНГ (вверх)", confidence=0.6, sources=["стакан"],
+                   regime="когерентный тренд (Курамото r высокий) — движения продолжаются",
+                   entry="вход у поддержки/на ложном проколе вниз (вакуум под ценой 99.8)", stop="стоп под стеной bid 99.5",
+                   invalidation="идея отменена, если стена bid оказалась призраком и агрессор льёт вниз")
+    ro_l = render_oracle(dict(v_flat, dir="long", reason="[ПАРЛАМЕНТ] парламент: P(вверх)=0.58 по 4 голосам"), dv_long)
+    assert "сторона голосов — лонг (вверх)" in ro_l and "школа обычно читает стакан так (толкование, не приказ): «вход у " \
+        "поддержки/на ложном проколе вниз (вакуум под ценой 99.8)»; «стоп под стеной bid 99.5»" in ro_l, ro_l
+    assert "движения продолжаются" not in ro_l and "зоны:" not in ro_l
     bif = bifurcation.bifurcation_context(xs)
     bt = render_bifurcation(bif)
     assert "БИФУРКАЦИИ" in bt and "Хёрст" in bt and "Пригожин" in bt, bt
     assert "расчёта нет" in render_bifurcation(None)
     assert render_wyckoff(None) == "Вайкофф: расчёта нет (мало свечей)"
     assert "стакана нет" in render_xray(None) and "стакана нет" in render_xray({"available": False})
+    # ревью 5.4.3: поза классификатора 4.x — толкование класса без повелительных слов, а не цитата приказа
+    import inspect
+    import re as _re
+    _actors = _re.findall(r'actor = "([^"]+)"', inspect.getsource(microstructure.classify))
+    assert len(_actors) >= 7, _actors
+    for _a in _actors:
+        _n = _posture_note({"signals": ["x"], "actor": _a, "posture": "готовить вход; ждать разворот; входы запрещены"})
+        assert "«" not in _n and "готовить" not in _n and "ждать" not in _n and "запрещен" not in _n, _n
+        assert _a == "толпа-шум" or "обычно читает так (толкование, не приказ)" in _n, (_a, _n)
+    assert "толкования этого класса у школы нет" in _posture_note({"signals": ["x"], "actor": "новый класс"})
     ro = render_oracle("нет модуля", "нет модуля")
-    assert "оракул: слой недоступен" in ro and "директива: слой недоступен" in ro and "Калибровка" in ro
+    assert "оракул: слой недоступен" in ro and "«директива»): слой недоступен" in ro and "Калибровка" in ro
+    assert "Обычно читают так" not in ro, "нет слоёв — нет и толкования"
     assert "слой недоступен" in render_sync(None, 1, 0) and "слой недоступен" in render_calendar(None)
     assert _norm_spread_bps(0.01, 100.0) == 3.0 and abs(_norm_spread_bps(0.5, 100.0) - 125.0) < 1e-9
     assert _weather_regions("SBER") == [] and _weather_regions("BRV6") and _weather_regions("TTFV6")
@@ -1128,6 +1253,8 @@ if __name__ == "__main__":
         assert "к VWAP +0." in xt, xt
         ot = ctx["oracle_text"]
         assert "оракул" in ot and "директива" in ot and "голоса (" in ot and "Калибровка" in ot, ot
+        for bad in ("ВНЕ РЫНКА", "ждём", "наблюдаем", "вход только", "Гейт-смысл"):
+            assert bad not in ot and bad not in ctx["kuramoto_text"], (bad, ot)
         assert ctx["oracle"]["state"] in ("ХАОС", "СИНГУЛЯРНОСТЬ", "У ПОРОГА", "ПАРЛАМЕНТ")
         assert {"xray", "maya", "bif", "trend", "wyckoff"} <= set(ctx["oracle"]["voices"]), ctx["oracle"]["voices"]
         assert ctx["directive"]["dir"] in ("long", "short", "flat") and "стакан" in ctx["directive"]["sources"]
@@ -1214,7 +1341,8 @@ if __name__ == "__main__":
         # биржа молчит: голосуют только небо (урезанный вес) и Хоукс сканера — стакана/ленты нет
         assert "оракул — состояние" in ctx2["oracle_text"] and ctx2["oracle"]["dir"] in ("long", "short", "flat")
         assert not ({"xray", "maya", "bif", "trend", "wyckoff"} & set(ctx2["oracle"]["voices"])), ctx2["oracle"]["voices"]
-        assert "директива —" in ctx2["oracle_text"] and "стакан" not in ctx2["directive"]["sources"]
+        assert "карта давлений 4.x («директива», не приказ)" in ctx2["oracle_text"] and "стакан" not in ctx2["directive"]["sources"]
+        assert "ВНЕ РЫНКА" not in ctx2["oracle_text"] and "ждём" not in ctx2["oracle_text"], ctx2["oracle_text"]
         assert ctx2["scan"] and ctx2["scan"]["ticks"] == 210 and "СКАНЕР СТАКАНА" in ctx2["scan_text"]
         assert ctx2["scan"]["hawkes"] and ctx2["oracle"]["hawkes_n"] == ctx2["scan"]["hawkes"]["n"]
         for k in ("wyckoff_text", "xray_text", "reactor_text", "calendar_text", "sync_text",
@@ -1253,6 +1381,7 @@ if __name__ == "__main__":
         assert "Рентген: OBI" in lt2["text"] and "Майя: тяга вверх" in lt2["text"], lt2["text"]
         assert lt2["xray"]["available"] and lt2["maya"]["available"] and lt2["maya"]["pull"]["side"] == "вверх"
         assert "классификатор" in lt2["text"] and "с тягой согласен" in lt2["text"]
+        assert "проскальзывание" in lt2["text"] and "запрещены" not in lt2["text"], lt2["text"]
         assert 5 <= lt2["text"].count("\n") + 1 <= 10, lt2["text"]
         print("── light() ──\n" + lt2["text"])
 
