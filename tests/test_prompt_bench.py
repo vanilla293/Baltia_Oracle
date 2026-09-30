@@ -1,19 +1,23 @@
 # -*- coding: utf-8 -*-
-"""v5.4.2 · стенд промптов (backend/prompt_bench.py): «как DeepSeek торгует сам».
+"""v5.4.3 · стенд промптов (backend/prompt_bench.py): «как DeepSeek торгует сам».
 
 Закреплено: 14 выдуманных ситуаций строят НАСТОЯЩИЕ промпты prompts_mission (перепроверка вне рынка и в позиции,
 дверь, мысль о прибыли, вердикт) по закону 3 (голос 4.5.4, system ≤ 20 строк, без BANNED в обе стороны, «json» у
-JSON-узлов, время МСК) и воспроизводимо; блоки — в формате боевых сборщиков; вызовы ИИ — те же маршруты, что у
-mission.py (mission_review / mission_entry / mission_profit / mission_verdict; у денег — срок попытки); слово решения —
-ai_v5.decision_of по словарям узлов, неразобранное и сбой — silent («ответа не было»), стенд идёт дальше; отчёты
-(текст, markdown, JSON) содержат все ситуации; --dump пишет 28 файлов без ИИ; без ключа и без мока — код 2.
-Без сети: ai_v5.pro_json / money_json / pro_text подменены; в data/ ничего не пишется (tmp_path)."""
+JSON-узлов, время МСК) и воспроизводимо; тексты, которые в бою собирает mission.py (ситуация, приказ, план и ответы у
+двери, ход цены, новости, итог совета, сканер, prev совета), — из боевых сборщиков на сцене (настоящие Mission +
+MissionPilot, замороженное время), и промпт стенда совпадает байт в байт с тем, что собирает настоящий узел
+(MissionPilot._review / _entry_check / _profit_think) на тех же данных; запись перепроверки сцены — та же, что пишет
+_review; вызовы ИИ — те же маршруты, что у mission.py (mission_review / mission_entry / mission_profit /
+mission_verdict; у денег — срок попытки); слово решения — ai_v5.decision_of по словарям узлов, неразобранное и сбой —
+silent («ответа не было»), стенд идёт дальше; отчёты (текст, markdown, JSON) содержат все ситуации; --dump пишет 28
+файлов без ИИ; без ключа и без мока — код 2. Без сети: ai_v5.pro_json / money_json / pro_text подменены; в data/ ничего
+не пишется (tmp_path)."""
 import asyncio
 import json
 
 import pytest
 
-from backend import ai_v5, config, prompt_bench as pb
+from backend import ai_pilot, ai_v5, config, council, mission, prompt_bench as pb
 from backend import prompts_mission as pm
 
 
@@ -60,31 +64,93 @@ def test_prompts_are_reproducible_and_selfcheck_passes():
     pb.check_prompts()
 
 
-def test_blocks_in_combat_format():
+@pytest.mark.parametrize("sid,piece", pb.FORMAT_PIECES)
+def test_blocks_in_combat_format(sid, piece):
+    """Строки mission.py 5.4.3 в промптах стенда: цена ожидания (приказ WAIT — цена тогда → сейчас, ориентир — не
+    условие), прошлая перепроверка с ценой решения, «ЖДЁМ подряд», будильник, длительность совета, взведённый вход,
+    пройденный пробой, дверь без петли своих отговорок (ЖДАТЬ — факт с исходом по цене), повод перепроверки из
+    наблюдателей тика, prev совета со свёрнутыми перепроверками."""
+    system, user = pb.build(pb.BY_ID[sid])
+    assert piece in user or piece in system, (sid, piece)
+
+
+def test_blocks_other_sources_in_their_format():
     s1 = pb.BY_ID["range_mid_wait"]["args"]
-    assert "ПРИКАЗ СОВЕТА (100 мин назад): вне рынка; совет ждал: закрепление над 304" in s1["situation"]
-    assert "Это прошлое мнение, а не запрет: реши заново — КУПИТЬ_СЕЙЧАС | ЖДЁМ | ПРОДАТЬ_СЕЙЧАС | НОВЫЙ_АНАЛИЗ" in s1["situation"]
-    assert s1["prev_exec"].startswith("Приказ (30.09 09:40): WAIT — совет ждал:")
+    assert s1["prev_exec"].startswith("Приказ совета 30.09 09:40 (100 мин назад, цена тогда 299.8): WAIT — вне рынка. "
+                                      "Ориентир совета (не условие): закрепление над 304")
     assert s1["light"].startswith("SBER: цена 300.0 (30.09.2026 11:20 МСК, среда)") and "Рентген: OBI" in s1["light"]
     assert "Майя: тяга нет (симметрия)" in s1["light"]
-    assert s1["scan"].startswith("СКАНЕР СТАКАНА (онлайн, тик 3 с): 1260 тиков") and "Как читают" in s1["scan"]
+    assert s1["scan"].startswith("СКАНЕР СТАКАНА (онлайн, тик 3 с): 2360 тиков за 118 мин") and "Как читают" in s1["scan"]
     assert "ВАЙКОФФ D1 (250 баров)" in s1["wyckoff"] and "ВАЙКОФФ H1 (300 баров)" in s1["wyckoff"]
+    assert "цена 299.8 на 54% высоты бокса" in s1["wyckoff"], "перепроверка видит Вайкоффа досье совета (m.layers)"
     assert s1["council_text"].startswith("Совет daily от 30.09 08:50 МСК (2 ч назад) — общий по рынку")
     assert s1["partners"].startswith("Связанные бумаги для SBER") and "Обычно читают так" in s1["partners"]
     # прокол сканера — первым в ситуации, повод — как у _puncture_watch
     s3 = pb.BY_ID["breakout_hold"]["args"]["situation"]
     assert s3.startswith("ПРОКОЛ СКАНЕРА: сторона ВВЕРХ") and "мы вне рынка без плана" in s3
-    assert "ПОВОД ПЕРЕПРОВЕРКИ (внеплановая): прокол сканера вверх 61 %" in s3
-    # позиция: плавающий P/L согласован с ценой и лотами
+    # позиция: плавающий P/L и аварийный трос — как считает пилот (PYTHIA_HARD_STOP_PCT сцены)
     assert "ПОЗИЦИЯ: short 30 лот @303, в рынке 70 мин, плавающий P/L +1050 ₽" in pb.BY_ID["short_add"]["args"]["situation"]
-    assert "плавающий P/L -450 ₽" in pb.BY_ID["long_pressure"]["args"]["situation"]
-    # дверь и прибыль
-    _, ue = pb.build(pb.BY_ID["door_breakout"])
-    assert "ЖДУ ПРОБИТИЯ: long при проходе 304.0" in ue and "long прорыв @304 — уровень достигнут" in ue
+    assert "аварийный трос в программе @291.95, тейк 305.0" in pb.BY_ID["long_resistance"]["args"]["situation"]
+    # у двери нет строки ПРОВЕРКА ВХОДА (её место — блок ПРОШЛЫЕ ОТВЕТЫ У ДВЕРИ), причина ЖДАТЬ — один раз
+    _, ue = pb.build(pb.BY_ID["door_now"])
+    assert "ПРОВЕРКА ВХОДА:" not in ue and "ПОМЕТКА" not in ue and ue.count(pb.DOOR_CHECK) == 1
     _, up = pb.build(pb.BY_ID["profit_fade"])
     assert "ПРИБЫЛЬ: пройдено 77 % хода от входа 298 до тейка 305" in up and "УРОВНИ ПОЗИЦИИ: вход 298" in up
     _, uv = pb.build(pb.BY_ID["verdict_split"])
     assert "═══ АНАЛИЗ ═══" in uv and "═══ КРИТИКА ═══" in uv and "спринг" in uv and "ПРОШЛЫЙ ПЛАН" in uv
+
+
+@pytest.mark.parametrize("sid", [s["id"] for s in pb.SITUATIONS if s["node"] in pb.COMBAT_NODES])
+def test_bench_prompt_equals_combat_node(sid):
+    """Стенд = бой: настоящий узел mission.py (сбор данных, склейка ситуации и повода, промпт) в той же сцене собирает
+    РОВНО промпт стенда — формат сборщиков и склейки не разъедется."""
+    sit = pb.BY_ID[sid]
+    system, user, route = pb.combat_prompt(sid)
+    assert (system, user) == pb.build(sit)
+    assert route == pb.ROUTE_OF[sit["node"]]
+
+
+@pytest.mark.parametrize("sid,answer", pb.REVIEW_ANSWERS)
+def test_scene_review_record_is_combat(sid, answer):
+    """Запись перепроверки, которую сцена кладёт в историю, — та же, что пишет настоящий MissionPilot._review."""
+    pb.check_review_record(sid, answer)
+
+
+def test_verdict_prev_and_news_from_combat_builders():
+    sc = pb.SCENES["verdict_split"]()
+    ctx = pb.BY_ID["verdict_split"]["args"]["ctx"]
+    with sc.combat():
+        assert ctx["prev"] == mission._prev_text(sc.m)
+        assert ctx["council"] == mission._council_text()
+        assert ctx["news"] == pb._drive(mission._news_for(sc.m))[1]
+    assert ctx["reason"] == sc.m.handoffs[-1]["reason"] and ctx["reason"].startswith("перепроверка потребовала свежий разбор: ")
+    assert "ЖДЁМ @298.4 → сейчас 299.2 (+0.27 %)" in ctx["prev"] and "Пилот: вне рынка" in ctx["prev"]
+
+
+def test_scene_leaves_modules_as_they_were():
+    """Сборка сцен и сверка с боем не оставляют подмен: время, ручки, соседние модули, ИИ — как были."""
+    import time as _time
+    knobs = {k: getattr(config, k, None) for k in pb.SCENE_KNOBS}
+    names = ("newsflow", "watch", "council", "_scan_status_raw", "_persist", "explain", "_fit_blocks")
+    before = {n: getattr(mission, n) for n in names}
+    ai = (ai_v5.pro_json, ai_v5.money_json, ai_v5.now_msk_str, ai_v5._skew_s)
+    pb.combat_prompt("door_now")
+    pb.check_review_record(*pb.REVIEW_ANSWERS[0])
+    pb.SCENES["news_shock"]()
+    assert mission.time is _time and ai_pilot.time is _time and council.time is _time
+    assert {k: getattr(config, k, None) for k in pb.SCENE_KNOBS} == knobs
+    assert {n: getattr(mission, n) for n in names} == before
+    assert (ai_v5.pro_json, ai_v5.money_json, ai_v5.now_msk_str, ai_v5._skew_s) == ai
+
+
+def test_combat_check_writes_nothing_to_data():
+    before = _data_snapshot()
+    for s in pb.SITUATIONS:
+        if s["node"] in pb.COMBAT_NODES:
+            pb.combat_prompt(s["id"])
+    for sid, answer in pb.REVIEW_ANSWERS:
+        pb.check_review_record(sid, answer)
+    assert _data_snapshot() == before
 
 
 def test_kinds_and_routes_on_fake_ai(fake):
