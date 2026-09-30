@@ -2180,8 +2180,8 @@ async def s33_gate_cancel(sc: Scene) -> None:
 async def s34_gate_silent(sc: Scene) -> None:
     """PRO у двери молчит (таймаут попытки PYTHIA_ENTRY_TIMEOUT_SEC) → v5.4.2: это не решение ИИ — запись кода НЕТ_ОТВЕТА
     (не «ЖДАТЬ»), входа и отмены нет, повтор через PYTHIA_SILENT_RETRY_SEC, ошибка в панель проблем; до срока тик PRO не
-    спрашивает и не пишет «велел ждать»; срок вышел → повтор → ВОЙТИ → вход. Непонятный ответ — НЕ_РАЗОБРАН, так же;
-    молчания подряд считаются, исполнения по молчанию нет."""
+    спрашивает и не пишет «ответ ЖДАТЬ» (5.4.3; было «велел ждать»); срок вышел → повтор → ВОЙТИ → вход. Непонятный
+    ответ — НЕ_РАЗОБРАН, так же; молчания подряд считаются, исполнения по молчанию нет."""
     sc.patch(config, "PYTHIA_ENTRY_TIMEOUT_SEC", 1)
     sc.patch(config, "PYTHIA_SILENT_RETRY_SEC", 30)
     sc.patch(fake_ai, "silent_sleep", 0.2)        # фейк «не ответил за срок попытки» — TimeoutError, как у ai_v5
@@ -2198,7 +2198,7 @@ async def s34_gate_silent(sc: Scene) -> None:
     assert st["busy"] is False and 0 < st["next_in_s"] <= 30 and st["decision"] == "НЕТ_ОТВЕТА", st
     await sc.tick(100.0)                          # срок не вышел — не спрашиваем
     assert fake_ai.count("mission_entry") == 1 and "не ответил у двери" in sc.p.last_action \
-        and "велел ждать" not in sc.p.last_action, sc.p.last_action
+        and "ответ ЖДАТЬ" not in sc.p.last_action and "велел" not in sc.p.last_action, sc.p.last_action
     assert "ЖДАТЬ" not in sc.p._gates_text(sc.p.plan) and "решения не было" in sc.p._situation_text(100.0)
     sc.p.plan["gate_after"] = 0.0                 # срок вышел
     fake_ai.queue("mission_entry", {"decision": "ВОЙТИ", "why": "стакан ожил"})

@@ -355,7 +355,9 @@ def test_entry_gate_wait_without_level_uses_wait_minutes_or_cooldown(offline, mo
         plan = p.plan
         assert plan["entry"] is None and 890 <= plan["gate_after"] - time.time() <= 900 and p.gates[-1]["wait_minutes"] == 15
         await tick(p, 100.0)
-        assert fake.count("mission_entry") == 1 and "велел ждать до" in p.last_action and p.state == "ЗАСАДА"
+        # 5.4.3: факт ответа и время повтора, без «велел» и без копии причины
+        assert fake.count("mission_entry") == 1 and "PRO у двери ответ ЖДАТЬ, повтор в" in p.last_action \
+            and "велел" not in p.last_action and "подождать открытия США" not in p.last_action and p.state == "ЗАСАДА"
         assert 880 <= p.status()["entry_gate"]["next_in_s"] <= 900
         # ЖДАТЬ без уровня и без срока → PYTHIA_ENTRY_CHECK_COOL_SEC
         plan["gate_after"] = 0.0
@@ -491,14 +493,18 @@ def test_entry_gate_enter_does_not_chase_adverse_drift(offline):
         assert p.pending is None and not p.broker.placed, "за уехавшей ценой молча не гонимся"
         # v5.4.2: не засада по старой цене (в тренде она не исполнится), а сразу новый вопрос с живой ценой и пометкой
         assert plan["entry"] is None and plan.get("kind") != "откат" and plan["gate_after"] <= time.time(), plan
-        assert plan["gate_note"] == "цена ушла на 1.50% за время раздумий (было 100, стало 101.5)", plan["gate_note"]
-        assert "спрошу сразу по живой" in p.gates[-1]["applied"] and "цена ушла на 1.50%" in p.last_action, p.last_action
+        # 5.4.3: дрейф — нейтрально и с направлением (пометка кода), без «ушла за время раздумий»
+        assert plan["gate_note"] == ("с момента решения цена прошла 1.50 % в сторону сделки (решение при 100, сейчас "
+                                     "101.5): вход сейчас — по 101.5"), plan["gate_note"]
+        assert "спрошу сразу по живой" in p.gates[-1]["applied"] and "прошла 1.50 % в сторону сделки" in p.last_action, \
+            p.last_action
         # следующий тик — дверь снова, пометка о дрейфе в промпте; ВОЙТИ по живой цене → вход
         mission.ai_v5.money_json = fake.money_json
         fake.queue("mission_entry", {"decision": "ВОЙТИ", "why": "импульс жив — беру по 101.5"})
         await tick(p, 101.5)
         assert p.pending and fake.count("mission_entry") == 2      # первый вызов — медленный ответ ВОЙТИ, второй — по живой цене
-        assert "ПОМЕТКА К ЭТОМУ ВОПРОСУ: цена ушла на 1.50% за время раздумий" in fake.calls[-1][1]
+        assert "ПОМЕТКА КОДА: с момента решения цена прошла 1.50 % в сторону сделки" in fake.calls[-1][1]
+        assert "ПОМЕТКА К ЭТОМУ ВОПРОСУ" not in fake.calls[-1][1] and "за время раздумий" not in fake.calls[-1][1]
 
     asyncio.run(scenario())
 

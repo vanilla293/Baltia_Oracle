@@ -350,11 +350,12 @@ def test_review_drift_keeps_now_with_note_and_door_enter_drift_reasks(free):
         p._plan_from_review("КУПИТЬ_СЕЙЧАС", {"invalidation": 98.0, "take": 110.0}, "т", 100.0, 101.5, snap_ts=time.time())
         plan = p.plan
         assert plan["entry"] is None and plan["kind"] == "сейчас", "не засада по старой цене"
-        assert plan["gate_note"] == "цена ушла на 1.50% за время раздумий (было 100, стало 101.5)", plan
+        assert plan["gate_note"] == ("с момента решения цена прошла 1.50 % в сторону сделки (решение при 100, сейчас "
+                                     "101.5): вход сейчас — по 101.5"), plan
         fake.queue("mission_entry", {"decision": "ВОЙТИ", "why": "импульс жив"})
         await tick(p, 101.5)
         assert fake.count("mission_entry") == 1 and p.pending, "дрейф — вопрос двери с пометкой, ВОЙТИ по живой цене"
-        assert "ПОМЕТКА К ЭТОМУ ВОПРОСУ: цена ушла на 1.50%" in fake.last_user("mission_entry")
+        assert "ПОМЕТКА КОДА: с момента решения цена прошла 1.50 % в сторону сделки" in fake.last_user("mission_entry")
 
         # ВОЙТИ, а цена за время раздумий двери ушла хуже её снимка → сразу новый вопрос, не засада
         m2, p2 = make_pilot()
@@ -368,7 +369,8 @@ def test_review_drift_keeps_now_with_note_and_door_enter_drift_reasks(free):
         await tick(p2, 100.0)
         fake.during = None
         assert p2.pending is None and p2.plan["entry"] is None and p2.plan["gate_after"] <= time.time()
-        assert "цена ушла на 1.30% за время раздумий (было 100, стало 101.3)" == p2.plan["gate_note"], p2.plan
+        assert ("с момента решения цена прошла 1.30 % в сторону сделки (решение при 100, сейчас 101.3): вход сейчас — "
+                "по 101.3") == p2.plan["gate_note"], p2.plan
 
     asyncio.run(scenario())
 
@@ -405,7 +407,8 @@ def test_enter_blocked_by_transient_ban_is_remembered(free):
         fake.queue("mission_entry", {"decision": "ЖДАТЬ", "why": "уехала"})
         await tick(p2, 101.5)
         assert p2.pending is None and fake.count("mission_entry") == 3 and "approved_until" not in p2.plan
-        assert "от одобренной у двери 100 (стало 101.5)" in fake.last_user("mission_entry")
+        assert ("ПОМЕТКА КОДА: с момента ответа ВОЙТИ у двери цена прошла 1.50 % в сторону сделки (ВОЙТИ при 100, "
+                "сейчас 101.5)") in fake.last_user("mission_entry")
 
     asyncio.run(scenario())
 
@@ -904,7 +907,8 @@ def test_door_off_drift_is_not_chased(free, monkeypatch):
         p.review_ts = time.time() + 1800
         await tick(p, 103.5)
         assert p.plan is None and p.pending is None and not p.broker.placed and fake.count("mission_entry") == 0
-        assert "цена ушла на 3.50% от снимка решения 100 (стало 103.5) — реши заново по живой цене" in p._review_reason
+        assert ("с момента решения цена прошла 3.50 % в сторону сделки (решение при 100, сейчас 103.5) — план по старой "
+                "цене снят, реши заново по живой цене") in p._review_reason, p._review_reason
         assert p.review_ts <= max(time.time(), p._last_review_ts) + mission.EVENT_MIN_GAP_SEC + 1
         assert m.handoffs[-1]["kind"] == "pilot"
         # в пределах PYTHIA_ENTRY_DRIFT_PCT — вход сразу, как было
