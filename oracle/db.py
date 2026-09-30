@@ -450,7 +450,16 @@ class DB:
         async with self._wlock:
             if self.conn.in_transaction:    # хвост незакоммиченной записи — VACUUM внутри транзакции нельзя
                 await self.conn.commit()
-            await self.conn.execute("VACUUM INTO ?", (str(dest),))
+        if self.path == ":memory:":         # у копии в памяти нет отдельного соединения
+            async with self._wlock:
+                await self.conn.execute("VACUUM INTO ?", (str(dest),))
+        else:
+            # VACUUM на ОТДЕЛЬНОМ соединении: долгая копия не держит ответы бота на основном соединении
+            src = await aiosqlite.connect(self.path)
+            try:
+                await src.execute("VACUUM INTO ?", (str(dest),))
+            finally:
+                await src.close()
         _private(dest)
         return dest.stat().st_size
 

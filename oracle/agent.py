@@ -1089,7 +1089,8 @@ class Agent:
     async def reset_context(self) -> int:
         """Забыть краткосрочный контекст (/reset): все несвёрнутые реплики помечаются свёрнутыми.
         Долговременная память (факты, позиции, дневник, конспекты) не трогается. → сколько реплик."""
-        return await self.db.execute("UPDATE messages SET summarized=1 WHERE summarized=0")
+        async with self._sum_lock:      # дождаться конспектирования: иначе оно свернёт уже сброшенное
+            return await self.db.execute("UPDATE messages SET summarized=1 WHERE summarized=0")
 
     # ── ночная рефлексия ─────────────────────────────────────────────────────
     async def reflect(self) -> str | None:

@@ -43,6 +43,7 @@ LATE_AFTER = timedelta(minutes=10)      # опоздали больше — «п
 CATCH_UP = timedelta(hours=3)           # ежедневную задачу догоняем не позже, чем через 3 ч
 STALE_NAG = timedelta(hours=1)          # долбёжка, просроченная на час (бот лежал), — уже не к месту
 STALE_WAKE = timedelta(hours=1)         # будильник, опоздавший на час, не долбит
+FIRE_GUARD = timedelta(minutes=5)       # доставили, но состояние не записалось — не повторять чаще, чем раз в это время
 SEND_TIMEOUT = 60.0                     # секунд на одну отправку
 SEND_GIVE_UP = timedelta(minutes=30)    # столько пробуем переотправить при отказе Telegram, потом двигаем
 JOB_RETRY = (timedelta(minutes=5), timedelta(minutes=10), timedelta(minutes=20), timedelta(minutes=30))
@@ -324,6 +325,7 @@ class Scheduler:
         self._warned_no_notifier = False
         self._warned_times: set[str] = set()
         self._fail_since: dict[tuple[str, int], datetime] = {}
+        self._fired_guard: dict[int, datetime] = {}   # доставленные, но не записанные — не долбить каждый тик
         self._outage: tuple[datetime, datetime | None] | None = None   # последний обрыв связи: (с, по)
         self._offline = False                              # в этом тике сеть уже падала — остальное потом
         self._job_tasks: dict[str, asyncio.Task] = {}
@@ -526,6 +528,12 @@ class Scheduler:
         for row in rows:
             if self._offline:           # сети нет — остальное на следующем тике, а не по минуте на строку
                 break
+            rid = int(row.get("id") or 0)
+            held = self._fired_guard.get(rid)   # уже доставили, но запись состояния сорвалась — не долбим каждый тик
+            if held is not None:
+                if now - held < FIRE_GUARD:
+                    continue
+                self._fired_guard.pop(rid, None)
             try:
                 await self.fire(row, now)
             except asyncio.CancelledError:
@@ -598,9 +606,18 @@ class Scheduler:
         sent = await self._deliver(("fire", rid), msg, reminder_buttons(row, self._female()), now)
         if not sent:
             return False
-        if not await self.ctx.db.execute(update, params):
-            log.info("напоминание #%s изменили во время отправки — его состояние не трогаю", rid)
+        try:
+            advanced = await self.ctx.db.execute(update, params)
+        except Exception as e:  # доставили, но состояние не записалось (база занята) — придержим, чтоб не долбить
+            log.error("напоминание #%s: не смог обновить состояние после отправки (%s) — придержу на %s",
+                      rid, _err(e), FIRE_GUARD)
+            self._fired_guard[rid] = now
             return True
+        if not advanced:
+            log.info("напоминание #%s изменили во время отправки — его состояние не трогаю", rid)
+            self._fired_guard[rid] = now      # next_at не сдвинулся — не даём повториться каждый тик
+            return True
+        self._fired_guard.pop(rid, None)
         if sent == GAVE_UP:
             await self._record(f"Не смог доставить напоминание #{rid} (Telegram не принимал): {text}")
         elif kind == "followup":
