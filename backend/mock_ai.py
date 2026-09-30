@@ -412,7 +412,8 @@ def _review(system: str, user: str) -> dict:
                 "invalidation": None, "take": None, "note": "Вне рынка: смотрю на края коридора."}
     if k == 2:
         opts = _section(user, "ДОПУСТИМЫЕ choice:", ("\n",)) or system
-        sell = "ПРОДАТЬ_СЕЙЧАС" in opts and "КУПИТЬ_СЕЙЧАС" not in opts
+        # v5.4.3: метки списка без «_СЕЙЧАС» (КУПИТЬ / ПРОДАТЬ) — узнаём по корню, старые метки тоже подходят
+        sell = "ПРОДАТЬ" in opts and "КУПИТЬ" not in opts
         choice = "ПРОДАТЬ_СЕЙЧАС" if sell else "КУПИТЬ_СЕЙЧАС"
         inv = round(price * (1.01 if sell else 0.99), 4) if price else None
         take = round(price * (0.98 if sell else 1.02), 4) if price else None
