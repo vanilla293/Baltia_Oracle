@@ -329,9 +329,17 @@ def render_xray(xr, ob=None, tape=None, *, norm=None, vol_norm=None, n_prices: i
     return "\n".join([
         "РЕНТГЕН СТАКАНА (микроструктура 4.x, снимок досье): " + ", ".join(parts) + ".",
         f"классификатор: {xr.get('actor')} (уверенность {_f(xr.get('confidence'), 0.0):.2f}); "
-        f"сигналы: {', '.join(sig) if sig else 'нет'}; школа микроструктуры предлагает: "
-        f"{xr.get('posture')}.",
+        f"сигналы: {', '.join(sig) if sig else 'нет'}; {_posture_note(xr)}.",
         XRAY_SCHOOL])
+
+
+def _posture_note(xr: dict) -> str:
+    """v5.4.3: «поза» классификатора 4.x — толкование школы, а не приказ (закон 3). Без сигналов классификатор
+    по умолчанию писал «ждать чистый сетап» — это стояло в user-части каждого узла у денег как скрытый толчок
+    к ожиданию; теперь без сигналов позы нет, с сигналами — цитатой «обычно читают так»."""
+    if not (xr.get("signals") or []):
+        return "явного давления крупного игрока классификатор не видит"
+    return f"школа микроструктуры обычно читает так (толкование, не приказ): «{xr.get('posture')}»"
 
 
 # ── календарь среды: Матьё + тег плотности ─────────────────────────────────────
@@ -440,14 +448,18 @@ def render_oracle(v, dv) -> str:
         L.append("оракул: слой недоступен: " + (v if isinstance(v, str) and v else "расчёта нет"))
     if isinstance(dv, dict) and dv.get("dir"):
         vt = dv.get("votes") or {}
+        # v5.4.3: машина 4.x при флете писала «только чистые сетапы, мелочь игнорируем» и «нет перевеса — вне
+        # рынка, ждём чистый сетап» — это совет школы, а не факт (закон 3): в промпт — только режим и зоны-числа
+        regime = str(dv.get("regime") or "").split(" — ")[0]
+        zones = [str(z) for z in (dv.get("entry"), dv.get("stop"), dv.get("invalidation"))
+                 if z and z != "—" and "ждём" not in str(z)]
         L.append(f"директива — {dv.get('dir_word')}, уверенность "
                  f"{_f(dv.get('confidence'), 0.0) * 100:.0f}% по своей шкале"
                  f"{' (сильная)' if dv.get('strong') else ''}, "
-                 f"режим {dv.get('regime')}, голоса стакан {_f(vt.get('стакан'), 0.0):+.2f} / "
+                 f"режим {regime}, голоса стакан {_f(vt.get('стакан'), 0.0):+.2f} / "
                  f"волна {_f(vt.get('волна'), 0.0):+.2f} / небо {_f(vt.get('небо'), 0.0):+.2f} "
                  f"(источники: {', '.join(dv.get('sources') or []) or 'нет'}); зоны: "
-                 + "; ".join(str(z) for z in (dv.get("entry"), dv.get("stop"), dv.get("invalidation"))
-                             if z and z != "—") + ".")
+                 + ("; ".join(zones) if zones else "своего перекоса по голосам нет") + ".")
     else:
         L.append("директива: слой недоступен: " + (dv if isinstance(dv, str) and dv else "расчёта нет"))
     L.append(ORACLE_CALIBRATION)
@@ -823,7 +835,7 @@ def _xray_line(xr, book: dict, norm: float) -> str:
     sig = xr.get("signals") or []
     if sig:
         s += f"; сигналы: {', '.join(sig)}"
-    return s + f"; поза школы: {xr.get('posture')}"
+    return s + f"; {_posture_note(xr)}"
 
 
 def _maya_line(my) -> str:

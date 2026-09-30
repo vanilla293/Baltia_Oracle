@@ -1,0 +1,209 @@
+# -*- coding: utf-8 -*-
+"""v5.4.2 · стенд промптов (backend/prompt_bench.py): «как DeepSeek торгует сам».
+
+Закреплено: 14 выдуманных ситуаций строят НАСТОЯЩИЕ промпты prompts_mission (перепроверка вне рынка и в позиции,
+дверь, мысль о прибыли, вердикт) по закону 3 (голос 4.5.4, system ≤ 20 строк, без BANNED в обе стороны, «json» у
+JSON-узлов, время МСК) и воспроизводимо; блоки — в формате боевых сборщиков; вызовы ИИ — те же маршруты, что у
+mission.py (mission_review / mission_entry / mission_profit / mission_verdict; у денег — срок попытки); слово решения —
+ai_v5.decision_of по словарям узлов, неразобранное и сбой — silent («ответа не было»), стенд идёт дальше; отчёты
+(текст, markdown, JSON) содержат все ситуации; --dump пишет 28 файлов без ИИ; без ключа и без мока — код 2.
+Без сети: ai_v5.pro_json / money_json / pro_text подменены; в data/ ничего не пишется (tmp_path)."""
+import asyncio
+import json
+
+import pytest
+
+from backend import ai_v5, config, prompt_bench as pb
+from backend import prompts_mission as pm
+
+
+@pytest.fixture
+def fake(monkeypatch):
+    f = pb.FakeAI(dict(pb.FAKE_ANSWERS))
+    monkeypatch.setattr(ai_v5, "pro_json", f.pro_json)
+    monkeypatch.setattr(ai_v5, "money_json", f.money_json)
+    monkeypatch.setattr(ai_v5, "pro_text", f.pro_text)
+    return f
+
+
+def _data_snapshot() -> dict:
+    d = config.DATA_DIR
+    return {p.name: p.stat().st_mtime_ns for p in d.iterdir()} if d.exists() else {}
+
+
+def test_fourteen_situations_cover_all_nodes():
+    assert len(pb.SITUATIONS) == 14 and len(pb.BY_ID) == 14
+    assert {s["node"] for s in pb.SITUATIONS} == set(pb.NODES)
+    assert {s["expect"] for s in pb.SITUATIONS} == set(pb.EXPECTS)
+    for sid in ("range_mid_wait", "range_low_buyer", "breakout_hold", "false_breakout", "trend_no_pullback",
+                "news_shock", "dead_market", "long_resistance", "long_pressure", "short_add", "door_now",
+                "door_breakout", "profit_fade", "verdict_split"):
+        assert sid in pb.BY_ID, sid
+    assert pb.BY_ID["long_resistance"]["side"] == "long" and pb.BY_ID["short_add"]["side"] == "short"
+
+
+@pytest.mark.parametrize("sid", [s["id"] for s in pb.SITUATIONS])
+def test_prompts_obey_law_3(sid):
+    sit = pb.BY_ID[sid]
+    system, user = pb.build(sit)
+    low = system.lower()
+    assert pm.VOICE in system and pm.FREEDOM in system
+    assert pm.system_lines(system) <= pm.SYSTEM_MAX_LINES
+    assert not [b for b in pm.BANNED if b in low]
+    if sit["node"] in pb.JSON_NODES:
+        assert "json" in low and "строго один JSON-объект" in system
+    assert pb.msk(sit["time"]) in system and "SBER" in user and "обрезано" not in user
+
+
+def test_prompts_are_reproducible_and_selfcheck_passes():
+    assert [pb.build(s) for s in pb.SITUATIONS] == [pb.build(s) for s in pb.SITUATIONS]
+    pb.check_prompts()
+
+
+def test_blocks_in_combat_format():
+    s1 = pb.BY_ID["range_mid_wait"]["args"]
+    assert "ПРИКАЗ СОВЕТА (100 мин назад): вне рынка; совет ждал: закрепление над 304" in s1["situation"]
+    assert "Это прошлое мнение, а не запрет: реши заново — КУПИТЬ_СЕЙЧАС | ЖДЁМ | ПРОДАТЬ_СЕЙЧАС | НОВЫЙ_АНАЛИЗ" in s1["situation"]
+    assert s1["prev_exec"].startswith("Приказ (30.09 09:40): WAIT — совет ждал:")
+    assert s1["light"].startswith("SBER: цена 300.0 (30.09.2026 11:20 МСК, среда)") and "Рентген: OBI" in s1["light"]
+    assert "Майя: тяга нет (симметрия)" in s1["light"]
+    assert s1["scan"].startswith("СКАНЕР СТАКАНА (онлайн, тик 3 с): 1260 тиков") and "Как читают" in s1["scan"]
+    assert "ВАЙКОФФ D1 (250 баров)" in s1["wyckoff"] and "ВАЙКОФФ H1 (300 баров)" in s1["wyckoff"]
+    assert s1["council_text"].startswith("Совет daily от 30.09 08:50 МСК (2 ч назад) — общий по рынку")
+    assert s1["partners"].startswith("Связанные бумаги для SBER") and "Обычно читают так" in s1["partners"]
+    # прокол сканера — первым в ситуации, повод — как у _puncture_watch
+    s3 = pb.BY_ID["breakout_hold"]["args"]["situation"]
+    assert s3.startswith("ПРОКОЛ СКАНЕРА: сторона ВВЕРХ") and "мы вне рынка без плана" in s3
+    assert "ПОВОД ПЕРЕПРОВЕРКИ (внеплановая): прокол сканера вверх 61 %" in s3
+    # позиция: плавающий P/L согласован с ценой и лотами
+    assert "ПОЗИЦИЯ: short 30 лот @303, в рынке 70 мин, плавающий P/L +1050 ₽" in pb.BY_ID["short_add"]["args"]["situation"]
+    assert "плавающий P/L -450 ₽" in pb.BY_ID["long_pressure"]["args"]["situation"]
+    # дверь и прибыль
+    _, ue = pb.build(pb.BY_ID["door_breakout"])
+    assert "ЖДУ ПРОБИТИЯ: long при проходе 304.0" in ue and "long прорыв @304 — уровень достигнут" in ue
+    _, up = pb.build(pb.BY_ID["profit_fade"])
+    assert "ПРИБЫЛЬ: пройдено 77 % хода от входа 298 до тейка 305" in up and "УРОВНИ ПОЗИЦИИ: вход 298" in up
+    _, uv = pb.build(pb.BY_ID["verdict_split"])
+    assert "═══ АНАЛИЗ ═══" in uv and "═══ КРИТИКА ═══" in uv and "спринг" in uv and "ПРОШЛЫЙ ПЛАН" in uv
+
+
+def test_kinds_and_routes_on_fake_ai(fake):
+    before = _data_snapshot()
+    rep = asyncio.run(pb.run(runs=1))
+    got = {r["id"]: (r["answers"][0]["decision"], r["answers"][0]["kind"]) for r in rep["situations"]}
+    assert got == pb.FAKE_WANT
+    routes = {sid: route for sid, route, _ in fake.calls}
+    assert {routes[s["id"]] for s in pb.SITUATIONS if s["node"].startswith("review")} == {"mission_review"}
+    assert routes["door_now"] == "mission_entry" and routes["profit_fade"] == "mission_profit"
+    assert routes["verdict_split"] == "mission_verdict"
+    atts = {sid: a for sid, r, a in fake.calls if r in ("mission_entry", "mission_profit")}
+    assert atts == {"door_now": float(config.PYTHIA_ENTRY_TIMEOUT_SEC), "door_breakout": float(config.PYTHIA_ENTRY_TIMEOUT_SEC),
+                    "profit_fade": float(config.PYTHIA_PROFIT_TIMEOUT_SEC)}, "срок каждой попытки — как у боевого _money_call"
+    t = rep["total"]
+    assert t["n"] == 14 and t["silent"] == 1 and t["decided"] == 13
+    assert abs(t["act_share"] + t["wait_share"] + t["council_share"] - 1.0) < 1e-6
+    json.dumps(rep, ensure_ascii=False)
+    assert _data_snapshot() == before
+
+
+def test_failure_and_unparsed_are_silent_and_bench_goes_on(fake):
+    fake.answers["door_now"] = RuntimeError("сеть упала")
+    fake.answers["profit_fade"] = asyncio.TimeoutError()
+    fake.answers["long_resistance"] = {"choice": "НЕ ВХОДИТЬ", "why": "?"}
+    fake.answers["range_mid_wait"] = "не json"
+    rep = asyncio.run(pb.run(ids=["door_now", "profit_fade", "long_resistance", "range_mid_wait", "short_add"], runs=2))
+    r = {x["id"]: x for x in rep["situations"]}
+    assert [a["decision"] for a in r["door_now"]["answers"]] == ["НЕТ_ОТВЕТА", "НЕТ_ОТВЕТА"]
+    assert "сеть упала" in r["door_now"]["answers"][0]["why"] and r["door_now"]["act_share"] is None
+    assert r["profit_fade"]["answers"][0]["why"] == "ответа не было: таймаут"
+    assert r["long_resistance"]["answers"][0]["decision"] == "НЕ_РАЗОБРАН" and r["long_resistance"]["silent"] == 2
+    assert r["range_mid_wait"]["answers"][0]["kind"] == "silent"
+    assert [a["decision"] for a in r["short_add"]["answers"]] == ["ДОБРАТЬ", "ДОБРАТЬ"], "стенд идёт дальше"
+    assert rep["total"]["silent"] == 8 and rep["total"]["decided"] == 2 and rep["total"]["act_share"] == 1.0
+
+
+def test_select_filters_and_rejects_unknown():
+    assert [s["id"] for s in pb.select(nodes=["entry"])] == ["door_now", "door_breakout"]
+    assert [s["id"] for s in pb.select(["profit_fade"], ["profit"])] == ["profit_fade"]
+    assert pb.select(["profit_fade"], ["entry"]) == []
+    with pytest.raises(ValueError):
+        pb.select(["нет_такой"])
+    with pytest.raises(ValueError):
+        pb.select(nodes=["triage"])
+
+
+@pytest.mark.parametrize("text,in_pos,want", [
+    ("Вердикт: BUY от 299.2, стоп 295.6", False, "BUY"),
+    ("## ВЕРДИКТ\nВне рынка до закрепления над 300.5", False, "WAIT"),
+    ("ВЕРДИКТ. SBER — long от 299.2", False, "BUY"),
+    ("Решение: не покупать, ждать 300.5", False, "WAIT"),
+    ("**Итог:** SELL от 300 к 296", False, "SELL"),
+    ("1. Выход из бокса вверх — не сейчас\n2. Сторона: шорт от 300.4", False, "SELL"),
+    ("Вердикт: держать лонг", False, "HOLD"),
+    ("Вердикт: закрыть позицию", True, "CLOSE"),
+    ("Разбор без решения", False, None),
+])
+def test_verdict_decision(text, in_pos, want):
+    assert pb.verdict_decision(text, in_pos)[0] == want
+
+
+def test_verdict_hold_flat_is_wait():
+    sit = pb.BY_ID["verdict_split"]
+    rec = pb.parse(sit, "Вердикт: держать, вне рынка")
+    assert rec["decision"] == "HOLD" and rec["kind"] == "wait"
+    think = ai_v5.ai.THINK_MARK + "\nчерновик: BUY"
+    assert pb.parse(sit, think)["decision"] == "НЕ_РАЗОБРАН", "черновик размышления — не решение"
+
+
+def test_reports_contain_all_ids(fake):
+    rep = asyncio.run(pb.run(runs=1))
+    txt, md = pb.report_text(rep), pb.report_md(rep)
+    for s in pb.SITUATIONS:
+        assert s["id"] in txt and s["id"] in md
+    assert "ПО УЗЛАМ" in txt and "ВСЕГО" in txt and "доли — от ответов с решением" in txt
+    assert md.startswith("# Стенд промптов") and "## Сводка" in md and "## Ответы по ситуациям" in md
+    assert "стоп 295.6" in md, "уровни ответа в деталях"
+
+
+def test_dump_writes_28_files_without_ai(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("dump не зовёт ИИ")
+    monkeypatch.setattr(ai_v5, "pro_json", boom)
+    monkeypatch.setattr(ai_v5, "money_json", boom)
+    monkeypatch.setattr(ai_v5, "pro_text", boom)
+    files = pb.dump(tmp_path / "d")
+    assert len(files) == 28 and len(list((tmp_path / "d").iterdir())) == 28
+    s, u = pb.build(pb.BY_ID["door_now"])
+    assert (tmp_path / "d" / "door_now.system.txt").read_text(encoding="utf-8") == s
+    assert (tmp_path / "d" / "door_now.user.txt").read_text(encoding="utf-8") == u
+    assert pb.main(["--dump", str(tmp_path / "cli")]) == 0 and len(list((tmp_path / "cli").iterdir())) == 28
+    assert pb.main(["--dump", str(tmp_path / "one"), "--only", "profit_fade"]) == 0
+    assert sorted(p.name for p in (tmp_path / "one").iterdir()) == ["profit_fade.system.txt", "profit_fade.user.txt"]
+
+
+def test_cli_without_key_exits_2(monkeypatch, capsys):
+    monkeypatch.delenv("PYTHIA_MOCK_AI", raising=False)
+    monkeypatch.setattr(ai_v5, "has_key", lambda: False)
+    assert pb.main(["--run"]) == 2
+    assert "нет ключа DeepSeek: задай ключ в панели или PYTHIA_MOCK_AI=1 для сухого прогона" in capsys.readouterr().err
+    assert pb.main(["--runs", "2", "--only", "door_now"]) == 2, "любой флаг прогона — прогон"
+    assert pb.main(["--only", "нет_такой", "--run"]) == 2
+
+
+def test_cli_run_writes_reports(fake, monkeypatch, tmp_path, capsys):
+    monkeypatch.delenv("PYTHIA_MOCK_AI", raising=False)
+    monkeypatch.setattr(ai_v5, "has_key", lambda: True)
+    md, js = tmp_path / "r" / "bench.md", tmp_path / "r" / "bench.json"
+    assert pb.main(["--runs", "2", "--only", "range_mid_wait,door_now,verdict_split", "--out", str(md),
+                    "--json", str(js), "--par", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "range_mid_wait" in out and "ВСЕГО" in out
+    rep = json.loads(js.read_text(encoding="utf-8"))
+    assert [r["id"] for r in rep["situations"]] == ["range_mid_wait", "door_now", "verdict_split"]
+    assert all(len(r["answers"]) == 2 for r in rep["situations"]) and rep["meta"]["runs"] == 2
+    assert "door_now" in md.read_text(encoding="utf-8")
+
+
+def test_cli_no_args_is_selftest(capsys):
+    assert pb.main([]) == 0
+    assert "prompt_bench self-test OK" in capsys.readouterr().out
