@@ -751,11 +751,11 @@ store через `_persist`), шина `bus.stage("mission", rid, "explain", sta
 **`status(ticker)` (для фронта):**
 ```json
 {"ticker":"SBER","name":"Сбербанк","asset_class":"share","play":"auto","started_ts":…,
- "run_id":"…","phase":"council|armed|entering|in_position|stopped|panic|idle|error|closed",   // closed — рынок закрыт (пилот стопорится)
+ "run_id":"…","phase":"council|armed|entering|in_position|stopped|panic|idle|error|closed|no_link|no_access",   // closed — рынок закрыт (пилот стопорится); 5.4.4: no_link — нет цены/связи с Т-Банком, no_access — токен/права/сертификат
  "market":{"open":bool,"reason":"…","next_open_ts":…,"next_open_msk":"10:00 МСК","session":"…","source":"tinkoff|schedule"}|null,
  "pilot":{…AIPilot.status()…},"exec":{…},"frame":{…},"texts":{"analysis":"…","critique":"…","verdict":"…"},
- "news":[…прикреплённые (news_window-элементы)…],"reviews":[{"ts","choice","why","note"}],
- "handoffs":[{"ts","reason","kind":"council|pilot|shock|news|stop|take|puncture|entry|profit","deferred":bool,"triage":"СЕЙЧАС|ПЛАНОВО|САМ …"|null}],   // поводы: совету / дежурному PRO / мягкий стоп / мягкий тейк; triage — вердикт триажа (W2); 5.4.1: entry — дверь → совет, profit — прибыль → совет
+ "news":[…прикреплённые (news_window-элементы)…],"reviews":[{"ts","choice","why","note","label"(5.4.4: метка модели — «КУПИТЬ — засада откат @X», «ДЕРЖАТЬ», «ОТМЕНИТЬ»),"applied"(5.4.4: как исполнено)}],
+ "handoffs":[{"ts","reason","kind":"council|pilot|shock|news|stop|take|puncture|entry|profit|wait_level|open|event","deferred":bool,"triage":"СЕЙЧАС|ПЛАНОВО|САМ …"|null}],   // поводы: совету / дежурному PRO / мягкий стоп / мягкий тейк; triage — вердикт триажа (W2); 5.4.1: entry — дверь → совет, profit — прибыль → совет
  "trades":{"count","pnl","net","gross","fee","wins","losses","est","confirmed","by_day","mode","last_sync"},   // фаза 4 W1: ledger.trades_summary
  "price":число|null,"note":"человеку","error":null,"exec_ts":…,
  "explain":[{"ts","kind","title","text","refs","ok","model"}],                  // v5.3: лента толмача (последние 40)
@@ -947,6 +947,19 @@ GET    /api/v5/chat/status                                  → {"busy","run_id"
 Фронт шлёт в `/ws/events` строку `ping` каждые 25 с и `ack` каждые 200 кадров.
 
 ## 7. Правила промптов (обязательны для всех)
+**5.4.4 «честный пилот» (воля владельца 30.09.2026).** `status()["pilot"]` (AIPilot.status) дополнен: `loop_alive`,
+`last_tick_ts`, `ticking` (петля жива и тик не старше `PYTHIA_TICK_STALE_SEC`; панель мигает только при нём), `feed`
+{`ok`, `kind` ok|no_price|auth|rights|cert|network|closed, `reason`, `cause`, `since`, `checked_ts`}, `broker_ok`,
+`broker_refusal` {`what` entry|close|topup|stop, `code`, `text`, `count`, `ts`, `kind`}|null, `account_limits` {`buy_lots`,
+`sell_lots`, `ts`, `note`}|null, `review_busy`, `review_started_ts`, `prepare_error`, `adopt_refused`, `account_unverified`,
+`close_retry_in_s`; миссия — `review_outcome`, `review_unparsed`, `council_window_s`, `level_wakes_left`, `label` у решений.
+Нет связи с Т-Банком → пилот в НЕТ_СВЯЗИ/НЕТ_ДОСТУПА (фазы `no_link`/`no_access`), ИИ не зовётся, проверка брокера раз в
+30 с (`tinkoff.check_access`), хуки `_on_feed_change(ok, info)` и `_on_killswitch(info)` (MissionPilot: толмач, шина, повод
+«связь восстановлена»). REST Т-Банка: `tinkoff.BASES` = tbank.ru (основной), tinkoff.ru (запасной — только если запрос не
+ушёл; заявки/стопы/отмены на другой адрес не повторяются), `PYTHIA_TINKOFF_BASE`. Ритм PRO — только плановая раз в 30 мин и
+рыночные триггеры (закон 3 CLAUDE.md), поводы без рыночного события копятся к плановой; `REVIEW_RETRY_SEC` удалён,
+`PYTHIA_SILENT_RETRY_SEC`/`PYTHIA_ENTRY_CHECK_COOL_SEC` дверью и мыслью о прибыли не читаются.
+
 - Русский. System-промпт ≤ 20 строк (5.4.1; было 12): роль в одной строке, голос (`prompts_mission.VOICE`),
   что дано, что вернуть. Без воды и дисклеймеров. Закон проверяют self-тесты `prompts_mission`, `prompts_council`,
   `api_chat` и `tests/test_prompts_voice.py` (`prompts_mission.system_lines(s) <= SYSTEM_MAX_LINES`).
