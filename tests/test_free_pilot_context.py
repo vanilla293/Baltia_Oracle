@@ -169,7 +169,8 @@ def _mem_mission(now: float) -> SimpleNamespace:
 def test_memory_shows_what_waiting_gave_and_silence_is_not_wait():
     m = _mem_mission(time.time())
     acc = explain._accumulated(m, {"price": 101.4})
-    assert "ЖДЁМ @100.0 → сейчас 101.4 (+1.4 %) — коридор" in acc, acc
+    # 5.4.3: ожидание вне рынка — в чью пользу: «лонг отсюда …, шорт …» (tests/test_decisive_door.py)
+    assert "ЖДЁМ @100.0 → сейчас 101.4 (лонг отсюда +1.4 %, шорт -1.4 %) — коридор" in acc, acc
     assert "Проверки входа у двери: " in acc and "ЖДАТЬ @100.0 → сейчас 101.4 (+1.4 %) — откат к 99.7" in acc
     assert acc.count("(модель не ответила — решения не было)") == 2, acc
     assert "(ответ модели не разобран — решения не было)" in acc

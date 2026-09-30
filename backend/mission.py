@@ -1916,7 +1916,7 @@ class MissionPilot(ai_pilot.AIPilot):
             Запись ответа ссылается на план, о котором спросили (gate_plan_ts), а не на обновлённый. Возврат: на месте?"""
             old = self.plan
             if old is not None and old.get("side") == new["side"] and old.get("gate_busy") and not flip:
-                for k in ("gate_note", "gate_wait_ts", "crossed"):   # пометки прошлого решения — решение свежее
+                for k in ("gate_note", "gate_wait_ts", "gate_wait_why", "crossed"):   # пометки прошлого решения
                     old.pop(k, None)
                 old.update(new)
                 old["ts"] = now
@@ -1951,8 +1951,8 @@ class MissionPilot(ai_pilot.AIPilot):
         if entry is None and price:
             adverse = (cur - price) / price * sgn    # > 0 — цена ушла ХУЖЕ снимка, < 0 — лучше
             if adverse > lim:
-                gate_note = f"цена ушла на {adverse * 100:.2f}% за время раздумий (было {price:g}, стало {cur:g})"
-                drift_note = f" ({gate_note} — решит дверь по живой цене)"
+                gate_note = self._drift_text(side, price, cur)   # 5.4.3: нейтрально, с направлением (пометка кода)
+                drift_note = f" ({self._drift_text(side, price, cur, tail=False)} — решит дверь по живой цене)"
             elif adverse < -lim:
                 drift_note = f" (цена лучше снимка {price:g} на {-adverse * 100:.2f}% — вхожу)"
         ref = entry if entry is not None else cur
@@ -2556,7 +2556,10 @@ class MissionPilot(ai_pilot.AIPilot):
         hard_s = f"{self._hard_name()[0].upper() + self._hard_name()[1:]} @{hard:g} — за ним слив без вопросов. " if hard else ""
         max_holds = int(getattr(config, "PYTHIA_SOFT_STOP_MAX_HOLDS", 3))
         holds = int(pos.get("holds") or 0)
-        holds_s = f"Ждать можно ещё {max(0, max_holds - holds)} раз(а)." if max_holds else ""
+        # 5.4.3: счёт как факт, а не «можно ещё N» (разрешение, которое тянет к ЖДАТЬ); правило — как в AIPilot.tick:
+        # holds ≥ PYTHIA_SOFT_STOP_MAX_HOLDS → за триггером слив без вопроса
+        holds_s = (f"У этого троса уже ждал {holds} раз из {max_holds}; после {max_holds}-го — слив по правилу, "
+                   f"без вопроса." if max_holds else "")
         if m is not None:
             try:
                 await bus.stage("mission", rid, "guard", "start", ticker=self.base,
@@ -2631,7 +2634,9 @@ class MissionPilot(ai_pilot.AIPilot):
                   f"хода до цели) не отпускаем: туда подтянется триггер, {self._hard_name()} встанет за ним. " if floor else "")
         max_h = int(getattr(config, "PYTHIA_SOFT_TAKE_MAX_HOLDS", 2))
         holds = int(pos.get("take_holds") or 0)
-        holds_s = f"Подержать можно ещё {max(0, max_h - holds)} раз(а)." if max_h else ""
+        # 5.4.3: счёт как факт; правило — как в AIPilot.tick: take_holds ≥ PYTHIA_SOFT_TAKE_MAX_HOLDS → фиксация без вопроса
+        holds_s = (f"Уже держал у тейка {holds} раз из {max_h}; после {max_h}-го — фиксация по правилу, без вопроса."
+                   if max_h else "")
         if m is not None:
             try:
                 await bus.stage("mission", rid, "take", "start", ticker=self.base,
@@ -2786,9 +2791,11 @@ class MissionPilot(ai_pilot.AIPilot):
         return f"{plan.get('side')} {plan.get('kind') or 'откат'} @{_f(e, 0.0):g}"
 
     def _gate_line(self, plan: dict) -> str:
-        """Строка о проверке входа для ситуации PRO (перепроверка/триаж): думает / велел ждать / прошлые ответы.
-        v5.4.2: молчание у двери — «ответа не было, повтор в …», а не «велел ждать»; одобренный вход — как есть."""
-        if not plan or not self._entry_check_on():
+        """Строка о проверке входа для ситуации PRO (перепроверка/триаж): думает / ответил ЖДАТЬ / прошлые ответы.
+        v5.4.2: молчание у двери — «ответа не было, повтор в …», а не ЖДАТЬ; одобренный вход — как есть.
+        5.4.3: ЖДАТЬ — факт с ценой и временем следующего вопроса, без копии причины (она одна — в «последняя …»);
+        у самой двери (_entry_check, флаг _door_asking) строки нет: там свой блок прошлых ответов."""
+        if not plan or not self._entry_check_on() or getattr(self, "_door_asking", False):
             return ""
         mm = self._money_name()
         now = time.time()
@@ -2802,22 +2809,57 @@ class MissionPilot(ai_pilot.AIPilot):
             parts.append(f"{mm} у двери сказал ВОЙТИ; вход ждёт снятия временного запрета"
                          + (f" ({plan.get('gate_note')})" if plan.get("gate_note") else ""))
         elif after > now and not (last and last.get("silent")):
-            parts.append(f"{mm} у двери велел ждать до {ai_v5.fmt_ts(after)}" + (f" ({plan.get('gate_note')})" if plan.get("gate_note") else ""))
+            if last and last.get("decision") == "ЖДАТЬ":
+                cur = self.prices[-1] if self.prices else 0.0
+                d = self._toward_plan(plan.get("side"), last.get("price"), cur)
+                parts.append(f"{mm} у двери ответил ЖДАТЬ в {self._hhmm(last.get('ts'))} при цене "
+                             f"{_f(last.get('price'), 0.0):g}"
+                             + (f" (сейчас {cur:g}, {d:+.2f} % в сторону плана)" if d is not None else "")
+                             + f" — следующий вопрос у двери в {self._hhmm(after)}")
+            else:
+                parts.append(f"следующий вопрос у двери в {self._hhmm(after)}")
         if last:
             txt = str(last.get("why") or "")[:200] if last.get("silent") else \
                 f"{last.get('decision')} — {str(last.get('why') or '')[:160]}"
             parts.append(f"проверок входа по этому плану: {len(mine)}, последняя {ai_v5.fmt_ts(last.get('ts'))}: {txt}")
         return ("ПРОВЕРКА ВХОДА: " + "; ".join(parts)) if parts else ""
 
-    def _gates_text(self, plan: dict) -> str:
+    def _gates_text(self, plan: dict, price: float | None = None) -> str:
         """Прошлые ответы PRO у двери по ЭТОМУ плану (для промпта проверки входа). v5.4.2: молчание и непонятный
         ответ — «ответа не было … решения не было» (запись кода), не ответ ИИ «ЖДАТЬ»; ответы «не применено» (про
-        прежний план, ревью 5.4.2) — не в счёт (_plan_gates)."""
-        return "\n".join((f"{ai_v5.fmt_ts(g.get('ts'))} @{g.get('price')}: {g.get('why')}" if g.get("silent") else
-                          f"{ai_v5.fmt_ts(g.get('ts'))} @{g.get('price')}: {g.get('decision')} — {g.get('why')}"
-                          + (f" (уровень {g.get('entry_kind')} @{g.get('entry')})" if g.get("entry") else "")
-                          + (f" (ждать {g.get('wait_minutes')} мин)" if g.get("wait_minutes") else ""))
-                         for g in self._plan_gates(plan))
+        прежний план, ревью 5.4.2) — не в счёт (_plan_gates).
+        5.4.3: у каждой записи исход — «→ сейчас {цена} ({±%} в сторону плана)»; первой строкой факт о серии ЖДАТЬ:
+        сколько раз и за сколько минут, куда прошла цена с первого ЖДАТЬ, когда план протухнет (PLAN_TTL_SEC).
+        price — текущая цена (нет — последняя цена пилота). Только числа — решает ИИ."""
+        mine = self._plan_gates(plan)
+        if not mine:
+            return ""
+        now = time.time()
+        cur = _f(price, 0.0) or (self.prices[-1] if self.prices else 0.0)
+        side = plan.get("side")
+
+        def _outcome(g: dict) -> str:
+            d = self._toward_plan(side, g.get("price"), cur)
+            return f" → сейчас {cur:g} ({d:+.2f} % в сторону плана)" if d is not None else ""
+
+        L: list[str] = []
+        waits = [g for g in mine if g.get("decision") == "ЖДАТЬ" and not g.get("silent")]
+        if waits:
+            first = waits[0]
+            head = f"ЖДАТЬ по этому плану: {len(waits)} раз за {int(max(0.0, now - _f(first.get('ts'), now)) // 60)} мин"
+            d0 = self._toward_plan(side, first.get("price"), cur)
+            if d0 is not None:
+                head += f"; цена {_f(first.get('price'), 0.0):g} → {cur:g} ({d0:+.2f} % в сторону плана)"
+            if _f(plan.get("ts"), 0.0) > 0:
+                ttl = max(0, int((ai_pilot.PLAN_TTL_SEC - (now - _f(plan.get("ts"), now))) // 60))
+                head += f"; план протухнет через {ttl} мин"
+            L.append(head)
+        L += [(f"{ai_v5.fmt_ts(g.get('ts'))} @{g.get('price')}: {g.get('why')}" if g.get("silent") else
+               f"{ai_v5.fmt_ts(g.get('ts'))} @{g.get('price')}: {g.get('decision')} — {g.get('why')}"
+               + (f" (уровень {g.get('entry_kind')} @{g.get('entry')})" if g.get("entry") else "")
+               + (f" (ждать {g.get('wait_minutes')} мин)" if g.get("wait_minutes") else ""))
+              + _outcome(g) for g in mine]
+        return "\n".join(L)
 
     def _plan_text(self, plan: dict, price: float) -> str:
         """Приказ совета + перепроверки + план пилота, по которому он готов войти."""
@@ -2853,6 +2895,26 @@ class MissionPilot(ai_pilot.AIPilot):
         if ref <= 0 or cur <= 0:
             return 0.0
         return (cur - ref) / ref * (1.0 if side == "long" else -1.0)
+
+    @classmethod
+    def _drift_text(cls, side: str | None, ref, cur, since: str = "решения", at: str = "решение",
+                    tail: bool = True) -> str:
+        """5.4.3: дрейф цены от снимка решения — нейтрально и с направлением, без «ушла» и «за время раздумий»:
+        «с момента решения цена прошла 1.50 % в сторону сделки (решение при 100, сейчас 101.5): вход сейчас — по
+        101.5»; против сделки — «против сделки» и то же число (_adverse > 0 — ход в сторону сделки: вход дороже)."""
+        a = cls._adverse(side, ref, cur)
+        c = _f(cur, 0.0)
+        return (f"с момента {since} цена прошла {abs(a) * 100:.2f} % {'в сторону сделки' if a >= 0 else 'против сделки'} "
+                f"({at} при {_f(ref, 0.0):g}, сейчас {c:g})" + (f": вход сейчас — по {c:g}" if tail else ""))
+
+    @staticmethod
+    def _toward_plan(side: str | None, ref, cur) -> float | None:
+        """5.4.3: ход цены от ref до cur в сторону плана, % до сотых (+ — туда, куда план хотел; − — против; без
+        «-0.00» в строке). Нет цены → None."""
+        ref, cur = _f(ref, 0.0), _f(cur, 0.0)
+        if ref <= 0 or cur <= 0 or side not in ("long", "short"):
+            return None
+        return round((cur / ref - 1.0) * 100.0 * (1.0 if side == "long" else -1.0), 2) + 0.0
 
     async def _money_call(self, system: str, user: str, *, route: str, attempt_timeout: float):
         """ai_v5.money_json со сроком каждой попытки (v5.4.2); подмена без attempt_timeout (старые фейки) — без него."""
@@ -2901,8 +2963,8 @@ class MissionPilot(ai_pilot.AIPilot):
             ref0 = plan.get("entry") if plan.get("entry") is not None else plan.get("snap_price")
             drift0 = self._adverse(plan.get("side"), ref0, price)
             if src and src != "council" and _f(ref0, 0.0) > 0 and drift0 > lim0:
-                note = (f"цена ушла на {drift0 * 100:.2f}% от снимка решения {_f(ref0, 0.0):g} (стало {price:g}) — "
-                        f"реши заново по живой цене")
+                note = (self._drift_text(plan.get("side"), ref0, price, tail=False)
+                        + " — план по старой цене снят, реши заново по живой цене")
                 self.plan = None
                 self._break_n = 0
                 if not self.position and not self.pending:
@@ -2921,13 +2983,17 @@ class MissionPilot(ai_pilot.AIPilot):
         if now < after:
             if not topup:
                 self.state = "ЗАСАДА"
-            if plan.get("gate_silent"):              # молчание — не решение ИИ: не «велел ждать»
+            if plan.get("gate_silent"):              # молчание — не решение ИИ: не ЖДАТЬ
                 self.last_action = (f"{pre}{mm} не ответил у двери — решения не было, повтор в {self._hhmm(after)}"
                                     f" — {self._plan_how(plan)}, цена {price:g}")
             else:
-                self.last_action = (f"{pre}{mm} у двери велел ждать до {ai_v5.fmt_ts(after)}"
-                                    + (f" ({plan.get('gate_note')})" if plan.get("gate_note") else "")
-                                    + f" — {self._plan_how(plan)}, цена {price:g}")
+                # 5.4.3: факт ответа и время повтора — без «велел» и без копии причины (она в записи ответа)
+                mine = self._plan_gates(plan)
+                dec = mine[-1].get("decision") if mine else None
+                head = (f"{mm} у двери ответ ЖДАТЬ, повтор в {self._hhmm(after)}" if dec == "ЖДАТЬ" else
+                        f"{mm} у двери: {dec}, следующий вопрос в {self._hhmm(after)}" if dec else
+                        f"следующий вопрос {mm} у двери в {self._hhmm(after)}")
+                self.last_action = f"{pre}{head} — {self._plan_how(plan)}, цена {price:g}"
             return False
         side = plan.get("side")
         lim = float(getattr(config, "PYTHIA_ENTRY_DRIFT_PCT", 1.0)) / 100.0
@@ -2945,9 +3011,9 @@ class MissionPilot(ai_pilot.AIPilot):
             if blocked is not None:
                 self.last_action = f"{pre}{mm} у двери сказал ВОЙТИ — жду: {blocked}"
                 return False
-            plan.pop("approved_until", None)         # цена ушла от одобренной — спросить заново с этой пометкой
-            plan["gate_note"] = (f"цена ушла на {drift * 100:.2f}% от одобренной у двери "
-                                 f"{_f(plan.get('approved_px'), 0.0):g} (стало {price:g})")
+            plan.pop("approved_until", None)         # цена прошла от одобренной — спросить заново с пометкой кода
+            plan["gate_note"] = self._drift_text(side, plan.get("approved_px"), price,
+                                                 since="ответа ВОЙТИ у двери", at="ВОЙТИ")
         # (2) биржа не даёт этой стороны ни лота (шорт недоступен / нет ГО) — не зовём ИИ к двери впустую
         if not topup:
             await self._refresh_max(price)
@@ -2997,7 +3063,8 @@ class MissionPilot(ai_pilot.AIPilot):
         prompts_mission.entry_check → ai_v5.money_json(route="mission_entry").
         v5.4.2: подготовка данных (сжатие в общей очереди FLASH) — свой срок MONEY_PREP_SEC, после него — что есть,
         с пометкой; у ИИ — PYTHIA_ENTRY_TIMEOUT_SEC на каждую попытку; снимок двери (plan["gate_px"]) — цена в промпте;
-        пометка к вопросу (дрейф, одобренный вход) — в ситуации."""
+        пометка кода к вопросу (дрейф, одобренный вход; 5.4.3 — «ПОМЕТКА КОДА», причина прошлого ЖДАТЬ сюда не идёт) — в
+        ситуации."""
         m = self.mission
         rid = m.run_id if m else None
         mm = self._money_name()
@@ -3038,9 +3105,15 @@ class MissionPilot(ai_pilot.AIPilot):
             log.warning("миссия %s: проверка входа — %s", self.base, prep_note)
         snap = self.prices[-1] if self.prices else price
         plan["gate_px"] = snap                        # цена, которую PRO видит в промпте (для дрейфа за раздумья)
-        situation = self._situation_for_ai(snap)
-        if plan.get("gate_note"):
-            situation += f"\nПОМЕТКА К ЭТОМУ ВОПРОСУ: {plan['gate_note']}"
+        # 5.4.3: у двери своя история ответов (блок ПРОШЛЫЕ ОТВЕТЫ У ДВЕРИ) — строка «ПРОВЕРКА ВХОДА» в ситуации её
+        # не дублирует; флаг снимается сразу (сборка синхронная — перепроверка/триаж строку видят как прежде)
+        self._door_asking = True
+        try:
+            situation = self._situation_for_ai(snap)
+        finally:
+            self._door_asking = False
+        if plan.get("gate_note"):                    # только пометки кода (дрейф, одобренный ВОЙТИ), не причина ЖДАТЬ
+            situation += f"\nПОМЕТКА КОДА: {plan['gate_note']}"
         if prep_note:
             situation += "\n" + prep_note
         s, u = prompts_mission.entry_check(
@@ -3186,9 +3259,11 @@ class MissionPilot(ai_pilot.AIPilot):
                 pass
         elif decision == "ВОЙТИ":
             plan.pop("gate_silent", None)
+            plan.pop("gate_note", None)              # 5.4.3: пометка кода была к этому вопросу — ответ получен
+            plan.pop("gate_wait_why", None)
             blocked = self._entry_blocked(cur, plan)
             snap = _f(plan.get("gate_px"), 0.0) or price          # цена, которую PRO видел в промпте
-            adverse = self._adverse(side, snap, cur)              # > 0 — цена ушла ХУЖЕ снимка, по которому думал PRO
+            adverse = self._adverse(side, snap, cur)              # > 0 — цена прошла в сторону сделки от снимка PRO
             lim = float(getattr(config, "PYTHIA_ENTRY_DRIFT_PCT", 1.0)) / 100.0
             asked = plan.get("gate_how")
             if plan.get("entry") is not None and asked and asked != self._plan_how(plan):
@@ -3211,17 +3286,18 @@ class MissionPilot(ai_pilot.AIPilot):
                 self.last_action = (f"{pre}{mm} у двери: ВОЙТИ ({why or 'без объяснений'}) — но {blocked}; "
                                     f"войду без нового вопроса, когда запрет снимется")
             elif adverse > lim:
-                # PRO думал, а цена ушла хуже его снимка: не засада по старой цене (в тренде она не исполнится) и не
-                # погоня — сразу новый вопрос с живой ценой и пометкой о дрейфе
+                # PRO думал, а цена прошла от его снимка в сторону сделки дальше предела: не засада по старой цене (в
+                # тренде она не исполнится) и не погоня — сразу новый вопрос с живой ценой и пометкой кода о дрейфе
+                # (5.4.3: нейтрально и с направлением, без «ушла за время раздумий»)
                 plan["gate_after"] = now
-                plan["gate_note"] = f"цена ушла на {adverse * 100:.2f}% за время раздумий (было {snap:g}, стало {cur:g})"
-                applied.append(plan["gate_note"] + " — не засада по старой цене: спрошу сразу по живой")
+                plan["gate_note"] = self._drift_text(side, snap, cur)
+                applied.append(self._drift_text(side, snap, cur, tail=False)
+                               + " — не засада по старой цене: спрошу сразу по живой")
                 if not topup:
                     self.state = "ЗАСАДА" if plan.get("entry") is not None else "ВХОЖУ"
                 self.last_action = f"{pre}{mm} у двери: ВОЙТИ ({why or 'без объяснений'}) — но {applied[-1]}"
             else:
                 plan.pop("gate_after", None)
-                plan.pop("gate_note", None)
                 await self._enter(cur, self.last_book)
                 applied.append(self.last_action)
                 self.last_action = f"{mm} у двери: ВОЙТИ ({why or 'без объяснений'}) → {self.last_action}"
@@ -3282,7 +3358,10 @@ class MissionPilot(ai_pilot.AIPilot):
             elif e is None:
                 plan["gate_after"] = now + cool
                 applied.append(f"повтор через {int(cool // 60)} мин")
-            plan["gate_note"] = (why or "")[:80]
+            # 5.4.3: причина ЖДАТЬ — слова модели, не пометка кода: хранится отдельно и на следующем вопросе не подаётся
+            # как «пометка к вопросу» (она есть в блоке прошлых ответов у двери — один раз, с исходом по цене)
+            plan.pop("gate_note", None)
+            plan["gate_wait_why"] = (why or "")[:120]
             if not topup:
                 self.state = "ЗАСАДА"
             self.last_action = (pre + f"{mm} у двери: ЖДАТЬ ({why or 'без объяснений'}) — "
@@ -5223,7 +5302,8 @@ if __name__ == "__main__":
         assert "Позиция закрыта: long 8 лот, P/L" in xcl["title"] and "решение перепроверки: закрыть" in xcl["detail"]
         assert m.memory.startswith("ПАМЯТЬ: ") and "ЖДЁМ" in m.memory and m.reviews_since_memory == 0
         um = fake_ai.last_user["memory"]
-        assert "Перепроверки:" in um and "Объяснения толмача:" in um and "Сделки:" in um and "ЗАКРЫТЬ" in um, um[:1500]
+        assert "Перепроверки:" in um and "Толмач писал владельцу (только заголовки" in um and "Сделки:" in um \
+            and "ЗАКРЫТЬ" in um, um[:1500]
         assert len(m.reviews) <= explain.KEEP_REVIEWS and len(m.explain) <= explain.KEEP_EXPLAIN
         assert status("TEST")["memory"]["n"] == m.memory_n and store_v5.mission_get("TEST")["memory"] == m.memory
         trs = store_v5.trades("TEST")
@@ -5321,11 +5401,13 @@ if __name__ == "__main__":
         finally:
             fake_ai.pro_json = _pj0
         assert p.plan and p.plan["entry"] is None and p.plan["snap_price"] == px and "откат" != p.plan["kind"], p.plan
-        assert p.plan["gate_note"] == f"цена ушла на 2.00% за время раздумий (было {px:g}, стало {worse:g})", p.plan
+        assert p.plan["gate_note"] == (f"с момента решения цена прошла 2.00 % в сторону сделки (решение при {px:g}, "
+                                       f"сейчас {worse:g}): вход сейчас — по {worse:g}"), p.plan
         assert "решит дверь по живой цене" in p.plan["why"] and not p._reanalyzing, p.plan
         assert await settle(lambda: p.plan is None), "дверь выключена, цена уехала дальше PYTHIA_ENTRY_DRIFT_PCT — не входим"
         assert p.position is None and p.pending is None, p.position
-        assert f"цена ушла на 2.00% от снимка решения {px:g} (стало {worse:g}) — реши заново по живой цене" \
+        assert (f"с момента решения цена прошла 2.00 % в сторону сделки (решение при {px:g}, сейчас {worse:g}) — "
+                f"план по старой цене снят, реши заново по живой цене") \
             in (p._review_reason or ""), p._review_reason
 
         # ── режим игры в перепроверке: ПРОДАТЬ при play=long → ЖДЁМ ──
