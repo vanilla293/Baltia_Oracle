@@ -231,24 +231,31 @@ def test_wait_streak_fact_line(fake):
             fake.queue("mission_review", {"choice": "ЖДЁМ", "why": "прорыва нет — сидим ждём", "note": "т"})
             await p._review(px)
         now = time.time()
-        for i, r in enumerate(m.reviews):
-            r["ts"] = now - (40 - 20 * i) * 60                  # 40, 20 и 0 мин назад
-        p._flat_track(99.5)
+        # ревью 5.4.3: серия — свой счётчик (m.wait_streak), а не хвост m.reviews (его режет память)
+        ws = m.wait_streak
+        assert ws and ws["n"] == 3 and ws["price"] == 100.0 and ws["lo"] == 100.0 and ws["hi"] == 100.7, ws
+        ws["ts"] = now - 40 * 60                                 # серия началась 40 мин назад
+        p._flat_track(99.5)                                      # тики за серию — мин/макс
         p._flat_track(101.2)
         p._flat["ts"] = now - 3600
         sit = p._situation_text(101.0)
-        want = (f"ЖДЁМ подряд: 3 за 40 мин; вне рынка с {p._hhmm(now - 3600)}, цена за это время 99.5–101.2 "
-                f"(размах 1.71 %), от первого ЖДЁМ +1.00 %")
+        want = (f"ЖДЁМ подряд: 3 за 40 мин (с {ai_v5.fmt_ts(now - 2400)}); вне рынка с {ai_v5.fmt_ts(now - 3600)}; "
+                f"цена за серию 99.5–101.2 (размах 1.71 %), от первого ЖДЁМ (100) +1.00 %")
         assert want in sit, sit
-        # в позиции ЖДЁМ — удержание: серии «вне рынка» нет
-        m.reviews.append({"ts": now, "choice": "ЖДЁМ", "why": "держим", "price": 101.0, "in_pos": True})
-        assert "ЖДЁМ подряд" not in p._situation_text(101.0)
-        m.reviews.append({"ts": now, "choice": "ЖДЁМ", "why": "т", "price": 101.0, "in_pos": False})
-        assert "ЖДЁМ подряд" not in p._situation_text(101.0), "серия прервана решением в позиции"
+        # в позиции ЖДЁМ — удержание: серия «вне рынка» снята
+        p.position = {"side": "long", "entry": 100.0, "lots": 1, "take": None, "invalidation": 98.0,
+                      "opened_ts": now - 60, "stop_id": None, "floating": 0.0}
+        fake.queue("mission_review", {"choice": "ЖДЁМ", "why": "держим", "note": "т"})
+        await p._review(101.0)
+        assert m.wait_streak is None and "ЖДЁМ подряд" not in p._situation_text(101.0)
+        p.position = None
+        fake.queue("mission_review", {"choice": "ЖДЁМ", "why": "т", "note": "т"})
+        await p._review(101.0)
+        assert m.wait_streak["n"] == 1 and "ЖДЁМ подряд" not in p._situation_text(101.0), "серия прервана решением в позиции"
         p.position = {"side": "long", "entry": 100.0, "lots": 1, "take": None, "invalidation": 98.0,
                       "opened_ts": now, "stop_id": None, "floating": 0.0}
         p._flat_track(101.0)
-        assert p._flat is None, "позиция открыта — отсчёт вне рынка снят"
+        assert p._flat is None and m.wait_streak is None, "позиция открыта — отсчёт вне рынка и серия сняты"
 
     asyncio.run(scenario())
 
@@ -356,7 +363,7 @@ def test_prev_block_folds_waits_with_price_outcome():
     p.last_action = "совет: вне рынка — ждал: пробой 101; перепроверка через 30 мин"
     txt = mission._prev_text(m)
     assert "ЖДЁМ ×3 (" in txt and "цена 100 → 100.8 (+0.80 %) к следующему решению — последнее: сидим ждём пробоя" in txt, txt
-    assert f"{ai_v5.fmt_ts(t0 + 1800)} КУПИТЬ_СЕЙЧАС @100.8 → сейчас 101.5 (+0.69 %) — пробой" in txt, txt
+    assert f"{ai_v5.fmt_ts(t0 + 1800)} КУПИТЬ @100.8 → сейчас 101.5 (+0.69 %) — пробой" in txt, txt   # метка модели
     assert f"{ai_v5.fmt_ts(t0 + 2400)} ЗАКРЫТЬ @101.6 → сейчас 101.5 (-0.10 %) — выдохлось" in txt, txt
     assert "ЖДЁМ ×2 (" in txt and "цена 101.4 → 101.5 (+0.10 %) сейчас — последнее: откат не пришёл" in txt, txt
     assert txt.count("прорыва нет") == 0, "20 одинаковых «ждём» не повторяются — свёрнуты"

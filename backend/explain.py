@@ -378,6 +378,17 @@ def _px(v: float) -> str:
 
 _SIDE_RU = {"long": "лонг", "short": "шорт"}
 _CHOICE_SIDE = {"КУПИТЬ_СЕЙЧАС": "long", "ПРОДАТЬ_СЕЙЧАС": "short"}     # вход перепроверки — сторона из слова
+_CHOICE_LABEL = {"КУПИТЬ_СЕЙЧАС": "КУПИТЬ", "ПРОДАТЬ_СЕЙЧАС": "ПРОДАТЬ"}
+
+
+def choice_label(r: dict | None) -> str:
+    """Ревью 5.4.3: решение перепроверки так, как модель его выбирала (та же карта, что mission._choice_label — толмач
+    duck-typed и миссию не импортирует): КУПИТЬ_СЕЙЧАС / ПРОДАТЬ_СЕЙЧАС — «КУПИТЬ» / «ПРОДАТЬ», ЖДЁМ в позиции —
+    «ДЕРЖАТЬ». Только подача модели: канон в записи прежний."""
+    c = str((r or {}).get("choice") or "")
+    if c in _CHOICE_LABEL:
+        return _CHOICE_LABEL[c]
+    return "ДЕРЖАТЬ" if c == "ЖДЁМ" and (r or {}).get("in_pos") else c
 
 
 def _pc(v: float) -> str:
@@ -408,15 +419,15 @@ def _since(price: Any, now: Any, how: str = "", side: str | None = None) -> str:
     return f" @{_px(p0)} → сейчас {_px(p1)} ({tail})"
 
 
-def _decided(rec: dict, key: str, now: Any, how: str = "", side: str | None = None) -> str:
+def _decided(rec: dict, key: str, now: Any, how: str = "", side: str | None = None, label: str | None = None) -> str:
     """Запись узла строкой: «ЖДЁМ @100.0 → сейчас 101.4 (лонг отсюда +1.4 %, шорт -1.4 %) — почему». Сбой ИИ
     (silent, НЕТ_ОТВЕТА, НЕ_РАЗОБРАН) — «(модель не ответила — решения не было)», а не ЖДАТЬ: хода цены к нему не
-    приписываем."""
+    приписываем. label — как показать решение (ревью 5.4.3: метка модели, choice_label), нет — как в записи."""
     d = str(rec.get(key) or "")
     if rec.get("silent") or d.upper() in _SILENT:
         return ("(ответ модели не разобран — решения не было)" if d.upper() == "НЕ_РАЗОБРАН"
                 else "(модель не ответила — решения не было)")
-    return f"{d}{_since(rec.get('price'), now, how, side)} — {rec.get('why') or ''}"
+    return f"{label or d}{_since(rec.get('price'), now, how, side)} — {rec.get('why') or ''}"
 
 
 def _pos_side_at(pos: Any, ts: Any) -> str | None:
@@ -433,20 +444,32 @@ def _pos_side_at(pos: Any, ts: Any) -> str | None:
 def _review_how(r: dict, pos: Any) -> tuple[str, str | None]:
     """Как показать ход цены после перепроверки: вход — «за лонг/шорт»; в позиции (in_pos в записи, если есть, или
     текущая позиция открыта раньше решения) — «за» сторону позиции (ПЕРЕВЕРНУТЬ — за новую сторону); вне рынка
-    (ЖДЁМ / НОВЫЙ_АНАЛИЗ / ВНЕ_РЕЖИМА без позиции) — обе стороны: «лонг отсюда …, шорт …»."""
+    (ЖДЁМ / НОВЫЙ_АНАЛИЗ / ВНЕ_РЕЖИМА без позиции) — обе стороны: «лонг отсюда …, шорт …». Ревью 5.4.3: сторона — из
+    записи (pos_side, пишет mission._review с 5.4.3), нет — от текущей позиции, открытой раньше решения, и при in_pos
+    True тоже (записи 5.4.3 до правки: in_pos есть, pos_side нет)."""
     c = str(r.get("choice") or "").upper()
     if c in _CHOICE_SIDE:
         return "deal", _CHOICE_SIDE[c]
     side = r.get("pos_side") if r.get("pos_side") in _SIDE_RU else None
     in_pos = r.get("in_pos")
-    if in_pos is None:
+    if in_pos is None or (in_pos and not side):
         side = side or _pos_side_at(pos, r.get("ts"))
-        in_pos = side is not None
+        in_pos = bool(in_pos) or side is not None
     if in_pos or c in ("ДОБРАТЬ", "ПЕРЕВЕРНУТЬ"):     # ходы только из позиции: сторона неизвестна — просто ход цены
         if side and c == "ПЕРЕВЕРНУТЬ":
             side = "short" if side == "long" else "long"
         return ("deal", side) if side else ("", None)
     return "wait", None
+
+
+def _review_row(r: dict, pos: Any, now: Any) -> str:
+    """Перепроверка строкой для памяти: метка модели (choice_label; ЖДЁМ, принятый в позиции, — «ДЕРЖАТЬ» и у старых
+    записей без in_pos) и ход цены в чью пользу (_review_how)."""
+    how, side = _review_how(r, pos)
+    lab = choice_label(r)
+    if lab == "ЖДЁМ" and how == "deal":
+        lab = "ДЕРЖАТЬ"
+    return _decided(r, "choice", now, how, side, label=lab)
 
 
 def _accumulated(m: Any, ctx: dict) -> str:
@@ -461,8 +484,7 @@ def _accumulated(m: Any, ctx: dict) -> str:
     pos = getattr(p, "position", None) if p is not None else None
     rv = getattr(m, "reviews", None) or []
     if rv:
-        L.append("Перепроверки: " + "; ".join(
-            f"{ai_v5.fmt_ts(r.get('ts'))} {_decided(r, 'choice', now, *_review_how(r, pos))}" for r in rv))
+        L.append("Перепроверки: " + "; ".join(f"{ai_v5.fmt_ts(r.get('ts'))} {_review_row(r, pos, now)}" for r in rv))
     since_mem = float(getattr(m, "memory_ts", None) or 0.0)     # двери и прибыль пилот не режет — только новое
     for attr, title in (("gates", "Проверки входа у двери"), ("profits", "Мысли о прибыли")):
         xs = [x for x in (list(getattr(p, attr, None) or []) if p is not None else [])
@@ -481,9 +503,11 @@ def _accumulated(m: Any, ctx: dict) -> str:
                                           for h in hs))
     gs = list(getattr(p, "guards", None) or []) if p is not None else []
     if gs:
+        # ревью 5.4.3: сторона позиции — из записи ответа (pos_side, пишет AIPilot._apply_guard/_apply_take): память
+        # сводится и после закрытия, когда текущей позиции уже нет; старые записи — от текущей позиции
         L.append("Ответы у троса и тейка: " + "; ".join(
             f"{ai_v5.fmt_ts(g.get('ts'))} {'у тейка ' if g.get('side') == 'take' else ''}"
-            f"{_decided(g, 'decision', now, 'deal', _pos_side_at(pos, g.get('ts')))}"
+            f"{_decided(g, 'decision', now, 'deal', g.get('pos_side') if g.get('pos_side') in _SIDE_RU else _pos_side_at(pos, g.get('ts')))}"
             for g in gs))
     # 5.4.3: толмач — только заголовки: его тексты — пересказ («пилот ждёт пробоя…»), в памяти он становился «фактом»;
     # факты уже есть в перепроверках, дверях, мыслях о прибыли, ответах у троса и в сделках
@@ -780,14 +804,32 @@ if __name__ == "__main__":
                 {"ts": t9, "decision": "ЖДАТЬ", "side": "stop", "price": 100.0, "why": "ложный прокол"}],
                 gates=[{"ts": t9, "decision": "ЖДАТЬ", "price": 100.0, "why": "откат", "side": "short"}], profits=[]))
         acc10 = _accumulated(m10, {"price": 101.0})
-        for piece in ("КУПИТЬ_СЕЙЧАС @100.0 → сейчас 101.0 (за лонг +1.0 %) — пробой",
-                      "ЖДЁМ @100.0 → сейчас 101.0 (за шорт -1.0 %) — держу",
+        for piece in ("КУПИТЬ @100.0 → сейчас 101.0 (за лонг +1.0 %) — пробой",     # ревью 5.4.3: метки модели
+                      "ДЕРЖАТЬ @100.0 → сейчас 101.0 (за шорт -1.0 %) — держу",
                       "ЖДЁМ @100.0 → сейчас 101.0 (лонг отсюда +1.0 %, шорт -1.0 %) — вне",
-                      "ДОБРАТЬ @100.0 → сейчас 101.0 (+1.0 %) — ещё",
+                      # ревью 5.4.3: in_pos без pos_side (записи 5.4.3 до правки) — сторона от текущей позиции
+                      "ДОБРАТЬ @100.0 → сейчас 101.0 (за шорт -1.0 %) — ещё",
                       "ЖДАТЬ @100.0 → сейчас 101.0 (за шорт -1.0 %) — ложный прокол",
                       "ЖДАТЬ @100.0 → сейчас 101.0 (-1.0 % в сторону плана) — откат"):
             assert piece in acc10, (piece, acc10)
         assert _pc(-0.0001) == "+0.00" and _pc(-0.05) == "-0.05" and _pc(-1.44) == "-1.4", (_pc(-0.0001), _pc(-0.05))
+        # ── ревью 5.4.3: позиция уже закрыта (узел «закрытие») — сторона из записей (pos_side), а не из текущей позиции ──
+        m11 = SimpleNamespace(ticker="T11", name="т", handoffs=[], memory_ts=t9 - 60, reviews=[
+            {"ts": t9, "choice": "ЖДЁМ", "why": "держу", "price": 100.0, "in_pos": True, "pos_side": "long"},
+            {"ts": t9, "choice": "ПЕРЕВЕРНУТЬ", "why": "слом", "price": 100.0, "in_pos": True, "pos_side": "long"},
+            {"ts": t9, "choice": "ЗАКРЫТЬ", "why": "выдохлось", "price": 100.0, "in_pos": True, "pos_side": "short"}],
+            pilot=SimpleNamespace(position=None, gates=[], profits=[], guards=[
+                {"ts": t9, "decision": "ЖДАТЬ", "side": "stop", "price": 100.0, "why": "вынос", "pos_side": "long"},
+                {"ts": t9, "decision": "ПОДЕРЖАТЬ", "side": "take", "price": 100.0, "why": "ход", "pos_side": "short"}]))
+        acc11 = _accumulated(m11, {"price": 101.0})
+        for piece in ("ДЕРЖАТЬ @100.0 → сейчас 101.0 (за лонг +1.0 %) — держу",
+                      "ПЕРЕВЕРНУТЬ @100.0 → сейчас 101.0 (за шорт -1.0 %) — слом",
+                      "ЗАКРЫТЬ @100.0 → сейчас 101.0 (за шорт -1.0 %) — выдохлось",
+                      "ЖДАТЬ @100.0 → сейчас 101.0 (за лонг +1.0 %) — вынос",
+                      "у тейка ПОДЕРЖАТЬ @100.0 → сейчас 101.0 (за шорт -1.0 %) — ход"):
+            assert piece in acc11, (piece, acc11)
+        assert choice_label({"choice": "КУПИТЬ_СЕЙЧАС"}) == "КУПИТЬ" and choice_label({"choice": "ЖДЁМ", "in_pos": True}) == "ДЕРЖАТЬ"
+        assert choice_label({"choice": "ЖДЁМ", "in_pos": False}) == "ЖДЁМ" and choice_label(None) == ""
         assert len(m2.reviews) == KEEP_REVIEWS and m2.reviews[-1]["why"] == "план жив 7"
         assert len(m2.handoffs) == KEEP_HANDOFFS and len(m2.pilot.guards) == KEEP_GUARDS and len(m2.explain) == KEEP_EXPLAIN
         assert events[-1]["stage"] == "memory" and events[-1]["status"] == "done" and events[-1]["data"]["n"] == 1

@@ -139,8 +139,11 @@ def test_chat_wait_order_and_silence(monkeypatch):
     monkeypatch.setitem(api_chat._STUBS, "mission", SimpleNamespace(snapshot=lambda: snap))
     txt, meta = api_chat._mission_text()
     assert meta["ticker"] == "SBER"
-    assert "фаза: вне рынка / жду план" in txt
-    assert "): WAIT — совет ждал: пробой 305 на объёме; уровни: 298, 305" in txt, txt
+    # ревью 5.4.3: подача WAIT как в миссии 5.4.3 — ориентир совета (не условие), уровни — будильник кода
+    assert "фаза: вне рынка, плана нет" in txt
+    assert ": WAIT — вне рынка. Ориентир совета (не условие): пробой 305 на объёме." in txt, txt
+    assert "Будильник кода у уровней 298, 305 — проход цены будит дежурного PRO, это не вход." in txt, txt
+    assert "совет ждал" not in txt and "Пилот: вне рынка, плана нет;" in txt, txt
     assert "вход сейчас" not in txt and "стоп None" not in txt and "тейк None" not in txt
     assert "Перепроверка" in txt and "ответа не было — решения не было" in txt and "ЖДЁМ — коридор 298–305" in txt
     assert "НЕТ_ОТВЕТА —" not in txt and "Ответ у троса" in txt and "FLASH у троса" not in txt
