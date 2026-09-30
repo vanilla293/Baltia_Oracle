@@ -26,6 +26,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterable
 import aiosqlite
 
 from .timeutil import iso, now_utc
+from .usage import USAGE_SCHEMA
 
 log = logging.getLogger("oracle.db")
 
@@ -319,6 +320,7 @@ class DB:
             await self.conn.execute("PRAGMA journal_mode=WAL")
             await self.conn.execute("PRAGMA foreign_keys=ON")
             await self.conn.executescript(SCHEMA)
+            await self.conn.executescript(USAGE_SCHEMA)   # учёт расходов на модель (oracle.usage)
             try:
                 await self.conn.executescript(FTS_SCHEMA)
             except Exception as e:  # sqlite без FTS5 — поиск деградирует до LIKE

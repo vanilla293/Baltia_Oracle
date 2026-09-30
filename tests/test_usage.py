@@ -100,7 +100,9 @@ def test_prices_table_shape():
 
 # ── запись вызова ───────────────────────────────────────────────────────────
 async def test_record_creates_table_lazily_on_fresh_db(db):
-    # свежая база из conftest: таблицы llm_usage ещё нет
+    # интегратор добавил llm_usage в схему db.open, поэтому в обычной базе таблица уже есть.
+    # Чтобы проверить ленивое создание в record(), временно её убираем — record() создаст сам.
+    await db.execute("DROP TABLE IF EXISTS llm_usage")
     exists = await db.fetchall(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='llm_usage'")
     assert exists == []

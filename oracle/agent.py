@@ -41,7 +41,7 @@ from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
 from urllib.parse import unquote, urlsplit, urlunsplit
 
-from . import persona, timeutil
+from . import persona, timeutil, usage
 from .llm import LLMError
 from .tools import base as tbase
 from .tools.base import OutItem, ToolContext
@@ -658,8 +658,9 @@ class Agent:
                               ringing=await self._ringing())
             try:
                 try:
-                    final = await self._run(msgs, deep=deep_v, turn=turn, actions=actions, guard=guard,
-                                            said=said, escalate=not deep_v and bool(self.cfg.llm_auto_deep))
+                    with usage.route("deep" if deep_v else "chat"):
+                        final = await self._run(msgs, deep=deep_v, turn=turn, actions=actions, guard=guard,
+                                                said=said, escalate=not deep_v and bool(self.cfg.llm_auto_deep))
                 except Escalate as esc:
                     # тот же ход заново — глубокой моделью; быстрая ничего не успела сделать
                     log.info("ход: быстрая модель передала вопрос глубокой (%s)", esc.reason)
@@ -669,7 +670,9 @@ class Agent:
                     await self._say(ESCALATE_TEXT)
                     system = await self._system(text, deep=True, extra="\n".join(extra))
                     msgs = await self._history(system, fallback=text, owner_urls=set())
-                    final = await self._run(msgs, deep=True, turn=turn, actions=actions, guard=guard, said=said)
+                    with usage.route("deep"):
+                        final = await self._run(msgs, deep=True, turn=turn, actions=actions, guard=guard,
+                                                said=said)
             finally:
                 await self._keep_urls(guard.fresh)
                 await self._keep_urls(mine | guard.pinned, owner=True)
@@ -1048,7 +1051,8 @@ class Agent:
                 return False
             transcript = self._transcript(rows, me="Ты", limit=SUMMARY_ITEM_MAX)
             try:
-                text = await self.llm.ask(SUMMARY_SYSTEM, transcript, deep=False)
+                with usage.route("summary"):
+                    text = await self.llm.ask(SUMMARY_SYSTEM, transcript, deep=False)
             except LLMError as e:
                 log.warning("конспект не получился: %s", e)
                 return False
@@ -1107,7 +1111,8 @@ class Agent:
             if persona.is_female(getattr(cfg, "owner_gender", "m")):
                 system += "\n" + persona.FEMALE_NOTE
             try:
-                data = await self.llm.ask_json(system, user, deep=True)
+                with usage.route("reflect"):
+                    data = await self.llm.ask_json(system, user, deep=True)
             except LLMError as e:
                 log.warning("рефлексия: модель не ответила: %s", e)
                 return None

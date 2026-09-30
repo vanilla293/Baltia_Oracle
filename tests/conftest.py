@@ -112,9 +112,12 @@ def clock():
 
 @pytest.fixture
 def cfg(tmp_path) -> Settings:
+    # files_workspace держим внутри tmp_path (и оканчивающимся на «Oracle»), чтобы зеркало идей
+    # в тестах не писало в настоящую домашнюю папку, а само значение оставалось узнаваемым
     return Settings(bot_token="1:x", owner_id=42, llm_api_key="sk-test",
                     timezone="Europe/Moscow", data_dir=tmp_path, db_path=tmp_path / "t.db",
-                    news_feeds=(), web_search=False)
+                    news_feeds=(), web_search=False,
+                    files_roots=(tmp_path,), files_workspace=tmp_path / "Oracle")
 
 
 @pytest_asyncio.fixture

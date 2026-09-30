@@ -158,6 +158,9 @@ class LLM:
         self._own_client = client is None
         self.usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
         self._key_idx = 0           # какой из cfg.api_keys сейчас в работе
+        # хук учёта расходов: async (info: dict) -> None; интегратор ставит usage.make_hook(db, cfg).
+        # Вызывается после каждого успешного ответа; любой сбой внутри учёт проглатывает сам.
+        self.on_usage: Any = None
 
     @property
     def api_key(self) -> str:
@@ -189,6 +192,17 @@ class LLM:
         if self._client is not None and self._own_client:
             await self._client.aclose()
         self._client = None
+
+    async def _fire_usage(self, resp: "LLMResponse", deep: bool) -> None:
+        """Отдать учёту расходов один вызов (модель, режим, usage). Учёт (make_hook) сам глотает
+        любые ошибки; здесь — ещё один страховочный try, чтобы учёт никогда не ломал ответ."""
+        hook = self.on_usage
+        if hook is None or not resp.usage:
+            return
+        try:
+            await hook({"model": resp.model, "deep": bool(deep), "usage": resp.usage})
+        except Exception:
+            log.debug("хук учёта расходов упал (проигнорирован)", exc_info=True)
 
     # ── сборка запроса ──
     def build_payload(self, messages: list[dict], *, tools: list[dict] | None = None,
@@ -282,6 +296,7 @@ class LLM:
                     raise LLMError("провайдер модели отфильтровал ответ (content_filter) — это цензура на стороне "
                                    "DeepSeek, а не моя; переформулируй вопрос", kind="filtered")
                 if allow_empty:
+                    await self._fire_usage(resp, deep)
                     return resp
                 if resp.finish_reason == "length":
                     raise LLMError("модель упёрлась в потолок токенов и не успела ответить — "
@@ -291,6 +306,7 @@ class LLM:
                     raise last
                 await asyncio.sleep(1.0)
                 continue
+            await self._fire_usage(resp, deep)
             return resp
         raise last or LLMError("модель не ответила")
 

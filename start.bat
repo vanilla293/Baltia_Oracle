@@ -103,10 +103,19 @@ if errorlevel 1 echo faster-whisper не поставился - голосовы
 
 :voice_ok
 rem ---- 6. Запуск ----
+rem Код выхода 75 = бот попросил перезапуск (кнопка на панели / применение настроек / определение
+rem владельца при первом сообщении). Перезапускаем. Обычный выход и Ctrl+C цикл не крутят.
 if not exist "data" mkdir "data"
 echo Запускаю бота. Остановить - Ctrl+C или закрыть это окно.
 echo Пока окно открыто и компьютер не спит, бот работает.
+:run_loop
 ".venv\Scripts\python.exe" -m oracle %*
+if errorlevel 76 goto after_run
+if errorlevel 75 (
+    echo Перезапускаюсь ^(применяю настройки^)...
+    goto run_loop
+)
+:after_run
 if errorlevel 1 goto crashed
 endlocal
 exit /b 0

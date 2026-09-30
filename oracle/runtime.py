@@ -15,9 +15,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import re
 import socket
 import time
 from collections import deque
@@ -546,3 +548,73 @@ async def warn_owner(notifier: Any, holders: list[dict[str, Any]]) -> bool:
     except Exception:
         log.warning("не смог предупредить владельца о конфликте токена", exc_info=True)
         return False
+
+
+# ── запись настроек в .env (для панели) ──────────────────────────────────────────
+_ENV_LINE = re.compile(r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*=)(.*)$")
+
+
+def _env_value(v: str) -> str:
+    """Значение для строки .env: если есть пробел/кавычка/решётка — берём в двойные кавычки."""
+    s = str(v)
+    if s and (s != s.strip() or any(c in s for c in " #\"'") ):
+        return '"' + s.replace('"', '\\"') + '"'
+    return s
+
+
+def update_env(path: str | os.PathLike, updates: dict[str, str | None]) -> dict[str, Any]:
+    """Аккуратно записать изменения в файл .env, сохранив комментарии и порядок строк.
+
+    updates: {ENV_NAME: значение} — заменить/добавить строку; {ENV_NAME: None} — удалить строку.
+    Существующие строки правятся на месте, новые дописываются в конец. Комментарии и пустые
+    строки не трогаются. Файла нет — создаётся. → {ok, changed:[…], path}. Не роняет вызывающего:
+    ошибка ввода-вывода возвращается как {ok: False, error}. Секреты в лог не пишутся.
+    """
+    updates = {k: v for k, v in (updates or {}).items() if k}
+    p = Path(path)
+    changed: list[str] = []
+    try:
+        try:
+            text = p.read_text(encoding="utf-8-sig")
+        except FileNotFoundError:
+            text = ""
+        except UnicodeDecodeError:
+            text = p.read_text(encoding="cp1251", errors="replace")
+        lines = text.splitlines()
+        seen: set[str] = set()
+        out: list[str] = []
+        for line in lines:
+            m = _ENV_LINE.match(line)
+            if m and m.group(2) in updates:
+                key = m.group(2)
+                seen.add(key)
+                val = updates[key]
+                if val is None:
+                    changed.append(key)
+                    continue                      # строку удаляем
+                new_line = f"{m.group(1)}{key}={_env_value(val)}"
+                if new_line != line:
+                    changed.append(key)
+                out.append(new_line)
+            else:
+                out.append(line)
+        # новые ключи (которых в файле не было) — в конец
+        added = [(k, v) for k, v in updates.items() if k not in seen and v is not None]
+        if added:
+            if out and out[-1].strip():
+                out.append("")
+            for k, v in added:
+                out.append(f"{k}={_env_value(v)}")
+                changed.append(k)
+        new_text = "\n".join(out)
+        if new_text and not new_text.endswith("\n"):
+            new_text += "\n"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(new_text, encoding="utf-8")
+        with contextlib.suppress(OSError):
+            if os.name == "posix":
+                os.chmod(p, 0o600)                # там бывают токен и ключи
+        return {"ok": True, "changed": changed, "path": str(p)}
+    except Exception as e:
+        log.warning("не смог записать %s: %s", p, type(e).__name__)
+        return {"ok": False, "error": f"{type(e).__name__}", "changed": changed, "path": str(p)}

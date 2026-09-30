@@ -62,6 +62,7 @@ class Deps:
     news: Any = None                 # services.news.NewsService
     notifier: Any = None             # BotNotifier (чат владельца)
     scheduler: Any = None            # services.scheduler.Scheduler
+    dashboard: Any = None            # dashboard.Dashboard (адрес панели с токеном для /panel)
 
 
 # ── тексты ───────────────────────────────────────────────────────────────────
@@ -87,6 +88,7 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("reset", "начать разговор с чистого листа"),
     ("backup", "резервная копия базы"),
     ("chats", "твои непрочитанные чаты"),
+    ("panel", "ссылка на панель настроек"),
     ("status", "состояние бота"),
 )
 
@@ -136,6 +138,7 @@ HELP_TEXT = """\
 /reset — начать разговор с чистого листа (память остаётся)
 /backup — резервная копия базы
 /chats — твои непрочитанные чаты (если подключён userbot)
+/panel — ссылка на локальную панель настроек
 /status — состояние бота"""
 
 DEEP_NOTE = "🧠 Думаю глубоко — это может занять пару минут."
@@ -1136,6 +1139,18 @@ class Handlers:
         else:
             await out.send(unlink(text), btns)
 
+    async def cmd_panel(self, message: Any) -> None:
+        dash = self.d.dashboard
+        url = getattr(dash, "url", None)
+        out = self._out(message)
+        if not url:
+            await out.send("Панель сейчас не запущена. Она поднимается локально при старте бота "
+                           "(адрес с токеном пишется в лог). Открывается только на том компьютере, где "
+                           "бот работает.")
+            return
+        await out.send(f"🖥 Панель управления (только на этом компьютере, ссылка с токеном — никому "
+                       f"не пересылай):\n{url}")
+
     async def cmd_status(self, message: Any) -> None:
         from ..tools import reminders as rem
         cfg, d = self.cfg, self.d
@@ -1164,9 +1179,21 @@ class Handlers:
             f"{what} {getattr(cfg, attr, '') or 'выкл.'}"
             for what, attr in (("сводка", "morning_brief_time"), ("дни рождения", "birthday_time"),
                                ("новости", "news_digest_time"), ("рефлексия", "reflection_time"))))
-        usage = getattr(d.llm, "usage_total", None) or {}
-        lines.append(f"Модель с запуска: вызовов — {usage.get('calls', 0)}, токенов на вход — "
-                     f"{usage.get('prompt_tokens', 0)}, на выход — {usage.get('completion_tokens', 0)}")
+        usage_total = getattr(d.llm, "usage_total", None) or {}
+        lines.append(f"Модель с запуска: вызовов — {usage_total.get('calls', 0)}, токенов на вход — "
+                     f"{usage_total.get('prompt_tokens', 0)}, на выход — {usage_total.get('completion_tokens', 0)}")
+        usage_mod = getattr(self.ctx.services, "usage", None)
+        if usage_mod is not None:
+            try:
+                today = await usage_mod.summary(self.db, days=1)
+                month = await usage_mod.summary(self.db, days=30)
+                lines.append(f"Расходы DeepSeek: сегодня ${today['total_cost']:.4f}, "
+                             f"за 30 дней ${month['total_cost']:.4f} ({month['total_calls']} вызовов)")
+            except Exception:
+                log.debug("не собрал расходы для /status", exc_info=True)
+        dash_url = getattr(d.dashboard, "url", None)
+        if dash_url:
+            lines.append(f"Панель: {dash_url}")
         failed = getattr(d.agent, "failed_modules", None)
         if failed:
             lines.append("Не загрузились инструменты: " + ", ".join(map(str, failed)))

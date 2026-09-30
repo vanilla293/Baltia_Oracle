@@ -4,6 +4,10 @@ aiogram>=3.20,<4
 httpx>=0.27,<1
 # сетевой слой httpx: read_url ставит в него свой страж от DNS rebinding
 httpcore>=1.0,<2
+# локальная панель (oracle.dashboard); тянется и aiogram, но нужен нам напрямую
+aiohttp>=3.10
+# поиск чужих копий, держащих тот же токен (oracle.runtime.find_holders); без него детект просто выключен
+psutil>=5.9
 aiosqlite>=0.20
 feedparser>=6.0.11
 python-dateutil>=2.9

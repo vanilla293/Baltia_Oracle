@@ -100,6 +100,18 @@ if grep -Eiq '^[[:space:]]*(export[[:space:]]+)?STT_PROVIDER[[:space:]]*=[[:spac
 fi
 
 # ── 6. Запуск ───────────────────────────────────────────────────────────
+# Код выхода 75 = бот попросил перезапуск (кнопка «перезапустить» / применение настроек на панели,
+# определение владельца при первом сообщении). Перезапускаем. Обычный выход (0) и Ctrl+C — не зациклены.
 mkdir -p data
 say "Запускаю бота. Остановить — Ctrl+C."
-exec .venv/bin/python -m oracle "$@"
+while true; do
+    set +e
+    .venv/bin/python -m oracle "$@"
+    code=$?
+    set -e
+    if [ "$code" -eq 75 ]; then
+        say "Перезапускаюсь (применяю настройки)…"
+        continue
+    fi
+    exit "$code"
+done

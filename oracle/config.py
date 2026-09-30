@@ -176,9 +176,7 @@ def resolve_timezone(name: str) -> str | None:
 class Settings:
     # Telegram
     bot_token: str = ""
-    owner_id: int = 0                          # главный (первый в OWNER_ID)
-    owner_ids: tuple[int, ...] = ()            # все из OWNER_ID=id1,id2 — у каждого своё пространство
-    allow_requests: bool = False               # чужой /start спрашивает главного «Пустить?» (по умолчанию — нет)
+    owner_id: int = 0                          # единственный владелец (первое число из OWNER_ID)
     telegram_api_url: str = ""                 # свой Bot API сервер; пусто — api.telegram.org
     bot_name: str = "Оракул"
     owner_name: str = ""
@@ -242,6 +240,19 @@ class Settings:
     weather_lat: float | None = None
     weather_lon: float | None = None
 
+    # локальная панель (dashboard)
+    dashboard_host: str = "127.0.0.1"
+    dashboard_port: int = 8765
+    dashboard_open: bool = True
+
+    # доступ к папкам: где боту можно читать и куда — писать
+    files_roots: tuple[Path, ...] = field(default_factory=lambda: (Path.home(),))
+    files_workspace: Path = field(default_factory=lambda: Path.home() / "Oracle")
+
+    # учёт расходов и живучесть одного экземпляра
+    usage_peak_pricing: bool = True            # считать дорогой пиковый тариф DeepSeek в пиковые окна
+    single_instance: bool = True               # замок «одна копия из этой папки»
+
     # userbot (чтение своих чатов, черновики ответов)
     userbot_enabled: bool = False
     tg_api_id: int = 0
@@ -265,8 +276,8 @@ class Settings:
 
     @property
     def owners(self) -> tuple[int, ...]:
-        """Все, кому бот служит по .env: главный первым."""
-        return self.owner_ids or ((self.owner_id,) if self.owner_id else ())
+        """Владелец кортежем (для логов/совместимости): бот служит ровно одному человеку."""
+        return (self.owner_id,) if self.owner_id else ()
 
     @property
     def tz_ok(self) -> bool:
@@ -316,6 +327,23 @@ def _rooted(p: str) -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
+def _paths(name: str, default: tuple[Path, ...]) -> tuple[Path, ...]:
+    """Список путей из .env: через запятую, точку с запятой или перенос строки (в панели
+    показываются и сохраняются через запятую). Пусто → default."""
+    v = _get(name, "")
+    if not v:
+        return default
+    parts = [x.strip() for x in re.split(r"[,;\n]+", v) if x.strip()]
+    roots = tuple(_rooted(p) for p in parts)
+    return roots or default
+
+
+def _one_path(name: str, default: Path) -> Path:
+    """Один путь из .env (или default). Относительный — от папки проекта, ~ раскрывается."""
+    v = _get(name, "")
+    return _rooted(v) if v else default
+
+
 def _read_env(path: Path) -> dict[str, str]:
     """Настройки из .env. Строка встречается дважды (дописал свою, а пустая осталась) — берётся
     последнее НЕпустое значение: пустая строка не стирает вписанный id. Кавычки и пробелы вокруг
@@ -362,15 +390,17 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
     base_url = _get("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/")
     ds_key, other_key = _get("DEEPSEEK_API_KEY"), _get("LLM_API_KEY")
     api_key = (ds_key or other_key) if "deepseek" in base_url.lower() else (other_key or ds_key)
-    # OWNER_ID=главный[,второй,…] — несколько людей, у каждого своё пространство
-    owner_ids: tuple[int, ...] = ()
+    # OWNER_ID — один человек: берём первое положительное число, остальное молча игнорируем
+    # (старый формат «id1,id2» больше не заводит второе пространство — версия на одного)
+    owner_id = 0
     for part in re.split(r"[,;\s]+", _get("OWNER_ID", "")):
         try:
             v = int(part)
         except ValueError:
             continue
-        if v > 0 and v not in owner_ids:
-            owner_ids += (v,)
+        if v > 0:
+            owner_id = v
+            break
     # несколько ключей через запятую: основной + запасные (кончились деньги / отозван — берём следующий)
     api_keys = tuple(dict.fromkeys(k.strip() for k in re.split(r"[,;\s]+", api_key) if k.strip()))
     api_key = api_keys[0] if api_keys else ""
@@ -391,9 +421,7 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
 
     return Settings(
         bot_token=_get("BOT_TOKEN"),
-        owner_id=owner_ids[0] if owner_ids else 0,
-        owner_ids=owner_ids,
-        allow_requests=_bool("ALLOW_REQUESTS", False),
+        owner_id=owner_id,
         telegram_api_url=_get("TELEGRAM_API_URL", "").rstrip("/"),
         bot_name=_get("BOT_NAME", "Оракул"),
         owner_name=_get("OWNER_NAME", ""),
@@ -445,6 +473,13 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
         weather_city=_get("WEATHER_CITY", ""),
         weather_lat=_opt_float("WEATHER_LAT"),
         weather_lon=_opt_float("WEATHER_LON"),
+        dashboard_host=_get("DASHBOARD_HOST", "127.0.0.1"),
+        dashboard_port=_int("DASHBOARD_PORT", 8765),
+        dashboard_open=_bool("DASHBOARD_OPEN", True),
+        files_roots=_paths("FILES_ROOTS", (Path.home(),)),
+        files_workspace=_one_path("FILES_WORKSPACE", Path.home() / "Oracle"),
+        usage_peak_pricing=_bool("USAGE_PEAK_PRICING", True),
+        single_instance=_bool("SINGLE_INSTANCE", True),
         userbot_enabled=_bool("USERBOT_ENABLED", False),
         tg_api_id=_int("TG_API_ID", 0),
         tg_api_hash=_get("TG_API_HASH"),

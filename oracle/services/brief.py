@@ -13,7 +13,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .. import timeutil
+from .. import timeutil, usage
 from ..tools.base import ToolContext
 
 log = logging.getLogger("oracle.brief")
@@ -408,7 +408,8 @@ async def morning_brief(ctx: ToolContext, *, mode: str = "morning") -> str:
         parts = {k: v.format(now=ctx.now_local().strftime("%H:%M")) for k, v in _MODES[mode].items()}
         system = SYSTEM.format(name=cfg.bot_name, owner=f"владельца ({owner})" if owner else "владельца",
                                limit=BRIEF_MAX, **parts)
-        text = await ctx.llm.ask(system, format_data(ctx, d), deep=False, temperature=0.9)
+        with usage.route("brief"):
+            text = await ctx.llm.ask(system, format_data(ctx, d), deep=False, temperature=0.9)
         text = str(text or "").strip()
         if text:
             return text

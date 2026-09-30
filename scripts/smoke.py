@@ -58,7 +58,9 @@ def main() -> int:
                    LLM_API_KEY="sk-test",
                    TELEGRAM_API_URL=TG, DATA_DIR=DATA, TIMEZONE="Europe/Moscow", STT_PROVIDER="off",
                    MORNING_BRIEF_TIME="off", NEWS_DIGEST_TIME="off", REFLECTION_TIME="off", BIRTHDAY_TIME="off",
-                   WEB_SEARCH="0", NEWS_FEEDS="http://127.0.0.1:18081/none", LOG_LEVEL="INFO", TTS_DEFAULT="off")
+                   WEB_SEARCH="0", NEWS_FEEDS="http://127.0.0.1:18081/none", LOG_LEVEL="INFO", TTS_DEFAULT="off",
+                   # панель — на свободном порту и без браузера; файлы бота — во временной папке
+                   DASHBOARD_PORT="0", DASHBOARD_OPEN="0", FILES_ROOTS=DATA, FILES_WORKSPACE=DATA)
     # ENV_FILE указывает в никуда — .env проекта (с настоящими ключами) не подмешивается
     app_env["ENV_FILE"] = os.path.join(DATA, "no.env")
     app = subprocess.Popen([PY, "-m", "oracle"], cwd=REPO, env=app_env,
@@ -82,6 +84,8 @@ def main() -> int:
              lambda out: any("<b>плохая</b>" in m["text"] and "&lt;потому что&gt;" in m["text"] for m in out)),
             ("voice without stt", {"kind": "voice"}, lambda out: any("GROQ" in m["text"] or "голос" in m["text"].lower() for m in out)),
             ("/status", {"kind": "text", "text": "/status"}, lambda out: any("deepseek-flash" in m["text"] for m in out)),
+            ("/panel", {"kind": "text", "text": "/panel"},
+             lambda out: any("127.0.0.1" in m["text"] and "?t=" in m["text"] for m in out)),
             ("/help", {"kind": "text", "text": "/help"}, lambda out: len(out) >= 1),
             ("/memory", {"kind": "text", "text": "/memory"}, lambda out: len(out) >= 1),
             ("/today", {"kind": "text", "text": "/today"}, lambda out: len(out) >= 1),

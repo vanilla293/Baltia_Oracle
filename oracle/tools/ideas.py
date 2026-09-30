@@ -20,6 +20,7 @@ from datetime import timedelta
 from typing import Any
 
 from .. import timeutil
+from .. import usage
 from ..db import normalize_text
 from ..llm import LLMError
 from .base import Buttons, OutItem, ToolContext, tool
@@ -171,6 +172,21 @@ def idea_card(row: dict, tz: Any) -> str:
 
 
 # ── база ─────────────────────────────────────────────────────────────────────
+async def _mirror(ctx: ToolContext, row: dict | None) -> None:
+    """Отразить идею markdown-файлом в рабочей папке (files.mirror_idea). Безопасно: mirror_idea
+    сам не бросает, а импорт/вызов ещё раз обёрнут — зеркало никогда не мешает сохранению идеи."""
+    if not row:
+        return
+    try:
+        from . import files
+    except Exception:
+        return
+    try:
+        await files.mirror_idea(ctx, row)
+    except Exception:
+        log.debug("не зеркалю идею #%s в файл", row.get("id"), exc_info=True)
+
+
 async def load_idea(db, idea_id: Any) -> dict | None:
     try:
         iid = int(str(idea_id).strip().lstrip("#"))
@@ -376,7 +392,8 @@ async def deep_evaluate(ctx: ToolContext, idea_id: int) -> str:
             facts = await facts_for_prompt(db, f"{row['title']} {row['content']} {row.get('tags') or ''}", 25)
         except Exception:  # без памяти разбор всё равно возможен
             log.exception("не смог достать факты для разбора идеи #%s", iid)
-        text = (await ctx.llm.ask(DEEP_SYSTEM, _deep_user_prompt(ctx, row, facts), deep=True) or "").strip()
+        with usage.route("idea"):
+            text = (await ctx.llm.ask(DEEP_SYSTEM, _deep_user_prompt(ctx, row, facts), deep=True) or "").strip()
         if not text:
             err = "модель вернула пустой разбор"
     except LLMError as e:
@@ -399,6 +416,7 @@ async def deep_evaluate(ctx: ToolContext, idea_id: int) -> str:
     verdict = parse_verdict(text)
     await db.execute("UPDATE ideas SET deep_evaluation=?, score=COALESCE(?, score), updated_at=? WHERE id=?",
                      (text, score, _now_iso(), iid))
+    await _mirror(ctx, await load_idea(db, iid))   # обновляем зеркало — теперь с глубоким разбором
     await _notify(ctx, f"🧠 Додумал идею #{iid} «{title}»\n\n{text}")
     summary = f"Бот додумал идею #{iid} «{title}», итог: оценка {score}/10" if score is not None \
         else f"Бот додумал идею #{iid} «{title}», итог: оценка не выставлена"
@@ -446,6 +464,7 @@ async def t_save_idea(ctx: ToolContext, *, title: str, content: str, evaluation:
         "VALUES(?,?,?,?,?,'new',?,?)", (title_s, content_s, eval_s, sc, tags_s, now, now))
     row = await load_idea(ctx.db, iid) or {}
     await _reindex(ctx.db, row)
+    await _mirror(ctx, row)                       # зеркалим идею markdown-файлом в рабочей папке
     ctx.outbox.append(OutItem(kind="text", text=f"💡 Идея #{iid} «{title_s}» сохранена · {sc}/10",
                               buttons=deep_buttons(iid)))
     out: dict[str, Any] = {"ok": True, "id": iid, "title": title_s, "score": sc, "tags": tags_s}

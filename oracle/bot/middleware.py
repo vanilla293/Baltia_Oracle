@@ -42,12 +42,9 @@ from .. import timeutil
 log = logging.getLogger("oracle.bot.middleware")
 
 STRANGER_TEXT = "Это личный бот."
-ACCESS_TEXT = {        # ответ чужому на /start, когда можно попроситься
-    "sent": "Это личный бот. Спросил хозяина, можно ли тебе им пользоваться, — если пустит, я напишу.",
-    "wait": "Хозяину уже передал — жди, если пустит, я напишу.",
-    "denied": STRANGER_TEXT,
-    "full": STRANGER_TEXT,
-}
+WELCOME_CLAIM = ("Привет! Теперь я твой личный бот — запомнил тебя как владельца, больше "
+                 "никого слушать не буду. Секунду — перезапущусь и включу голову: память, "
+                 "напоминания, идеи, дневник. Через пару секунд напиши /start.")
 NO_ACCESS = "Нет доступа"
 SETUP_BUTTON = ("Эта копия бота не настроена: в её .env нет OWNER_ID, поэтому кнопки не работают. "
                 "Закрой её (или впиши OWNER_ID) — отвечать должна одна копия.")
@@ -92,19 +89,33 @@ class OwnerOnly(BaseMiddleware):
     и callback_query."""
 
     def __init__(self, cfg: Any, *, stranger_reply: bool = True, reply_every: float = REPLY_EVERY,
-                 clock: Callable[[], float] = time.monotonic,
-                 allowed: Callable[[Any], bool] | None = None,
-                 on_request: Callable[[Any], Awaitable[str]] | None = None):
-        """allowed(uid) — кого пускать (по умолчанию — только OWNER_ID); on_request(user) — чужой прислал
-        /start: спросить главного, пустить ли (→ "sent" | "wait" | "denied" | "full")."""
+                 clock: Callable[[], float] = time.monotonic, db: Any = None,
+                 on_claim: Callable[[int], Awaitable[Any]] | None = None):
+        """db — база (для «первый написавший становится владельцем»); on_claim(uid) — что сделать после
+        того, как владельца определили (в приложении — запросить перезапуск, чтобы поднять мозг)."""
         self.cfg = cfg
-        self.allowed = allowed or (lambda uid: is_owner(cfg, uid))
-        self.on_request = on_request
+        self.db = db
+        self.on_claim = on_claim
         self.stranger_reply = stranger_reply
         self.reply_every = float(reply_every)
         self._clock = clock
         self._replied: dict[int, float] = {}
         self._warned: set[int] = set()
+        self._claimed: int | None = None       # владелец, определённый на лету (первый написавший)
+        self._loaded = False                    # уже сверялись со stored owner в базе
+
+    def _owner_id(self) -> int:
+        """Владелец: из .env (cfg.owner_id) или определённый на лету (первый написавший). 0 — никого."""
+        return int(getattr(self.cfg, "owner_id", 0) or 0) or int(self._claimed or 0)
+
+    def _is_owner(self, uid: Any) -> bool:
+        oid = self._owner_id()
+        if not oid or uid is None or isinstance(uid, bool):
+            return False
+        try:
+            return int(uid) == oid
+        except (TypeError, ValueError):
+            return False
 
     def _may_reply(self, uid: int | None) -> bool:
         """Не чаще раза в reply_every на человека (и память не пухнет от спамеров)."""
@@ -122,11 +133,25 @@ class OwnerOnly(BaseMiddleware):
         self._replied[uid] = now
         return True
 
+    async def _ensure_loaded(self) -> None:
+        """Один раз при OWNER_ID=0 свериться с базой: вдруг владельца уже запомнили (claim при
+        прошлом сообщении/запуске). Обычно после claim бот перезапускается и владелец уже в cfg."""
+        if self._loaded or self.db is None or int(getattr(self.cfg, "owner_id", 0) or 0):
+            return
+        self._loaded = True
+        try:
+            stored = int(await self.db.kv_get("owner_id", 0) or 0)
+        except Exception:
+            stored = 0
+        if stored > 0:
+            self._claimed = stored
+
     async def __call__(self, handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
                        event: TelegramObject, data: dict[str, Any]) -> Any:
         user = getattr(event, "from_user", None)
         uid = getattr(user, "id", None)
-        if uid is not None and not isinstance(uid, bool) and self.allowed(uid):
+        await self._ensure_loaded()
+        if uid is not None and not isinstance(uid, bool) and self._is_owner(uid):
             chat = event_chat(event)
             chat_type = getattr(chat, "type", None)
             if chat_type == "private":
@@ -141,8 +166,7 @@ class OwnerOnly(BaseMiddleware):
             return None
         try:
             if isinstance(event, CallbackQuery):
-                owner_set = bool(int(getattr(self.cfg, "owner_id", 0) or 0))
-                await event.answer(NO_ACCESS if owner_set else SETUP_BUTTON, show_alert=True)
+                await event.answer(NO_ACCESS if self._owner_id() else SETUP_BUTTON, show_alert=True)
             elif isinstance(event, Message):
                 await self._stranger_message(event, uid, user)
         except Exception as e:   # ответ чужому — не повод падать
@@ -160,27 +184,43 @@ class OwnerOnly(BaseMiddleware):
         log.warning("посторонний %s написал боту — игнорирую. Если это ты, OWNER_ID в .env неверный: "
                     "впиши OWNER_ID=%s и перезапусти бота", uid, uid)
 
+    async def _claim(self, message: Message, uid: int) -> None:
+        """Первый написавший становится владельцем: запоминаем в базе, приветствуем и (через on_claim)
+        просим приложение перезапуститься — чтобы поднялся мозг с этим владельцем."""
+        try:
+            await self.db.kv_set("owner_id", int(uid))
+        except Exception:
+            log.warning("не смог запомнить владельца %s", uid, exc_info=True)
+            return
+        self._claimed = int(uid)
+        log.warning("первый написавший (%s) стал владельцем — запомнил в базе, перезапускаюсь", uid)
+        try:
+            await message.answer(WELCOME_CLAIM, parse_mode=None)
+        except Exception as e:
+            log.debug("приветствие новому владельцу не ушло: %r", e)
+        if self.on_claim is not None:
+            try:
+                await self.on_claim(int(uid))
+            except Exception:
+                log.warning("claim: не смог запросить перезапуск", exc_info=True)
+
     async def _stranger_message(self, message: Message, uid: int | None, user: Any = None) -> None:
-        owner_set = bool(int(getattr(self.cfg, "owner_id", 0) or 0))
         chat_type = getattr(getattr(message, "chat", None), "type", "private")
-        if owner_set and self.on_request is not None and uid is not None and chat_type == "private" \
-                and is_start(message.text):
-            status = await self.on_request(user)
-            log.info("чужой %s прислал /start — запрос доступа: %s", uid, status)
-            text = ACCESS_TEXT.get(status)
-            if text and (status == "sent" or self._may_reply(uid)):
-                await message.answer(text, parse_mode=None)
+        if self._owner_id():                      # владелец уже есть (из .env или определён на лету) — это чужой
+            self._log_stranger(uid)
+            if self.stranger_reply and chat_type == "private" and self._may_reply(uid):
+                await message.answer(STRANGER_TEXT, parse_mode=None)
             return
-        if not owner_set:
-            if uid is not None and is_start(message.text):
-                log.info("OWNER_ID не задан; /start от %s — отправляю ему id", uid)
-                await message.answer(id_text(uid), parse_mode="HTML")
-            elif chat_type == "private" and self._may_reply(uid):
-                await message.answer(SETUP_HINT, parse_mode=None)
+        # владельца ещё нет. Настоящий запуск (есть база) — первый написавший в личке становится им
+        if self.db is not None and uid is not None and chat_type == "private":
+            await self._claim(message, int(uid))
             return
-        self._log_stranger(uid)
-        if self.stranger_reply and chat_type == "private" and self._may_reply(uid):
-            await message.answer(STRANGER_TEXT, parse_mode=None)
+        # запуск без базы (например, тесты/бутстрап) — прежнее поведение: /start пришлёт id, иначе подсказка
+        if uid is not None and is_start(message.text):
+            log.info("OWNER_ID не задан; /start от %s — отправляю ему id", uid)
+            await message.answer(id_text(uid), parse_mode="HTML")
+        elif chat_type == "private" and self._may_reply(uid):
+            await message.answer(SETUP_HINT, parse_mode=None)
 
 
 # ── порядок реплик ───────────────────────────────────────────────────────────

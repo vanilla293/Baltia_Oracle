@@ -7,6 +7,7 @@ from .base import REGISTRY, OutItem, Services, ToolContext, dispatch, schemas, t
 
 MODULES = (
     "reminders", "calendar", "birthdays", "ideas", "projects", "memory", "news", "tg_chats", "settings",
+    "files",
 )
 
 

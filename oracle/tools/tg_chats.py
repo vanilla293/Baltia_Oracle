@@ -23,6 +23,7 @@ import re
 from typing import Any
 
 from .. import timeutil
+from .. import usage
 from ..llm import LLMError
 from .base import Buttons, OutItem, ToolContext, tool
 
@@ -178,7 +179,8 @@ async def _compose(ctx: ToolContext, ub: Any, chat_id: int, title: str, instruct
         parts.append(f"Прошлый вариант не подошёл — напиши по-другому, не повторяй его:\n{previous}")
     parts.append("Напиши сообщение.")
     try:
-        raw = await ctx.llm.ask(system, "\n\n".join(parts), deep=False, temperature=0.9)
+        with usage.route("draft"):
+            raw = await ctx.llm.ask(system, "\n\n".join(parts), deep=False, temperature=0.9)
     except LLMError as e:
         raise ValueError(f"не смог написать черновик: {e}") from e
     draft = clean_draft(raw)

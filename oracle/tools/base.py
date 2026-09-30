@@ -65,6 +65,8 @@ class Services:
     news: Any = None         # services.news.NewsService
     agent: Any = None        # agent.Agent (для фоновых задач: глубокая оценка идеи и т.п.)
     tts: Any = None          # services.tts.TTS (инструменту настроек: доступна ли озвучка)
+    runtime: Any = None      # runtime.Runtime (живучесть экземпляра, конфликт токена — для дашборда)
+    usage: Any = None        # модуль oracle.usage (учёт расходов) — для /status и дашборда
     _tasks: set = field(default_factory=set)
 
     def spawn(self, coro: Awaitable[Any], name: str = "bg") -> asyncio.Task:

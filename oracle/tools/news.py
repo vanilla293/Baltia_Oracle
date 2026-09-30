@@ -14,6 +14,7 @@ import logging
 from typing import Any
 
 from .. import timeutil
+from .. import usage
 from .base import MAX_RESULT_CHARS, ToolContext, tool
 
 log = logging.getLogger("oracle.tools.news")
@@ -319,25 +320,26 @@ async def news_digest(ctx: ToolContext, topic: str = "", *, deep: bool = True) -
     parts.append(f"НОВОСТИ ЗА СУТКИ ({len(items)} шт., источники: {', '.join(sources)}):\n\n{_format_items(items)}")
     user = "\n\n".join(parts)
 
-    if not deep:
+    with usage.route("digest"):
+        if not deep:
+            try:
+                text = await ctx.llm.ask(system, user, deep=False, timeout=cfg.llm_fast_timeout)
+            except LLMError as e:
+                log.warning("дайджест не вышел: %s", e)
+                return _plain_headlines(items, str(e))
+            text = (text or "").strip()
+            return text or _plain_headlines(items, "пустой ответ")
         try:
-            text = await ctx.llm.ask(system, user, deep=False, timeout=cfg.llm_fast_timeout)
+            text = await ctx.llm.ask(system, user, deep=True, timeout=cfg.llm_deep_timeout)
         except LLMError as e:
-            log.warning("дайджест не вышел: %s", e)
-            return _plain_headlines(items, str(e))
+            log.warning("дайджест в глубоком режиме не вышел (%s) — пробую быстрый", e)
+            try:
+                text = await ctx.llm.ask(system, user, deep=False, timeout=cfg.llm_fast_timeout)
+            except LLMError as e2:
+                log.warning("дайджест не вышел: %s", e2)
+                return _plain_headlines(items, str(e2))
         text = (text or "").strip()
         return text or _plain_headlines(items, "пустой ответ")
-    try:
-        text = await ctx.llm.ask(system, user, deep=True, timeout=cfg.llm_deep_timeout)
-    except LLMError as e:
-        log.warning("дайджест в глубоком режиме не вышел (%s) — пробую быстрый", e)
-        try:
-            text = await ctx.llm.ask(system, user, deep=False, timeout=cfg.llm_fast_timeout)
-        except LLMError as e2:
-            log.warning("дайджест не вышел: %s", e2)
-            return _plain_headlines(items, str(e2))
-    text = (text or "").strip()
-    return text or _plain_headlines(items, "пустой ответ")
 
 
 # ── погода одной строкой ─────────────────────────────────────────────────────
