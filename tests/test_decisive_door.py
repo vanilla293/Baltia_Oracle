@@ -173,17 +173,20 @@ def test_door_wait_reason_is_data_not_code_note(fake, do, inv, take, p1, move):
         # причина — слова модели, отдельно от пометок кода
         assert plan["gate_wait_why"] == why and "gate_note" not in plan, plan
         assert "PRO у двери ответ ЖДАТЬ, повтор в" in p.last_action or "PRO у двери: ЖДАТЬ" in p.last_action
-        await tick(p, 100.0)                                         # до срока — не спрашиваем
+        await tick(p, 100.0)                                         # до ответа перепроверки — не спрашиваем
         assert fake.count("mission_entry") == 1
-        assert re.search(r"PRO у двери ответ ЖДАТЬ, повтор в \d\d:\d\d — ", p.last_action), p.last_action
+        # 5.4.4 (воля владельца 30.09: PRO — раз в 30 мин и по рыночным триггерам): ЖДАТЬ без уровня и срока — не
+        # повтор через PYTHIA_ENTRY_CHECK_COOL_SEC, а следующий вопрос у двери после ответа дежурного PRO на перепроверке
+        assert re.search(r"PRO у двери ответ ЖДАТЬ; следующий вопрос у двери — после ответа дежурного PRO на "
+                         r"перепроверке \(плановая в \d\d:\d\d\) — ", p.last_action), p.last_action
         assert "велел" not in p.last_action and why not in p.last_action, p.last_action
         # перепроверка/триаж: строка ПРОВЕРКА ВХОДА — факт с ценой и сроком, причина в ней ровно один раз
         gl = p._gate_line(plan)
         assert re.search(r"PRO у двери ответил ЖДАТЬ в \d\d:\d\d при цене 100 \(сейчас 100, \+0\.00 % в сторону плана\) "
-                         r"— следующий вопрос у двери в \d\d:\d\d", gl), gl
+                         r"— следующий вопрос у двери после ответа дежурного PRO на перепроверке \(этого\)", gl), gl
         assert gl.count(why) == 1 and "велел" not in gl, gl
-        # срок вышел, цена прошла — второй вопрос
-        plan["gate_after"] = 0.0
+        # перепроверка ответила (5.4.4), цена прошла — второй вопрос
+        p._last_review_ts = time.time() + 1.0
         fake.queue("mission_entry", {"decision": "ВОЙТИ", "why": "закрепились"})
         await tick(p, p1)
         assert fake.count("mission_entry") == 2
@@ -237,12 +240,13 @@ def test_code_note_survives_silence_and_is_dropped_after_answer(fake):
         fake.queue("mission_entry", FakeMoney.SILENT)
         await tick(p, 101.5)
         assert p.plan["gate_note"] == note, "молчание — вопрос не отвечен: пометка кода остаётся к повтору"
-        p.plan["gate_after"] = 0.0
+        # 5.4.4: молчание у двери — без быстрого повтора: следующий вопрос после ответа дежурного PRO на перепроверке
+        p._last_review_ts = time.time() + 1.0
         fake.queue("mission_entry", {"decision": "ЖДАТЬ", "why": "откат к 100.8"})
         await tick(p, 101.5)
         assert "ПОМЕТКА КОДА: " + note in fake.last("mission_entry")[1]
         assert "gate_note" not in p.plan and p.plan["gate_wait_why"] == "откат к 100.8", p.plan
-        p.plan["gate_after"] = 0.0
+        p._last_review_ts = time.time() + 2.0                      # 5.4.4: ЖДАТЬ без уровня и срока — до перепроверки
         fake.queue("mission_entry", {"decision": "ВОЙТИ", "why": "ок"})
         await tick(p, 101.4)
         u = fake.last("mission_entry")[1]
