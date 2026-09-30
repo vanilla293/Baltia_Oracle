@@ -26,7 +26,7 @@ def test_act_vs_ask_wording_present():
     assert "ровно ОДИН короткий уточняющий вопрос" in p
     assert "какой файл" in p and "необратим" in p
     # никакого залипания на общих вопросах
-    assert "Общими вопросами не тяни" in p
+    assert "не тяни общими вопросами" in p and "два и более вопроса" in p
 
 
 def test_files_block_present_and_lists_tools():
