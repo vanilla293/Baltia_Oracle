@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
+import ssl
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -28,7 +30,16 @@ from . import config
 
 logger = logging.getLogger("pythia.tinkoff")
 
-BASE = "https://invest-public-api.tinkoff.ru/rest"
+# v5.4.4: два домена API Т-Банка — основной (новый бренд) и запасной (прежний). На запасной переключаемся, только
+# когда запрос ТОЧНО не ушёл (соединение, DNS, TLS-рукопожатие, прокси); чтение — ещё при таймауте/обрыве чтения и
+# 5xx. Заявки, стопы и отмены (WRITE_METHODS) при потерянном ответе или 5xx на другой домен НЕ повторяются: второй
+# ордер хуже паузы — судьбу первой выясняет вызывающий по тому же UUID. 4xx не переключают (ответ сервера — ответ).
+# Рабочий адрес запоминается (BASE). PYTHIA_TINKOFF_BASE (окружение / config_user.json) — один адрес, без запасного.
+BASES = ("https://invest-public-api.tbank.ru/rest", "https://invest-public-api.tinkoff.ru/rest")
+BASE = BASES[0]
+WRITE_METHODS = frozenset({"PostOrder", "PostStopOrder", "CancelOrder", "CancelStopOrder", "ReplaceOrder",
+                           "PostOrderAsync", "PostSandboxOrder", "CancelSandboxOrder", "ReplaceSandboxOrder",
+                           "OpenSandboxAccount", "CloseSandboxAccount", "SandboxPayIn"})
 MD = "tinkoff.public.invest.api.contract.v1.MarketDataService"
 INS = "tinkoff.public.invest.api.contract.v1.InstrumentsService"
 
@@ -184,48 +195,142 @@ async def aclose() -> None:
 
 
 # v5.3 фаза 3 (W1): память последней ошибки API Тинькофф для панели проблем (health): отказ биржи
-# (TinkoffError с кодом 30042…) или сеть; последний успешный ответ — чтобы понять, актуальна ли ошибка
+# (TinkoffError с кодом 30042…) или сеть; последний успешный ответ — чтобы понять, актуальна ли ошибка.
+# v5.4.4: ошибка помнится ещё и по ИСТОЧНИКУ — рынок (котировки, стакан, инструменты), заявки (заявки, стопы, лимиты),
+# счёт (счета, портфель, операции, маржа): успешная цена не прячет отказ заявок/счёта (владелец видел «всё хорошо»,
+# пока пилот не мог ни купить, ни продать). В записи — HTTP-статус, код Т-Банка (40003, а не gRPC «16»), вид ошибки
+# (classify: auth/rights/cert/network/other) и текст владельцу с подсказкой.
 _last_err: dict | None = None
 _last_ok_ts: float = 0.0
+_src_err: dict[str, dict] = {}               # источник → последняя ошибка
+_src_ok: dict[str, float] = {}               # источник → последний успешный ответ
+_price_err: dict[str, dict] = {}             # instrument_id → последний сбой GetLastPrices (сброс успехом)
+_access_last: dict | None = None             # итог последней проверки токена (check_access)
+_token_epoch = 0                             # растёт при смене токена в «Ключах» (reset_errors)
+_warned: dict[str, float] = {}               # ключ → когда писали в лог (одна строка в минуту на сбой)
+SOURCES = ("market", "orders", "account")
+KINDS = ("auth", "rights", "cert", "network", "other")
+_ACCOUNT_METHODS = frozenset({"GetAccounts", "GetPortfolio", "GetOperationsByCursor", "GetOperations", "GetInfo",
+                              "GetMarginAttributes", "GetUserTariff", "GetPositions", "GetWithdrawLimits",
+                              "GetSandboxAccounts", "GetSandboxPortfolio", "GetSandboxPositions",
+                              "OpenSandboxAccount", "SandboxPayIn", "CloseSandboxAccount"})
+
+
+def _method(path: str) -> str:
+    return (path or "").rsplit("/", 1)[-1]
+
+
+def _source(path: str) -> str:
+    """Источник запроса для панели проблем: orders (OrdersService/StopOrdersService, заявки песочницы), account
+    (счета, портфель, операции, маржа), market (котировки, стакан, свечи, инструменты, расписания)."""
+    m = _method(path)
+    if m in _ACCOUNT_METHODS or "UsersService" in (path or "") or "OperationsService" in (path or ""):
+        return "account"
+    if ("OrdersService" in (path or "") or m in WRITE_METHODS or m in ("GetOrderState", "GetOrders", "GetMaxLots",
+                                                                        "GetStopOrders", "GetSandboxOrderState",
+                                                                        "GetSandboxOrders", "GetSandboxMaxLots")):
+        return "orders"
+    return "market"
+
+
+def _warn_once(key: str, msg: str, *args, every: float = 60.0) -> None:
+    """Предупреждение в лог не чаще раза в every с на ключ (петля пилота опрашивает цену каждые секунды)."""
+    now = time.time()
+    if now - _warned.get(key, 0.0) >= every:
+        _warned[key] = now
+        logger.warning(msg, *args)
 
 
 def note_error(e: "Exception | str", path: str = "") -> dict:
+    """Запомнить ошибку запроса: {"ts","path","source","status","code","grpc","kind","reason","text"} (копия)."""
     global _last_err
-    code = getattr(e, "code", None) if isinstance(e, Exception) else None
-    _last_err = {"ts": time.time(), "path": (path or "").rsplit("/", 1)[-1][:60],
-                 "code": str(code) if code else None, "text": str(e)[:200]}
-    return dict(_last_err)
+    status = e.status if isinstance(e, TinkoffError) else None
+    tcode = str(getattr(e, "message", "") or "").strip() if isinstance(e, TinkoffError) else ""
+    grpc = str(getattr(e, "code", "") or "").strip() if isinstance(e, TinkoffError) else ""
+    kind, reason = classify(e)
+    text = humanize_api_error(e) if isinstance(e, Exception) else str(e)
+    rec = {"ts": time.time(), "path": _method(path)[:60], "source": _source(path), "status": status,
+           "code": (tcode if tcode.isdigit() else grpc) or None, "grpc": grpc or None,
+           "kind": kind, "reason": reason, "text": text[:240]}
+    _last_err = rec
+    _src_err[rec["source"]] = rec
+    return dict(rec)
 
 
 def last_error() -> dict | None:
-    """Последняя ошибка Tinkoff: {"ts","path","code","text"} | None (копия)."""
+    """Последняя ошибка Tinkoff (любой источник): {"ts","path","source","status","code","grpc","kind","reason","text"}
+    | None (копия)."""
     return dict(_last_err) if _last_err else None
 
 
-def last_ok_ts() -> float:
+def last_ok_ts(source: str | None = None) -> float:
+    """Последний успешный ответ: всего API или одного источника (market | orders | account)."""
+    if source:
+        return float(_src_ok.get(source) or 0.0)
     return _last_ok_ts
+
+
+def errors() -> dict[str, dict]:
+    """v5.4.4: последние ошибки по источникам {source: {...запись note_error..., "stale": bool}}; stale — после
+    ошибки ЭТОТ ЖЕ источник уже ответил успешно (успех рынка не прячет отказ заявок или счёта)."""
+    out = {}
+    for src, rec in list(_src_err.items()):
+        r = dict(rec)
+        r["stale"] = bool(_src_ok.get(src, 0.0) > float(r.get("ts") or 0.0))
+        out[src] = r
+    return out
+
+
+def price_error(instrument_id: str) -> dict | None:
+    """Почему последняя GetLastPrices по инструменту не дала цену ({kind, reason, text, ts, status, code}); цена
+    пришла → None. Петля пилота по ней отличает «токен не принят» от «цены просто нет»."""
+    r = _price_err.get(instrument_id)
+    return dict(r) if r else None
+
+
+def failure_text(default: str = "", max_age: float = 120.0) -> str:
+    """Причина свежей ошибки Tinkoff владельцу (для текстов «счёт не прочитан: …»); свежей нет — default."""
+    r = _last_err
+    if r and time.time() - float(r.get("ts") or 0.0) <= max_age:
+        return str(r.get("reason") or r.get("text") or default)
+    return default
+
+
+def reset_errors() -> None:
+    """Новый токен в «Ключах»: прошлые ошибки и проверки — в прошлое (иначе панель показывала бы старый 401, а пилот
+    ждал бы до 30 с своей проверки); эпоха токена растёт — пилот проверяет брокера сразу."""
+    global _last_err, _access_last, _token_epoch
+    _last_err = None
+    _src_err.clear()
+    _price_err.clear()
+    _access_last = None
+    _token_epoch += 1
+
+
+def token_epoch() -> int:
+    return _token_epoch
 
 
 class TinkoffError(RuntimeError):
     """Ошибка API Тинькофф человеческим текстом: код (30042…), сообщение и описание из тела
     ответа, а не «400 Bad Request for url …». Именно этот текст видит владелец в панели
-    («вход отбит: …»), поэтому он обязан говорить, ЧТО именно отбила биржа."""
+    («вход отбит: …»), поэтому он обязан говорить, ЧТО именно отбила биржа.
+    v5.4.4: в тексте — код Т-Банка (40003, 30042), а не gRPC-номер (16): «Tinkoff 401 · 40003: …»."""
 
     def __init__(self, status: int, code: str = "", message: str = "", description: str = "",
                  path: str = ""):
         self.status, self.code, self.message, self.description, self.path = (
             status, code, message, description, path)
-        parts = [x for x in (description, message) if x and x != description]
-        if description and message and message != description:
-            parts = [description, f"({message})"]
-        elif description:
-            parts = [description]
-        elif message:
-            parts = [message]
-        text = " ".join(parts) or f"HTTP {status}"
+        tcode = str(message or "").strip()
+        num = tcode if tcode.isdigit() else ""
+        if description:
+            text = description + (f" ({message})" if message and message != description and not num else "")
+        else:
+            text = message if (message and not num) else ""
+        text = text or f"HTTP {status}"
         method = path.rsplit("/", 1)[-1] if path else ""
-        super().__init__(f"Tinkoff {status}{' ' + code if code else ''}: {text}"
-                         + (f" [{method}]" if method else ""))
+        head = f"Tinkoff {status}" + (f" · {num}" if num else (f" {code}" if code else ""))
+        super().__init__(f"{head}: {text}" + (f" [{method}]" if method else ""))
 
 
 _ERR_HINTS = {
@@ -240,26 +345,155 @@ _ERR_HINTS = {
     "30083": "выставление заявок по API запрещено для этого счёта",
     "30092": "заявка отклонена: цена вне допустимого коридора",
     "30099": "цена не кратна шагу цены",
-    "40002": "нет прав по токену (только чтение?)",
-    "40003": "токен не действителен",
+    "40002": "у токена нет прав на эту операцию (только чтение или не к этому счёту)",
+    "40003": "токен не принят (отозван или истёк)",
+    "40004": "заявки с этого токена недоступны (нужен токен с правом торговли)",
     "80002": "лимит запросов к API исчерпан — повтор через минуту",
 }
 
 
-def humanize_api_error(e: Exception) -> str:
-    """Любое исключение запроса → короткий русский текст для панели и логов."""
+def _int(x) -> int | None:
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def classify(e) -> tuple[str, str]:
+    """Ошибка Tinkoff → (вид, причина владельцу по-русски). Виды: auth (401/40003 — токен не принят), rights
+    (403/40002/40004 — нет прав на торговлю/счёт), cert (TLS: сертификат не принят), network (сеть, DNS, таймаут,
+    5xx, лимит запросов), other (отказ по существу: 30042 и т. п.). Принимает исключение, запись note_error
+    (dict) или текст ошибки (результат брокера {"error": …} — строка)."""
+    status, tcode, grpc, text = None, "", "", ""
     if isinstance(e, TinkoffError):
+        status, tcode, grpc, text = e.status, str(e.message or "").strip(), str(e.code or "").strip(), str(e)
+    elif isinstance(e, dict):
+        if e.get("kind") in KINDS and e.get("reason"):
+            return str(e["kind"]), str(e["reason"])
+        status, tcode = _int(e.get("status")), str(e.get("code") or "").strip()
+        grpc, text = str(e.get("grpc") or "").strip(), str(e.get("text") or e.get("error") or "")
+    elif isinstance(e, BaseException):
+        text = f"{type(e).__name__}: {e}"
+    else:
+        text = str(e or "")
+    low = text.lower()
+    code = tcode if tcode.isdigit() else ""
+    if not code:
+        mc = re.search(r"\b(400\d\d|300\d\d|800\d\d|700\d\d|500\d\d)\b", text)
+        code = mc.group(1) if mc else ""
+    if not status:
+        ms = re.search(r"(?:tinkoff|т-банк|http)\s+(\d{3})\b", low)
+        status = int(ms.group(1)) if ms else None
+    tag = code or (str(status) if status else "")
+    if "token не установлен" in low or "токен не задан" in low:
+        return "auth", "токен Т-Банка не задан — вставь его в «Ключи»"
+    if status == 401 or code == "40003" or grpc in ("16", "UNAUTHENTICATED") or "unauthenticated" in low:
+        return "auth", (f"токен Т-Банка не принят ({tag or 'UNAUTHENTICATED'}) — выпусти новый с полным доступом и "
+                        "вставь в «Ключи»")
+    if status == 403 or code in ("40002", "40004") or grpc in ("7", "PERMISSION_DENIED") or "permission_denied" in low:
+        return "rights", (f"у токена нет прав на торговлю/счёт ({tag or 'PERMISSION_DENIED'}) — выпусти в приложении "
+                          "Т-Банка токен с полным доступом к этому счёту и вставь в «Ключи»")
+    if (isinstance(e, ssl.SSLError) or "certificate" in low or "certificate_verify" in low
+            or ("ssl" in low and "handshake" in low)):
+        return "cert", ("TLS: сертификат Т-Банка не принят — нужны CA Минцифры (data/russian_trusted.pem подтягивается "
+                        "сам при старте, см. лог); антивирус с проверкой HTTPS тоже ломает TLS")
+    if status == 429 or code == "80002" or grpc in ("8", "RESOURCE_EXHAUSTED") or "resource_exhausted" in low:
+        return "network", "Т-Банк ограничил частоту запросов (80002/429) — пауза, повтор через минуту"
+    if (status and status >= 500) or grpc in ("13", "14", "4", "INTERNAL", "UNAVAILABLE", "DEADLINE_EXCEEDED"):
+        return "network", f"Т-Банк временно недоступен ({tag or grpc or '5xx'}) — повтор позже"
+    net_words = ("timed out", "timeout", "connect", "name or service", "getaddrinfo", "nodename", "network",
+                 "temporary failure in name resolution", "no route", "connection reset", "remote protocol",
+                 "server disconnected", "сети нет", "таймаут", "соединени")
+    if isinstance(e, (httpx.TransportError, OSError, asyncio.TimeoutError)) or any(w in low for w in net_words):
+        short = (str(e) if isinstance(e, BaseException) else text).strip() or type(e).__name__
+        return "network", f"нет связи с Т-Банком (сеть, DNS или таймаут): {short[:90]}"
+    return "other", (text or "отказ Т-Банка без описания")[:200]
+
+
+def humanize_api_error(e: Exception) -> str:
+    """Любое исключение запроса → короткий русский текст для панели и логов (с кодом Т-Банка и подсказкой)."""
+    if isinstance(e, TinkoffError):
+        kind, reason = classify(e)
+        base = str(e)
+        if kind in ("auth", "rights"):
+            return f"{base} — {reason}"
         hint = _ERR_HINTS.get(str(e.message or "").strip()) or _ERR_HINTS.get(str(e.code))
-        return str(e) + (f" — {hint}" if hint and hint not in str(e) else "")
+        return base + (f" — {hint}" if hint and hint not in base else "")
     raw = str(e) or type(e).__name__
-    low = raw.lower()
-    if "timed out" in low or "timeout" in low:
-        return "Tinkoff не ответил (таймаут)"
-    if "certificate" in low:
-        return "TLS: сертификат Тинькофф не принят (нужны CA Минцифры, см. лог)"
-    if "connect" in low:
-        return "нет соединения с Tinkoff API"
+    kind, reason = classify(e)
+    if kind in ("cert", "network", "auth", "rights"):
+        return reason
     return raw[:200]
+
+
+# ── проверка токена (v5.4.4): GetAccounts + уровень доступа счёта ─────────────────────────────────────────────
+_ACCESS_RU = {"FULL_ACCESS": "полный доступ", "READ_ONLY": "только чтение", "NO_ACCESS": "нет доступа"}
+
+
+def _access_of(acc: dict | None) -> str | None:
+    lvl = str((acc or {}).get("accessLevel") or "").replace("ACCOUNT_ACCESS_LEVEL_", "").strip().upper()
+    return lvl if lvl and lvl != "UNSPECIFIED" else None
+
+
+async def check_access(timeout: float = 15.0) -> dict:
+    """Токен принят и что он может: GetAccounts (только чтение). {"ok" — токен принят (чтение работает), "trade" —
+    FULL_ACCESS к первому счёту (им торгует пилот; None — брокер уровень не сообщил), "kind" ok|auth|rights|cert|
+    network|other, "reason" — владельцу, "access", "accounts", "account", "ts"}. Помнится (token_state)."""
+    global _access_last
+    now = time.time()
+    if not enabled():
+        res = {"ok": False, "trade": False, "kind": "auth", "reason": "токен Т-Банка не задан — вставь его в «Ключи»",
+               "access": None, "accounts": 0, "account": None, "ts": now}
+        _access_last = res
+        return dict(res)
+    try:
+        d = await asyncio.wait_for(_post(f"{USERS}/GetAccounts", {}), timeout)
+    except Exception as e:                                 # noqa: BLE001
+        if isinstance(e, asyncio.TimeoutError):
+            note_error(e, f"{USERS}/GetAccounts")
+        kind, reason = classify(e)
+        res = {"ok": False, "trade": False, "kind": kind, "reason": reason, "access": None, "accounts": 0,
+               "account": None, "ts": now}
+        _access_last = res
+        return dict(res)
+    accs = [a for a in ((d or {}).get("accounts") or []) if isinstance(a, dict)]
+    first = accs[0] if accs else {}
+    access = _access_of(first)
+    name = str(first.get("name") or first.get("id") or "")[:40]
+    res = {"accounts": len(accs), "account": first.get("id"), "access": access, "ts": now}
+    if not accs:
+        res.update(ok=False, trade=False, kind="rights",
+                   reason="токен принят, но счетов по нему не видно — выпусти токен с доступом к счёту и вставь в «Ключи»")
+    elif access == "FULL_ACCESS":
+        res.update(ok=True, trade=True, kind="ok", reason=f"токен принят: полный доступ (счёт «{name}»)")
+    elif access == "READ_ONLY":
+        res.update(ok=True, trade=False, kind="rights",
+                   reason=f"токен принят, но только для чтения (счёт «{name}») — пилот не сможет торговать: выпусти "
+                          "токен с полным доступом и вставь в «Ключи»")
+    elif access == "NO_ACCESS":
+        res.update(ok=False, trade=False, kind="rights",
+                   reason=f"у токена нет доступа к счёту «{name}» — выпусти токен с полным доступом к нему")
+    else:
+        res.update(ok=True, trade=None, kind="ok", reason="токен принят; уровень доступа счёта брокер не сообщил")
+    _access_last = res
+    return dict(res)
+
+
+def token_state() -> dict | None:
+    """Что известно о токене: итог последней проверки (check_access), а свежий отказ 401/403 после неё главнее
+    ({"ok": False, "kind": "auth"|"rights", "source": "error"}). Ни проверки, ни отказа — None."""
+    a = dict(_access_last) if _access_last else None
+    bad = None
+    for src, rec in _src_err.items():
+        if rec.get("kind") in ("auth", "rights") and not (_src_ok.get(src, 0.0) > float(rec.get("ts") or 0.0)):
+            worse = bad is not None and rec["kind"] == "auth" and bad.get("kind") != "auth"   # 401 тяжелее 403
+            if bad is None or worse or (rec["kind"] == bad.get("kind")
+                                        and float(rec.get("ts") or 0.0) > float(bad.get("ts") or 0.0)):
+                bad = rec
+    if bad and (a is None or float(bad.get("ts") or 0.0) > float(a.get("ts") or 0.0)):
+        return {"ok": bad["kind"] != "auth", "trade": False, "kind": bad["kind"], "reason": bad.get("reason"),
+                "access": (a or {}).get("access"), "ts": bad.get("ts"), "source": "error"}
+    return a
 
 
 _server_date: tuple[float, float] | None = None   # (Date сервера биржи, локальное время приёма)
@@ -283,34 +517,82 @@ def server_date() -> tuple[float, float] | None:
     return _server_date
 
 
+def bases() -> list[str]:
+    """Адреса API по порядку попыток: PYTHIA_TINKOFF_BASE (окружение / config_user.json) — только он, без запасного;
+    иначе рабочий (последний ответивший) первым, затем второй домен."""
+    one = ""
+    try:
+        getter = getattr(config, "get", None)
+        one = str((getter("PYTHIA_TINKOFF_BASE", "") if callable(getter) else "") or "").strip().rstrip("/")
+    except Exception:                                      # noqa: BLE001
+        one = ""
+    if one:
+        return [one]
+    cur = BASE if BASE in BASES else BASES[0]
+    return [cur] + [b for b in BASES if b != cur]
+
+
+def _host(url: str) -> str:
+    return (url or "").split("://", 1)[-1].split("/", 1)[0]
+
+
+def _not_sent(e: BaseException) -> bool:
+    """Запрос ТОЧНО не ушёл к API: соединение не установлено (отказ, DNS, таймаут соединения, TLS-рукопожатие —
+    httpx отдаёт его как ConnectError), прокси не пустил, пул соединений занят."""
+    return isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ProxyError))
+
+
+def _read_retryable(e: BaseException) -> bool:
+    """Для чтения можно и при потерянном ответе: таймаут/обрыв чтения, сломанный протокол."""
+    return isinstance(e, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError))
+
+
 async def _post(path: str, body: dict, timeout: float = 15.0) -> dict:
     if not config.TINKOFF_TOKEN:
         raise RuntimeError("Tinkoff token не установлен")
-    url = f"{BASE}/{path}"
     headers = {"Authorization": f"Bearer {config.TINKOFF_TOKEN}"}
-    global _last_ok_ts
+    global _last_ok_ts, BASE
+    method = _method(path)
+    write = method in WRITE_METHODS
+    urls = bases()
     cl = await _client()
-    try:
-        r = await cl.post(url, headers=headers, json=body, timeout=timeout)
-    except Exception as e:                                 # noqa: BLE001  (сеть/таймаут — тоже в память)
-        note_error(e, path)
-        raise
-    _remember_date(r)
-    if r.status_code >= 400:
-        code = msg = desc = ""
+    for i, base in enumerate(urls):
+        more = i + 1 < len(urls)
         try:
-            j = r.json()
-            if isinstance(j, dict):
-                code = str(j.get("code") or "")
-                msg = str(j.get("message") or "")
-                desc = str(j.get("description") or "")
-        except Exception:                                  # noqa: BLE001
-            desc = (r.text or "")[:200]
-        err = TinkoffError(r.status_code, code, msg, desc, path)
-        note_error(err, path)
-        raise err
-    _last_ok_ts = time.time()
-    return r.json()
+            r = await cl.post(f"{base}/{path}", headers=headers, json=body, timeout=timeout)
+        except Exception as e:                             # noqa: BLE001  (сеть/таймаут — тоже в память)
+            if more and (_not_sent(e) or (not write and _read_retryable(e))):
+                _warn_once(f"base:{base}:{type(e).__name__}", "Tinkoff %s: %s не ответил (%s) — пробую %s",
+                           method, _host(base), type(e).__name__, _host(urls[i + 1]))
+                continue
+            note_error(e, path)
+            raise
+        _remember_date(r)
+        if r.status_code >= 500 and not write and more:    # чтение: сервер одного домена лежит — второй
+            _warn_once(f"base:{base}:{r.status_code}", "Tinkoff %s: %s ответил %d — пробую %s",
+                       method, _host(base), r.status_code, _host(urls[i + 1]))
+            continue
+        if r.status_code >= 400:
+            code = msg = desc = ""
+            try:
+                j = r.json()
+                if isinstance(j, dict):
+                    code = str(j.get("code") or "")
+                    msg = str(j.get("message") or "")
+                    desc = str(j.get("description") or "")
+            except Exception:                              # noqa: BLE001
+                desc = (r.text or "")[:200]
+            err = TinkoffError(r.status_code, code, msg, desc, path)
+            note_error(err, path)
+            raise err
+        now = time.time()
+        _last_ok_ts = now
+        _src_ok[_source(path)] = now
+        if base in BASES and base != BASE:
+            logger.warning("Tinkoff: рабочий адрес API теперь %s", _host(base))
+            BASE = base                                    # запомнить: следующие запросы — сразу сюда
+        return r.json()
+    raise RuntimeError("Tinkoff: нет адреса API")          # сюда не доходим: последний адрес либо ответил, либо поднял
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -420,14 +702,20 @@ async def last_price(instrument_id: str) -> dict | None:
     try:
         d = await _post(f"{MD}/GetLastPrices", {"instrumentId": [instrument_id]})
     except Exception as e:
-        logger.warning("GetLastPrices failed: %s", str(e)[:100])
+        # _post уже запомнил ошибку этого запроса (ts ≥ начала вызова); нет — запомнить здесь (токена нет и т. п.)
+        rec = (dict(_last_err) if (_last_err and float(_last_err.get("ts") or 0.0) >= now)
+               else note_error(e, f"{MD}/GetLastPrices"))
+        _price_err[instrument_id] = rec
+        _warn_once(f"lp:{instrument_id}:{rec.get('kind')}", "GetLastPrices failed: %s", str(e)[:100])
         return None
     rows = d.get("lastPrices") or []
-    if not rows:
-        return None
-    px = _q(rows[0].get("price"))
+    px = _q(rows[0].get("price")) if rows else 0.0
     if px <= 0:
+        _price_err[instrument_id] = {"ts": now, "kind": "no_price", "status": None, "code": None,
+                                     "reason": "Т-Банк ответил без цены по инструменту (ошибки нет)",
+                                     "text": "GetLastPrices: пустой ответ"}
         return None
+    _price_err.pop(instrument_id, None)
     _price_cache[instrument_id] = (now, px)
     return {"price": px, "ts": now, "quote_time": rows[0].get("time")}
 
@@ -496,7 +784,7 @@ async def orderbook(instrument_id: str, depth: int = 50) -> dict | None:
         d = await _post(f"{MD}/GetOrderBook",
                         {"instrumentId": instrument_id, "depth": depth})
     except Exception as e:
-        logger.warning("GetOrderBook failed: %s", str(e)[:100])
+        _warn_once(f"ob:{instrument_id}", "GetOrderBook failed: %s", str(e)[:100])
         return None
     bids = [(_q(b.get("price")), int(b.get("quantity", 0) or 0))
             for b in d.get("bids", [])]
@@ -759,7 +1047,9 @@ OPS = "tinkoff.public.invest.api.contract.v1.OperationsService"
 
 async def accounts() -> list[dict] | None:
     """Список счетов владельца (GetAccounts). Нужен, чтобы бот знал, НА КАКОМ
-    счёте и СКОЛЬКО денег. Только чтение. Нет токена → None."""
+    счёте и СКОЛЬКО денег. Только чтение. Нет токена → None.
+    v5.4.4: None — счёт НЕ ПРОЧИТАН (причина в last_error()/failure_text()), [] — счетов нет; access — уровень
+    доступа токена к счёту (FULL_ACCESS | READ_ONLY | NO_ACCESS | None)."""
     if not enabled():
         return None
     try:
@@ -769,7 +1059,7 @@ async def accounts() -> list[dict] | None:
     out = []
     for a in d.get("accounts", []):
         out.append({"id": a.get("id"), "name": a.get("name"),
-                    "type": a.get("type"), "status": a.get("status")})
+                    "type": a.get("type"), "status": a.get("status"), "access": _access_of(a)})
     return out
 
 
@@ -1318,4 +1608,154 @@ if __name__ == "__main__":
         assert _norm_operation({"id": "x"}) is None and _norm_operation("мусор") is None
 
     _aio.run(_main())
-    print("tinkoff self-test OK (operations)")
+
+    # ── v5.4.4: два домена, безопасное переключение, коды 40003/40002, источники ошибок, проверка токена ──────────
+    async def _domains():
+        global _http, BASE, _last_ok_ts
+        import os as _os
+        _tok, _http0 = config.TINKOFF_TOKEN, _http
+        _env0 = _os.environ.pop("PYTHIA_TINKOFF_BASE", None)
+        config.TINKOFF_TOKEN = "t.selftest-fake"            # в сеть не уходит: транспорт — MockTransport
+        hits: list[tuple[str, str]] = []
+        plan: dict = {}                                     # (host, method) → "connect" | "read" | "tls" | int статус
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            host, method = req.url.host, req.url.path.rsplit("/", 1)[-1]
+            hits.append((host, method))
+            act = plan.get((host, method), plan.get((host, "*")))
+            if act == "connect":
+                raise httpx.ConnectError("Name or service not known", request=req)
+            if act == "tls":
+                raise httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed", request=req)
+            if act == "read":
+                raise httpx.ReadTimeout("read timed out", request=req)
+            if isinstance(act, int):
+                body = {"code": 16, "message": "40003", "description": "Authentication token is missing or invalid"} \
+                    if act == 401 else {"code": 7, "message": "40002", "description": "Insufficient privileges"} \
+                    if act == 403 else {"code": 13, "message": "70001", "description": "Internal error"}
+                return httpx.Response(act, json=body)
+            if method == "GetAccounts":
+                return httpx.Response(200, json={"accounts": [{"id": "acc-1", "name": "Брокерский",
+                                                               "status": "ACCOUNT_STATUS_OPEN",
+                                                               "accessLevel": plan.get("access", "ACCOUNT_ACCESS_LEVEL_FULL_ACCESS")}]})
+            if method == "GetLastPrices":
+                return httpx.Response(200, json={"lastPrices": [{"price": {"units": 100, "nano": 0}}]})
+            return httpx.Response(200, json={"orderId": "EX-1"})
+
+        _http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        TB, TK = _host(BASES[0]), _host(BASES[1])
+        try:
+            assert BASES[0].startswith("https://invest-public-api.tbank.ru") and "tinkoff.ru" in BASES[1]
+            BASE = BASES[0]
+            # 1) чтение: соединение не установлено → запасной домен; рабочий адрес запоминается
+            plan.clear(); plan[(TB, "*")] = "connect"
+            d = await _post(f"{MD}/GetLastPrices", {"instrumentId": ["F"]})
+            assert d["lastPrices"] and [h for h, _ in hits] == [TB, TK] and BASE == BASES[1], (hits, BASE)
+            hits.clear(); plan.clear()
+            await _post(f"{MD}/GetLastPrices", {"instrumentId": ["F"]})
+            assert [h for h, _ in hits] == [TK], hits           # сразу рабочий
+            # 2) заявка: соединение не установлено (запрос точно не ушёл) → второй домен можно
+            BASE = BASES[0]; hits.clear(); plan.clear(); plan[(TB, "*")] = "tls"
+            await _post("tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder", {"orderId": "u1"})
+            assert [h for h, _ in hits] == [TB, TK], hits
+            # 3) заявка: ответ потерян (таймаут чтения) → НЕ повторять на другом домене
+            BASE = BASES[0]; hits.clear(); plan.clear(); plan[(TB, "*")] = "read"
+            try:
+                await _post("tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder", {"orderId": "u2"})
+                raise AssertionError("потерянный ответ заявки обязан подняться")
+            except httpx.ReadTimeout:
+                pass
+            assert [h for h, _ in hits] == [TB] and BASE == BASES[0], hits
+            #    …а чтение при таймауте чтения — на запасной
+            hits.clear()
+            await _post(f"{MD}/GetLastPrices", {"instrumentId": ["F"]})
+            assert [h for h, _ in hits] == [TB, TK], hits
+            # 4) 5xx: чтение — на запасной, заявка/отмена — нет (ни PostOrder, ни CancelOrder, ни стопы)
+            BASE = BASES[0]; hits.clear(); plan.clear(); plan[(TB, "*")] = 500
+            await _post(f"{MD}/GetLastPrices", {"instrumentId": ["F"]})
+            assert [h for h, _ in hits] == [TB, TK], hits
+            for m_ in ("OrdersService/CancelOrder", "StopOrdersService/PostStopOrder", "StopOrdersService/CancelStopOrder"):
+                BASE = BASES[0]; hits.clear()
+                try:
+                    await _post(f"tinkoff.public.invest.api.contract.v1.{m_}", {})
+                    raise AssertionError(m_)
+                except TinkoffError as e:
+                    assert e.status == 500
+                assert [h for h, _ in hits] == [TB], (m_, hits)
+            # 5) 4xx не переключают; текст — с кодом Т-Банка 40003 (не gRPC 16) и подсказкой; вид — auth
+            BASE = BASES[0]; hits.clear(); plan.clear(); plan[(TB, "*")] = 401
+            try:
+                await _post(f"{USERS}/GetAccounts", {})
+                raise AssertionError("401 обязан подняться")
+            except TinkoffError as e:
+                assert "401 · 40003" in str(e) and "16" not in str(e).split("[")[0], str(e)
+                assert "токен Т-Банка не принят" in humanize_api_error(e) and "«Ключи»" in humanize_api_error(e)
+            assert [h for h, _ in hits] == [TB], hits
+            le = last_error()
+            assert le["code"] == "40003" and le["status"] == 401 and le["kind"] == "auth" and le["source"] == "account", le
+            # 6) источники: успех рынка не прячет отказ заявок; успех того же источника — прячет
+            plan.clear(); plan[(TB, "PostOrder")] = 403
+            try:
+                await _post("tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder", {"orderId": "u3"})
+            except TinkoffError:
+                pass
+            await _post(f"{MD}/GetLastPrices", {"instrumentId": ["F"]})
+            er = errors()
+            assert er["orders"]["kind"] == "rights" and er["orders"]["code"] == "40002" and not er["orders"]["stale"], er
+            assert er["account"]["kind"] == "auth" and not er["account"]["stale"]
+            ts = token_state()
+            assert ts and ts["ok"] is False and ts["kind"] in ("auth", "rights"), ts
+            # 7) проверка токена: FULL_ACCESS → trade; READ_ONLY → принят, но без торговли; 401 → auth
+            plan.clear()
+            r = await check_access()
+            assert r["ok"] and r["trade"] is True and r["access"] == "FULL_ACCESS" and "полный доступ" in r["reason"], r
+            assert errors()["account"]["stale"] is True, errors()     # успех счёта снял «свежесть» его 401
+            plan["access"] = "ACCOUNT_ACCESS_LEVEL_READ_ONLY"
+            r = await check_access()
+            assert r["ok"] and r["trade"] is False and r["kind"] == "rights" and "только для чтения" in r["reason"], r
+            plan.clear(); plan[(TB, "GetAccounts")] = 401; plan[(TK, "GetAccounts")] = 401
+            r = await check_access()
+            assert not r["ok"] and r["kind"] == "auth" and "40003" in r["reason"], r
+            accs = await accounts()
+            assert accs is None and "токен Т-Банка не принят" in failure_text("x")
+            plan.clear()
+            accs = await accounts()
+            assert accs and accs[0]["access"] == "FULL_ACCESS", accs
+            # 8) цена: сбой по токену помнится по инструменту и снимается ценой
+            _price_cache.clear(); plan.clear(); plan[(TB, "GetLastPrices")] = 401; plan[(TK, "GetLastPrices")] = 401
+            BASE = BASES[0]
+            assert await last_price("FIGI-X") is None
+            pe = price_error("FIGI-X")
+            assert pe and pe["kind"] == "auth", pe
+            plan.clear(); _price_cache.clear()
+            assert (await last_price("FIGI-X"))["price"] == 100.0 and price_error("FIGI-X") is None
+            # 9) смена токена: ошибки в прошлое, эпоха растёт
+            ep = token_epoch()
+            reset_errors()
+            assert last_error() is None and errors() == {} and token_state() is None and token_epoch() == ep + 1
+            # 10) PYTHIA_TINKOFF_BASE — один адрес, без запасного
+            _os.environ["PYTHIA_TINKOFF_BASE"] = "https://example-proxy.local/rest/"
+            assert bases() == ["https://example-proxy.local/rest"], bases()
+            _os.environ.pop("PYTHIA_TINKOFF_BASE", None)
+            assert bases()[0] in BASES and len(bases()) == 2
+            # 11) классификация без HTTP: строки брокера, TLS, сеть, прочее
+            assert classify("Tinkoff 403 · 40002: Insufficient privileges [PostOrder]")[0] == "rights"
+            assert classify("Tinkoff 401 16: Authentication token is missing or invalid (40003) [PostOrder]")[0] == "auth"
+            assert classify(httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED]"))[0] == "cert"
+            assert classify(httpx.ConnectTimeout("connect timeout"))[0] == "network"
+            assert classify(TinkoffError(400, "3", "30042", "Not enough assets"))[0] == "other"
+            assert classify(TinkoffError(429, "8", "80002", "limit"))[0] == "network"
+        finally:
+            await _http.aclose()
+            _http = _http0
+            config.TINKOFF_TOKEN = _tok
+            BASE = BASES[0]
+            reset_errors()
+            if _env0 is not None:
+                _os.environ["PYTHIA_TINKOFF_BASE"] = _env0
+
+    _aio.run(_domains())
+    print("tinkoff self-test OK (operations; v5.4.4: tbank.ru основной / tinkoff.ru запасной — переключение только когда "
+          "запрос точно не ушёл, чтение ещё при таймауте и 5xx, заявки/отмены/стопы при потерянном ответе и 5xx не "
+          "повторяются, 4xx не переключают, рабочий адрес помнится, PYTHIA_TINKOFF_BASE — один адрес; коды 40003/40002 "
+          "с подсказкой; ошибки по источникам рынок/заявки/счёт; проверка токена FULL_ACCESS/READ_ONLY/401)")

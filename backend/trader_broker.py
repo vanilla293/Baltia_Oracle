@@ -109,6 +109,22 @@ def _err_text(e: Exception) -> str:
         return str(e)[:200]
 
 
+def _err_info(e: Exception) -> dict:
+    """v5.4.4: вид и код ошибки для пилота (без разбора текста): err_kind auth|rights|cert|network|other,
+    err_code — код Т-Банка (40003, 30042…) или gRPC, err_status — HTTP-статус. Отказ из-за токена/прав пилот не
+    штурмует лесенкой попыток — сразу «нет доступа» (ai_pilot.feed)."""
+    try:
+        kind, _reason = tinkoff.classify(e)
+    except Exception:                                       # noqa: BLE001
+        kind = "other"
+    code = None
+    if isinstance(e, tinkoff.TinkoffError):
+        tcode = str(e.message or "").strip()
+        code = tcode if tcode.isdigit() else (str(e.code or "") or None)
+    return {"err_kind": kind, "err_code": code,
+            "err_status": e.status if isinstance(e, tinkoff.TinkoffError) else None}
+
+
 def _audit(kind: str, payload: dict) -> None:
     """Каждое движение денег — в несбиваемый журнал (append-only)."""
     rec = {"ts": _now(), "kind": kind, **payload}
@@ -213,7 +229,7 @@ class Broker:
             return {"cash": cash, "total": _q_to_float(p.get("totalAmountPortfolio")) or None,
                     "positions": poss, "mode": self.mode}
         except Exception as e:                              # noqa: BLE001
-            return {"cash": None, "positions": [], "error": _err_text(e)}
+            return {"cash": None, "positions": [], "error": _err_text(e), **_err_info(e)}
 
     # ── СКОЛЬКО ДАЁТ БИРЖА (полное управление счётом, v5.2) ────────────────
     async def max_lots(self, figi: str, price: float | None = None) -> dict | None:
@@ -275,6 +291,10 @@ class Broker:
                    "request_id": order_id, "id_type": "exchange" if r.get("orderId") else "request",
                    "status": r.get("executionReportStatus"),
                    "exec_lots": r.get("lotsExecuted")}
+            if status.endswith("REJECTED"):             # v5.4.4: отказ биржи — с причиной, а не «отбит: None»
+                res.update(error=("биржа отклонила заявку (REJECTED)"
+                                  + (f": {str(r.get('message'))[:120]}" if r.get("message") else "")),
+                           err_kind="other", err_code="REJECTED", err_status=None)
             _audit("order_done", res)
             return res
         except Exception as e:                              # noqa: BLE001
@@ -284,7 +304,7 @@ class Broker:
             uncertain = (not isinstance(e, tinkoff.TinkoffError) or
                          e.status >= 500 or e.status in (408, 409)) and not _not_sent(e)
             res = {**intent, "ok": False, "error": _err_text(e),
-                   "request_id": order_id, "id_type": "request", "uncertain": uncertain}
+                   "request_id": order_id, "id_type": "request", "uncertain": uncertain, **_err_info(e)}
             _audit("order_error", res)
             return res
 
@@ -313,7 +333,7 @@ class Broker:
             if request_id and _order_not_found(e):
                 return {"ok": True, "status": "NOT_FOUND", "not_found": True, "filled": False, "exec_lots": 0,
                         "error": _err_text(e)}
-            return {"ok": False, "error": _err_text(e)}
+            return {"ok": False, "error": _err_text(e), **_err_info(e)}
 
     async def cancel(self, order_id: str, *, request_id: bool = False) -> dict:
         """Снять невыполненный лимит (цена ушла / таймаут)."""
@@ -333,7 +353,7 @@ class Broker:
         except Exception as e:                              # noqa: BLE001
             if request_id and _order_not_found(e):
                 return {"ok": True, "status": "NOT_FOUND", "not_found": True, "error": _err_text(e)}
-            return {"ok": False, "error": _err_text(e)}
+            return {"ok": False, "error": _err_text(e), **_err_info(e)}
 
     # ── АППАРАТНЫЙ СТОП НА СЕРВЕРЕ БИРЖИ (спринт «Хищник», прокол №4) ──────
     async def place_stop(self, figi: str, direction: str, lots: int,
@@ -376,7 +396,7 @@ class Broker:
         except Exception as e:                              # noqa: BLE001
             res = {**intent, "ok": False, "error": _err_text(e),
                    "uncertain": (not isinstance(e, tinkoff.TinkoffError) or
-                                 e.status >= 500 or e.status in (408, 409)) and not _not_sent(e)}
+                                 e.status >= 500 or e.status in (408, 409)) and not _not_sent(e), **_err_info(e)}
             _audit("stop_error", res)
             return res
 
@@ -393,7 +413,7 @@ class Broker:
                               "stopOrderId": stop_order_id})
             return {"ok": True}
         except Exception as e:                              # noqa: BLE001
-            return {"ok": False, "error": _err_text(e)}
+            return {"ok": False, "error": _err_text(e), **_err_info(e)}
 
     async def stop_orders(self, *, strict: bool = False) -> list:
         """Живые биржевые стопы счёта (сверка/чистка сирот). strict=True — ошибка запроса не глотается
@@ -676,6 +696,30 @@ if __name__ == "__main__":
         dry_stop = await b.place_stop("SIU5", SELL, 1, 100.0)
         assert dry_stop["ok"] and dry_stop["virtual"], dry_stop
         assert (await b.place_stop("SIU5", SELL, 0, 100.0))["ok"] is False
+        tinkoff.config.TINKOFF_TOKEN = _tok
+
+        # 6c) v5.4.4: отказ несёт вид и код (пилот не разбирает текст): 403/40002 → rights, 401/40003 → auth, 30042 → other;
+        #     REJECTED биржи — с причиной, а не «отбит: None»
+        tinkoff.config.TINKOFF_TOKEN = "t.test"
+
+        async def refusing_post(path, body, timeout=15.0):
+            if path.endswith("PostOrder"):
+                raise tinkoff.TinkoffError(403, "7", "40002", "Insufficient privileges", path)
+            if path.endswith("GetOrderState"):
+                raise tinkoff.TinkoffError(401, "16", "40003", "Authentication token is missing or invalid", path)
+            return {}
+        brr = Broker(mode="real", account_id="ACC", poster=refusing_post)
+        rr = await brr.place("SIU5", BUY, 1, price=100.0)
+        assert not rr["ok"] and not rr["uncertain"] and rr["err_kind"] == "rights" and rr["err_code"] == "40002", rr
+        assert "40002" in rr["error"] and "«Ключи»" in rr["error"], rr["error"]
+        so = await brr.order_state("x")
+        assert not so["ok"] and so["err_kind"] == "auth" and so["err_code"] == "40003" and so["err_status"] == 401, so
+
+        async def rejecting_post(path, body, timeout=15.0):
+            return {"orderId": "EX-9", "executionReportStatus": "EXECUTION_REPORT_STATUS_REJECTED",
+                    "message": "30042 недостаточно активов"}
+        rj = await Broker(mode="real", account_id="ACC", poster=rejecting_post).place("SIU5", BUY, 1, price=100.0)
+        assert not rj["ok"] and "REJECTED" in rj["error"] and "30042" in rj["error"] and rj["err_kind"] == "other", rj
         tinkoff.config.TINKOFF_TOKEN = _tok
 
         # 7) Quotation round-trip
