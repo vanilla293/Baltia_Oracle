@@ -2098,7 +2098,7 @@ async def s32_gate_wait(sc: Scene) -> None:
     assert mission.status(TICKER)["phase"] == "armed"
     ue = fake_ai.last_user["mission_entry"]
     for piece in ("ПРИКАЗ И ПЛАН", "ПЛАН ПИЛОТА", "long сейчас", "ЖИВОЙ РЫНОК", "ИТОГ ОБЩЕГО СОВЕТА", "СВЕЖИЕ НОВОСТИ",
-                  "СКАНЕР СТАКАНА", "СВЯЗАННЫЕ БУМАГИ", "Войти сейчас, ждать уровня/срока или отменить"):
+                  "СКАНЕР СТАКАНА", "СВЯЗАННЫЕ БУМАГИ", "Войти сейчас, отменить или ждать уровня/срока"):
         assert piece in ue, (piece, ue[:900])
     assert sc.m.sizes["entry"]["prompt"] == len(ue) and sc.m.sizes["entry"]["answer"] > 0
     await sc.tick(99.8)                           # выше уровня — ждём, PRO не дёргаем
@@ -2261,7 +2261,7 @@ async def s35_profit_exit(sc: Scene) -> None:
     assert x["decision"] == "ВЫЙТИ" and share in x["reason"] and x["model"] == MM() and x["floating"] > 0, x
     up = fake_ai.last_user["mission_profit"]
     for piece in ("ПРИБЫЛЬ: " + share, "ХОД ЦЕНЫ", "ЖИВОЙ РЫНОК", "ПЛАН И ПРОШЛЫЕ РЕШЕНИЯ", "УРОВНИ ПОЗИЦИИ", "ИТОГ ОБЩЕГО СОВЕТА",
-                  "СВЕЖИЕ НОВОСТИ", "Держать, выйти, выйти и перезайти или звать совет"):
+                  "СВЕЖИЕ НОВОСТИ", "Выйти, выйти и перезайти, держать или звать совет"):
         assert piece in up, (piece, up[:900])
     assert sc.m.sizes["profit"]["prompt"] == len(up) and sc.m.sizes["profit"]["answer"] > 0
     assert sc.p.last_action.startswith("ЗАКРЫЛ ВСЁ (мысль о прибыли") and "после закрытия" in sc.p.last_action, sc.p.last_action

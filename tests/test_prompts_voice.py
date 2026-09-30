@@ -11,6 +11,10 @@ v5.4.2 «СВОБОДНЫЙ ПИЛОТ» (воля владельца 28.09.2026
 свобода решения (все ходы равноправны, у каждого своя цена); BANNED ловит подталкивания в ОБЕ стороны — и «главное
 войти», и «вне рынка — не трусость» / «только с перевесом» / «сомнение — ждать» / «не входить вслепую»; шифровальщик
 переводит вердикт как есть; критик ищет и слабый вход, и упущенный ход; совет — входов столько, сколько даёт картина.
+v5.4.3 «РЕШИТЕЛЬНЫЙ ПИЛОТ» (воля владельца 30.09.2026: «прорыва нет, сидим ждём» — надоело): лёгкий крен к действию
+через цену ожидания, засаду у уровня, порядок вариантов и требование числа (не голым «будь агрессивнее»): доктрина —
+спор сигналов не повод стоять, у ожидания тоже цена, ожидаемый итог лучших ходов; «ждёшь пробоя» — засада, а не
+ЖДЁМ/WAIT; ожидание и удержание в списках последними; метки перепроверки без «_СЕЙЧАС» (канон кода прежний).
 Без сети: ИИ не зовётся (money_json — на подменённых pro_json/flash_json)."""
 import asyncio
 
@@ -84,7 +88,7 @@ def test_doctrine_is_compact_and_says_the_right_things():
     assert pm.VOICE == f"{pm.PERSONA}\n{pm.DOCTRINE}" and len(pm.VOICE.splitlines()) <= 11
     for piece in ("кухню рынка", "НАБИРАЕТ", "РАЗДАЁТ", "ВЫНОСИТ стопы", "Конкретика", "таймингом", "Сценарии", "отменой",
                   "Холодный расчёт", "решителен", "честен", "асимметрия", "рынок ошибается", "стоять вне рынка",
-                  "равноправные ходы", "ни один не выбор по умолчанию", "лишний вход", "пропущенный ход"):
+                  "ни один ход не выбор по умолчанию", "лишний вход", "пропущенный ход"):
         assert piece in pm.DOCTRINE, piece
     # v5.4.2: п.7 не оправдывает одно ожидание и не делает вход «дороже» пропуска
     for absent in ("трусост", "хуже пропущенного", "Нет перевеса — вне рынка"):
@@ -142,11 +146,94 @@ def test_verdict_and_review_treat_all_moves_as_equal():
     assert "только с перевесом" not in sv and "весомых новых основаниях" not in sv, "у статус-кво нет форы"
     sr, ur = MISSION["review"]
     assert "Приказ совета WAIT" in sr and "wait_for" in sr and "ориентир, а не условие" in sr and "у двери" in sr
-    assert "Все choice равноправны" in sr and "не якорь" in sr and "порядок ничего не значит" in sr
+    assert "ни один choice не выбор по умолчанию" in sr and "не якорь" in sr and "порядок ничего не значит" in sr
     assert "WAIT — ждём 283" in ur, "перепроверка видит приказ WAIT"
-    assert pm.review_options("auto", False).split(" | ")[0] != "ЖДЁМ" and pm.review_options("auto", True).split(" | ")[0] != "ЖДЁМ"
+    assert pm.review_options("auto", False).split(" | ")[0] != "ЖДЁМ" and pm.review_options("auto", True).split(" | ")[0] != "ДЕРЖАТЬ"
     sc, _ = MISSION["critique"]
     assert "в обе стороны" in sc and "Перестраховка" in sc and "упустил ли вход или выход" in sc
+
+
+def test_decisive_tilt_543():
+    """v5.4.3 «РЕШИТЕЛЬНЫЙ ПИЛОТ»: лёгкий крен к действию задан ценой ожидания, засадой у уровня, порядком вариантов и
+    требованием числа — не голым «будь агрессивнее»; invalidation для входа по-прежнему обязателен; канон кода прежний."""
+    # доктрина и персона: спор сигналов — не повод стоять, у ожидания своя цена, ожидаемый итог, засада, боковик — рынок
+    for piece in ("не повод стоять", "у ожидания тоже", "ожидаемый итог", "засаду у уровня", "боковик (диапазон — тоже рынок",
+                  "небольшой перекос — тоже перекос", "а не откладывай словами"):
+        assert piece in pm.DOCTRINE, piece
+    assert "пока толпа ждёт подтверждения" in pm.PERSONA and len(pm.PERSONA.splitlines()) == 1
+    assert len(pm.DOCTRINE.splitlines()) == 8, "заголовок + 7 пунктов, один пункт — одна строка"
+    systems = {**{k: v[0] for k, v in MISSION.items()}, **{k: v[0] for k, v in COUNCIL.items()}, "chat": CHAT[0]}
+    for name, s in systems.items():
+        low = s.lower()
+        assert "агрессивн" not in low and "будь решительным" not in low, (name, "голый приказ решительности")
+    # перепроверка: ждать пробоя — засада, ЖДЁМ с числом, описание рынка — не решение, entry при ЖДЁМ — будильник
+    sr, _ = MISSION["review"]
+    for piece in ("это засада", "а не ЖДЁМ", "описание рынка, а не решение", "будильник", "почему не засада",
+                  "уровень числом или время МСК", "в диапазоне играют от границ", "invalidation обязателен",
+                  "а не потому, что картина неясна", "на ближайшие 30 мин", "трос и тейк встанут туда"):
+        assert piece in sr, piece
+    assert "КУПИТЬ_СЕЙЧАС" not in sr and "ПРОДАТЬ_СЕЙЧАС" not in sr
+    # списки choice: ожидание / удержание последними во всех режимах, «_СЕЙЧАС» в метках нет, всё разбирается в канон
+    for play in ("long", "short", "mixed", "auto"):
+        for in_pos, side in ((False, None), (True, "long"), (True, "short")):
+            opts = pm.review_options(play, in_pos, side).split(" | ")
+            assert opts[-1] == ("ДЕРЖАТЬ" if in_pos else "ЖДЁМ"), (play, in_pos, opts)
+            assert not any("_СЕЙЧАС" in o for o in opts), opts
+            table = ai_v5.review_table(in_pos, side)
+            for o in opts:
+                assert ai_v5.decision_of(o, table) in table, (play, in_pos, side, o)
+    assert ai_v5.decision_of("КУПИТЬ", ai_v5.review_table(False)) == "КУПИТЬ_СЕЙЧАС"
+    assert ai_v5.decision_of("ПРОДАТЬ", ai_v5.review_table(False)) == "ПРОДАТЬ_СЕЙЧАС"
+    assert ai_v5.decision_of("ДЕРЖАТЬ", ai_v5.review_table(True, "long")) == "ЖДЁМ"
+    assert ai_v5.decision_of("ЖДЁМ", ai_v5.review_table(False)) == "ЖДЁМ"
+    assert ai_v5.decision_of("КУПИТЬ", ai_v5.review_table(True, "long")) == "ДОБРАТЬ", "в позиции КУПИТЬ у лонга — добор"
+    # схемы двери и прибыли: ожидание / удержание не первыми
+    door = pm.ENTRY_SCHEMA.split('"decision":"')[1].split('"')[0].split("|")
+    prof = pm.PROFIT_SCHEMA.split('"decision":"')[1].split('"')[0].split("|")
+    assert door[0] == "ВОЙТИ" and door[-1] == "ЖДАТЬ" and prof[0] != "ДЕРЖАТЬ" and prof[0] == "ВЫЙТИ", (door, prof)
+    se, ue = MISSION["entry_check"]
+    assert "что изменилось после приказа" in se and "ход до этой точки пройдёт без нас" in se
+    assert "Войти сейчас, отменить или ждать уровня/срока?" in ue
+    sp, up = MISSION["profit_think"]
+    assert "назови lock_price" in sp and "а не просто спорная картина" in sp and "ни один ответ не выбор по умолчанию" in sp
+    assert "Выйти, выйти и перезайти, держать или звать совет?" in up
+    # приказ: «войти, если пробьёт X» — BUY/SELL с засадой, а не WAIT; WAIT — с числом; invalidation для входа обязателен
+    assert "а не WAIT" in pm.EXEC_RULE and "засаду пилот исполнит сам" in pm.EXEC_RULE
+    assert "уровень числом и/или время МСК" in pm.EXEC_RULE and "«подтверждение» — только с числом" in pm.EXEC_RULE
+    assert "при проходе которых разбудить дежурного PRO" in pm.EXEC_RULE and '"levels":[число]' in pm.EXEC_SCHEMA
+    assert "что изменит решение" in pm.EXEC_SCHEMA and "чего ждём" not in pm.EXEC_SCHEMA and "что отменяет идею" in pm.EXEC_SCHEMA
+    assert "invalidation обязателен для BUY/SELL" in MISSION["exec_order"][0]
+    # вердикт, анализ и критика миссии: ждать пробоя — вход на пробитии; «вне рынка» — с числом; упущенный ход в %
+    sv = MISSION["verdict"][0]
+    assert "пилот исполнит его сам, а не «вне рынка»" in sv and "какое число изменит решение" in sv
+    assert "что отменяет план" in sv and "чего ждёшь" not in sv and "подтверждение, время" not in sv
+    assert "ждёшь пробоя или отката — дай уровень входа, стоп и цель" in MISSION["analysis"][0]
+    sc = MISSION["critique"][0]
+    for piece in ("с равным усердием", "засадой у уровня", "боковик без игры от границ", "сколько % стоил бы упущенный ход",
+                  "как рынок уйдёт без нас и где был бы вход"):
+        assert piece in sc, piece
+    # трос, тейк, триаж: ожидание не бесплатно
+    sg = MISSION["stop_guard"][0]
+    assert "докажи числами" in sg and "иначе это надежда, а не картина" in sg and "назови hold_until_price" in sg
+    assert "можешь назвать новый уровень" not in sg
+    assert "lock_price обязателен" in MISSION["take_guard"][0]
+    st = MISSION["event_triage"][0]
+    assert "уже в цене" not in st and "Не уверен, нужен ли PRO, — СЕЙЧАС" in st
+    # «нет данных» по слою — не повод не решать (миссия у денег и совет)
+    for name in ("analysis", "verdict", "review", "stop_guard", "take_guard", "entry_check", "profit_think", "event_triage"):
+        s = MISSION[name][0]
+        assert "нет данных по слою — скажи и решай по тому, что есть" in s and "нет данных — так и скажи" not in s, name
+    for name in ("analysis_daily", "analysis_update", "analysis_human", "critique", "verdict"):
+        s = COUNCIL[name][0]
+        assert "нет данных по слою — скажи и решай по тому, что есть" in s and "так и скажи" not in s, name
+    # совет: идея со стороной и уровнем — вход с триггером, а не «смотреть»; итог кладёт её в picks
+    svc, ssc, scc = COUNCIL["verdict"][0], COUNCIL["summary"][0], COUNCIL["critique"][0]
+    assert "только идеи без стороны" in svc and "это вход с триггером, а не «смотреть»" in svc and "уровень входа числом" in svc
+    assert "даже если вердикт назвал её «смотреть»" in ssc and "в обе стороны с равным усердием" in scc and "«ждать пробоя»" in scc
+    # прокол: одна оговорка-критерий у всех ролей, без голого «или ложный прокол»
+    assert all(pm.PUNCTURE_FALSE in v for v in pm.PUNCTURE_ROLES.values())
+    assert not any("или ложный прокол" in v for v in pm.PUNCTURE_ROLES.values())
+    assert "засада за полосой опоздает" in pm.PUNCTURE_ROLES["вне рынка"]
 
 
 def test_guards_ask_by_picture_not_by_rule():
@@ -166,10 +253,10 @@ def test_guards_ask_by_picture_not_by_rule():
 
 def test_entry_check_blocks_and_schema():
     s, u = MISSION["entry_check"]
-    assert pm.ENTRY_SCHEMA in s and '"decision":"ВОЙТИ|ЖДАТЬ|ОТМЕНИТЬ"' in pm.ENTRY_SCHEMA
+    assert pm.ENTRY_SCHEMA in s and '"decision":"ВОЙТИ|ОТМЕНИТЬ|ЖДАТЬ"' in pm.ENTRY_SCHEMA
     for field in ('"entry"', '"entry_kind":"сейчас|откат|прорыв"|null', '"wait_minutes"', '"invalidation"', '"take"', '"council":true|false', '"note"'):
         assert field in pm.ENTRY_SCHEMA, field
-    assert "у самой двери" in s and "сверь его с живым рынком" in s and "три исхода равноправны" in s and "ОТМЕНИТЬ" in s
+    assert "у самой двери" in s and "сверь его с живым рынком" in s and "ни один исход не выбор по умолчанию" in s and "ОТМЕНИТЬ" in s
     assert "анализ заново не пересобирай" in s and "не входить вслепую" not in s and "сомнение — ЖДАТЬ" not in s
     assert "Совет уже решил войти" not in s and "приказ совета или дежурного PRO" in s, "решение могло прийти и от перепроверки"
     for piece in (f"ВРЕМЯ: {TIME}", "═══ СИТУАЦИЯ ═══", "Цена 285.4, позиция long 10 @279", "═══ ПРИКАЗ И ПЛАН", "BUY сейчас, стоп 281",
@@ -177,7 +264,7 @@ def test_entry_check_blocks_and_schema():
                   "не обязательство",
                   "═══ ПРОШЛЫЕ ОТВЕТЫ У ТРОСА И ТЕЙКА ═══", "10:40 трос: ЖДАТЬ", "═══ ПАМЯТЬ МИССИИ", "═══ СКАНЕР СТАКАНА ═══",
                   "═══ ДАННЫЕ РАЗВЕДКИ ═══", "MX 2 791", "═══ СВЯЗАННЫЕ БУМАГИ", "ρ=+0.81", "═══ ИТОГ ОБЩЕГО СОВЕТА ═══",
-                  "═══ СВЕЖИЕ НОВОСТИ (время МСК) ═══", "[a1b2c3]", "Войти сейчас, ждать уровня/срока или отменить?"):
+                  "═══ СВЕЖИЕ НОВОСТИ (время МСК) ═══", "[a1b2c3]", "Войти сейчас, отменить или ждать уровня/срока?"):
         assert piece in u, piece
     assert u.index("═══ СИТУАЦИЯ ═══") < u.index("═══ ПРИКАЗ И ПЛАН") < u.index("═══ ХОД ЦЕНЫ") < u.index("═══ СВЕЖИЕ НОВОСТИ")
     _, u0 = pm.entry_check("SBER", "Сбербанк", "long", situation="", plan="", history="", light="", news="", council_text="")
@@ -186,7 +273,7 @@ def test_entry_check_blocks_and_schema():
 
 def test_profit_think_blocks_and_schema():
     s, u = MISSION["profit_think"]
-    assert pm.PROFIT_SCHEMA in s and '"decision":"ДЕРЖАТЬ|ВЫЙТИ|ВЫЙТИ_И_ПЕРЕЗАЙТИ|СОВЕТ"' in pm.PROFIT_SCHEMA
+    assert pm.PROFIT_SCHEMA in s and '"decision":"ВЫЙТИ|ВЫЙТИ_И_ПЕРЕЗАЙТИ|ДЕРЖАТЬ|СОВЕТ"' in pm.PROFIT_SCHEMA
     for field in ('"lock_price"', '"take"', '"reentry"', '"reentry_kind":"откат|прорыв"|null', '"note"'):
         assert field in pm.PROFIT_SCHEMA, field
     assert "позиция в плюсе" in s and "пройдено 64 %" in s and "может продолжиться, а может выдохнуться" in s and "ВЫЙТИ_И_ПЕРЕЗАЙТИ" in s
@@ -194,7 +281,7 @@ def test_profit_think_blocks_and_schema():
     for piece in (f"ВРЕМЯ: {TIME}", "ПРИБЫЛЬ: пройдено 64 % хода до тейка 291", "═══ СИТУАЦИЯ ═══", "═══ ХОД ЦЕНЫ", "279 → 285.4",
                   "═══ ЖИВОЙ РЫНОК ═══", "═══ ПЛАН И ПРОШЛЫЕ РЕШЕНИЯ ═══", "BUY тейк 291 стоп 276", "═══ ПРОШЛЫЕ МЫСЛИ О ПРИБЫЛИ ═══",
                   "14:00 ДЕРЖАТЬ", "═══ ПАМЯТЬ МИССИИ", "═══ СКАНЕР СТАКАНА ═══", "═══ ДАННЫЕ РАЗВЕДКИ ═══", "═══ СВЯЗАННЫЕ БУМАГИ",
-                  "═══ ИТОГ ОБЩЕГО СОВЕТА ═══", "═══ СВЕЖИЕ НОВОСТИ (время МСК) ═══", "Держать, выйти, выйти и перезайти или звать совет?"):
+                  "═══ ИТОГ ОБЩЕГО СОВЕТА ═══", "═══ СВЕЖИЕ НОВОСТИ (время МСК) ═══", "Выйти, выйти и перезайти, держать или звать совет?"):
         assert piece in u, piece
     assert "ПРОШЛЫЕ ОТВЕТЫ У ТРОСА И ТЕЙКА" not in u, "пустой блок guards пропущен"
 
