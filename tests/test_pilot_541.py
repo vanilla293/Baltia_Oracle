@@ -394,9 +394,10 @@ def test_entry_gate_cancel_with_and_without_council(offline):
         fake.queue("mission_entry", {"decision": "ОТМЕНИТЬ", "why": "идея отыграна"})
         await tick(p, 100.0)
         assert p.plan is None and p.state == "ЖДУ_ПЛАН" and not p.broker.placed
-        assert m.handoffs[-1]["kind"] == "pilot" and not m.handoffs[-1]["deferred"] and "вход отменён PRO у двери" in m.handoffs[-1]["reason"]
-        # 5.4.2: вне рынка без плана повод пилота зовёт PRO скоро (EVENT_MIN_GAP_SEC), а не на плановой перепроверке
-        assert p.review_ts <= time.time() + mission.EVENT_MIN_GAP_SEC + 1 and "идея отыграна" in (p._review_reason or "")
+        assert m.handoffs[-1]["kind"] == "pilot" and m.handoffs[-1]["deferred"] and "вход отменён PRO у двери" in m.handoffs[-1]["reason"]
+        # 5.4.2: вне рынка без плана повод пилота звал PRO скоро (EVENT_MIN_GAP_SEC); v5.4.4 (воля владельца «только
+        # триггеры и раз в 30 мин»): ОТМЕНИТЬ у двери — повод к плановой перепроверке
+        assert p.review_ts >= time.time() + 1790 and "идея отыграна" in (p._review_reason or ""), p.review_ts - time.time()
         p.reanalyze_cb.assert_not_awaited()
         assert p.adopt_forecast(ex("BUY"))
         fake.queue("mission_entry", {"decision": "ОТМЕНИТЬ", "why": "нужен совет", "council": True})

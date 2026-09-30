@@ -194,6 +194,14 @@ async def money_json(system: str, user: str, *, route: str, max_tokens: int | No
 # «НЕ ВХОДИТЬ» у двери — входом. Здесь: целые слова (Ё=Е, регистр, латиница, знаки и markdown не мешают), ключ
 # decision|choice|do|action, отрицание в начале и два разных решения → None. None — «решения нет»: вызывающий
 # пишет «ответ не разобран» и переспрашивает, а не выбирает за ИИ.
+# v5.4.4 (отчёт проверяющего 30.09, раздел D: живые слова DeepSeek, которые давали None или не тот токен): эхо схемы
+# («КУПИТЬ | ПРОДАТЬ | …», «КУПИТЬ/ПРОДАТЬ») → None; семейство «засада / войти / вход взведён» у перепроверки вне
+# рынка — сторона по словам ответа («на покупку», «в лонг», LIMIT_BUY), без стороны — по уровням ответа
+# (side_by_levels, решает MissionPilot._parse_choice); ОТМЕНИТЬ у перепроверки при взведённом входе (снять вход);
+# «подтянуть трос», «стоп в безубыток», «не закрывать» — держать; частичное закрытие («частично», «половину»,
+# «сократить») → None: его нет, переспрос с пометкой; условный вход у двери («ВОЙТИ на откате», BUY_LIMIT, «позже»)
+# → ЖДАТЬ с уровнем, а не вход по текущей цене; «ВЫЙТИ, ПЕРЕЗАЙТИ на …» → ВЫЙТИ_И_ПЕРЕЗАЙТИ; «звать совет»,
+# «не сливать» у троса → ЖДАТЬ, CUT → СЛИТЬ.
 DECISION_KEYS = ("decision", "choice", "do", "action", "решение", "выбор")
 _NEGATIONS = frozenset({"НЕ", "НЕТ", "NOT", "NO", "DONT", "DO_NOT", "НЕЛЬЗЯ"})
 # отрицание сразу ПОСЛЕ слова решения: «ВОЙТИ нельзя», «КУПИТЬ сейчас не стоит»
@@ -205,20 +213,67 @@ SYN_SELL = ("ПРОДАТЬ", "ПРОДАТЬ_СЕЙЧАС", "ПРОДАТЬ_Н�
             "ПРОДАВАТЬ", "ПРОДАЕМ", "ПРОДАЮ", "ШОРТ", "В_ШОРТ", "SELL", "SELL_NOW", "SHORT", "GO_SHORT")
 # «ДА/YES/GO» — не ответ на вопрос из трёх исходов (ВОЙТИ / ЖДАТЬ / ОТМЕНИТЬ): их здесь нет (находка ревью 5.4.2)
 SYN_ENTER = ("ВОЙТИ", "ВОЙТИ_СЕЙЧАС", "ВХОД", "ВХОДИМ", "ВХОДИТЬ", "ВХОЖУ", "ЗАЙТИ", "ENTER", "ENTRY")
-SYN_WAIT = ("ЖДАТЬ", "ЖДЕМ", "ЖДУ", "ПОДОЖДАТЬ", "ОЖИДАТЬ", "WAIT")
+SYN_WAIT = ("ЖДАТЬ", "ЖДЕМ", "ЖДУ", "ПОДОЖДАТЬ", "ОЖИДАТЬ", "ОЖИДАНИЕ", "ОЖИДАЕМ", "ПОДОЖДЕМ", "WAIT")
 # «вне рынка» зависит от позиции: без позиции — не входить (ожидание), в позиции — выйти; «NONE/PASS» — не ответ
 SYN_OUT = ("ВНЕ_РЫНКА", "STAY_OUT", "NO_TRADE", "OUT_OF_MARKET")
+# v5.4.4: «входа нет» у перепроверки вне рынка — ожидание (при взведённом входе — снять его); PASS — только здесь, в
+# общий словарь ожидания не входит (у двери и троса «pass» — не ответ)
+SYN_NO_ENTRY = ("ПАС", "ПАСУЕМ", "ПРОПУСТИТЬ", "ПРОПУСКАЕМ", "НЕТ_ВХОДА", "БЕЗ_ВХОДА", "НЕ_ВХОДИТЬ", "НЕ_ВХОДИМ",
+                "NO_ENTRY", "PASS")
 SYN_HOLD = ("ДЕРЖАТЬ", "ДЕРЖИМ", "ДЕРЖУ", "ПОДЕРЖАТЬ", "ОСТАВИТЬ", "HOLD", "KEEP")
+# v5.4.4: «подтянуть трос / стоп в безубыток / запереть прибыль» — держать с новыми уровнями (числа — в invalidation)
+SYN_TRAIL = ("ПОДТЯНУТЬ", "ПОДТЯГИВАЕМ", "ПОДТЯНУТЬ_ТРОС", "ПОДТЯНУТЬ_СТОП", "ПЕРЕСТАВИТЬ_СТОП", "ПЕРЕСТАВИТЬ_ТРОС",
+             "ПЕРЕНЕСТИ_СТОП", "СДВИНУТЬ_СТОП", "СТОП_В_БЕЗУБЫТОК", "СТОП_В_БУ", "ТРОС_В_БЕЗУБЫТОК", "В_БЕЗУБЫТОК",
+             "БЕЗУБЫТОК", "ЗАПЕРЕТЬ_ПРИБЫЛЬ", "TRAIL", "TRAIL_STOP", "MOVE_STOP", "BREAKEVEN")
 SYN_CLOSE = ("ЗАКРЫТЬ", "ЗАКРЫВАЕМ", "ЗАКРЫВАТЬ", "ВЫЙТИ", "ВЫХОД", "ВЫХОДИМ", "ВЫХОДИТЬ", "СЛИТЬ", "СЛИВАЕМ", "СЛИВАТЬ",
              "ЗАФИКСИРОВАТЬ",
              "ФИКСИРОВАТЬ", "ФИКСИРУЕМ", "ЗАБРАТЬ", "ЗАБРАТЬ_ПРИБЫЛЬ", "ФИКСИРОВАТЬ_ПРИБЫЛЬ", "ЗАФИКСИРОВАТЬ_ПРИБЫЛЬ",
              "CLOSE", "EXIT", "FLAT", "TAKE_PROFIT", "CLOSE_ALL")
 SYN_CANCEL = ("ОТМЕНИТЬ", "ОТМЕНА", "ОТМЕНЯЕМ", "ОТКАЗ", "ОТКАЗАТЬСЯ", "CANCEL", "SKIP", "ABORT")
+# v5.4.4: снять взведённый вход (перепроверка при засаде, дверь)
+SYN_UNARM = ("СНЯТЬ", "СНИМАЕМ", "СНЯТЬ_ЗАСАДУ", "ОТМЕНИТЬ_ЗАСАДУ", "СНЯТЬ_ВХОД", "ОТМЕНИТЬ_ВХОД", "СНЯТЬ_ПЛАН",
+             "ОТМЕНИТЬ_ПЛАН", "СНЯТЬ_ЗАЯВКУ", "ОТМЕНИТЬ_ЗАЯВКУ")
 SYN_ADD = ("ДОБРАТЬ", "ДОБОР", "ДОКУПИТЬ", "УСИЛИТЬ", "НАРАСТИТЬ", "ADD", "TOPUP", "TOP_UP", "SCALE_IN")
 SYN_FLIP = ("ПЕРЕВЕРНУТЬ", "ПЕРЕВОРОТ", "РАЗВЕРНУТЬ", "РАЗВОРОТ_ПОЗИЦИИ", "FLIP", "REVERSE")
-SYN_COUNCIL = ("НОВЫЙ_АНАЛИЗ", "СОВЕТ", "НОВЫЙ_СОВЕТ", "ПЕРЕАНАЛИЗ", "COUNCIL", "REANALYZE", "NEW_ANALYSIS")
-SYN_REENTER = ("ВЫЙТИ_И_ПЕРЕЗАЙТИ", "ВЫЙТИ_ПЕРЕЗАЙТИ", "ПЕРЕЗАЙТИ", "ПЕРЕЗАХОД", "REENTER", "REENTRY", "RE_ENTER",
-               "RE_ENTRY", "EXIT_AND_REENTER")
+SYN_COUNCIL = ("НОВЫЙ_АНАЛИЗ", "СОВЕТ", "НОВЫЙ_СОВЕТ", "ПЕРЕАНАЛИЗ", "ЗВАТЬ_СОВЕТ", "ПОЗВАТЬ_СОВЕТ", "СОЗВАТЬ_СОВЕТ",
+               "НУЖЕН_СОВЕТ", "ПЕРЕДАТЬ_СОВЕТУ", "COUNCIL", "REANALYZE", "NEW_ANALYSIS")
+SYN_REENTER = ("ВЫЙТИ_И_ПЕРЕЗАЙТИ", "ВЫЙТИ_ПЕРЕЗАЙТИ", "ПЕРЕЗАЙТИ", "ПЕРЕЗАХОД", "ВЫЙТИ_И_ВОЙТИ_СНОВА",
+               "ВЫЙТИ_И_ЗАЙТИ_СНОВА", "REENTER", "REENTRY", "RE_ENTER", "RE_ENTRY", "EXIT_AND_REENTER")
+# v5.4.4: вход без стороны у перепроверки вне рынка («засада», «войти», «вход взведён», LIMIT, AMBUSH) — сторона по
+# словам ответа, иначе по его уровням (side_by_levels у вызывающего); «ДЕРЖАТЬ ЗАСАДУ» — не вход, а ожидание (ДЕРЖАТЬ)
+SYN_AMBUSH = ("ЗАСАДА", "ЗАСАДУ", "ЗАСАДЫ", "ВЗВЕСТИ", "ВЗВЕСТИ_ЗАСАДУ", "ПОСТАВИТЬ_ЗАСАДУ", "ПЕРЕСТАВИТЬ_ЗАСАДУ",
+              "ВЫСТАВИТЬ_ЗАСАДУ", "ВХОД_ВЗВЕДЕН", "ВЗВЕСТИ_ВХОД", "ЛИМИТ", "ЛИМИТКА", "ЛИМИТКУ", "LIMIT", "AMBUSH",
+              "SET_AMBUSH", "ОТКРЫТЬ", "ОТКРЫТЬ_ПОЗИЦИЮ", "ОТКРЫВАЕМ")
+ENTRY_ANY = "ВХОД_БЕЗ_СТОРОНЫ"      # токен «вход, сторона не названа» — только у review_table(..., sideless=True)
+REVIEW_CANCEL = "ОТМЕНИТЬ_ВХОД"     # v5.4.4: канон кода «снять взведённый вход» (модель видит «ОТМЕНИТЬ»)
+# стороны в словах ответа («засада на покупку», «вход в лонг», LIMIT_BUY) — целые слова, не основы («продавцы» — не шорт)
+_LONG_WORDS = frozenset({"КУПИТЬ", "КУПИМ", "КУПЛЮ", "ДОКУПИТЬ", "ПОКУПКА", "ПОКУПКУ", "ПОКУПКИ", "ПОКУПКЕ", "ПОКУПАТЬ",
+                         "ПОКУПАЕМ", "ПОКУПАЮ", "ЛОНГ", "ЛОНГА", "ЛОНГЕ", "ЛОНГУ", "BUY", "LONG"})
+_SHORT_WORDS = frozenset({"ПРОДАТЬ", "ПРОДАМ", "ПРОДАДИМ", "ПРОДАЖА", "ПРОДАЖУ", "ПРОДАЖИ", "ПРОДАЖЕ", "ПРОДАВАТЬ",
+                          "ПРОДАЕМ", "ПРОДАЮ", "ШОРТ", "ШОРТА", "ШОРТЕ", "ШОРТУ", "SELL", "SHORT"})
+# условный вход у двери — ожидание уровня, а не вход по текущей цене (основы слов и целые слова)
+_COND_STEMS = ("ОТКАТ", "ПРОБО", "ПРОРЫВ", "ЛИМИТ", "LIMIT", "ПОЗЖЕ", "ПОТОМ", "ЗАСАД", "ВЗВЕД", "ОТЛОЖ", "РЕТЕСТ",
+               "PULLBACK", "BREAKOUT", "RETEST", "LATER")
+_COND_WORDS = frozenset({"ЕСЛИ", "КОГДА", "ПОСЛЕ", "ПРИ", "IF", "WHEN", "AFTER"})
+# частичного закрытия / выхода у пилота нет: «ЗАКРЫТЬ ПОЛОВИНУ», «ЧАСТИЧНО ВЫЙТИ», «СОКРАТИТЬ» — не решение, переспрос
+_PARTIAL = frozenset({"ЧАСТИЧНО", "ЧАСТЬ", "ЧАСТЬЮ", "ЧАСТИ", "ПОЛОВИНУ", "ПОЛОВИНА", "ПОЛОВИНОЙ", "ТРЕТЬ", "ЧЕТВЕРТЬ",
+                      "СОКРАТИТЬ", "СОКРАЩАЕМ", "СОКРАТИМ", "УРЕЗАТЬ", "УМЕНЬШИТЬ", "PARTIAL", "PARTIALLY", "HALF",
+                      "REDUCE", "TRIM"})
+_FILLER = frozenset({"И", "А", "ПОТОМ", "ЗАТЕМ", "СРАЗУ", "THEN", "AND"})
+_ECHO_SEP = r"[|/]"                 # эхо схемы: «КУПИТЬ | ПРОДАТЬ | …», «КУПИТЬ/ПРОДАТЬ»
+
+
+class DecisionTable(dict):
+    """v5.4.4: словарь слова решения узла {токен: синонимы} (обычный dict: токены, итерация, `in`) + правила разбора:
+    side — (токен «вход без стороны», токен лонга, токен шорта, вернуть ли токен без стороны): вход без стороны →
+      сторона по словам ответа (_LONG_WORDS / _SHORT_WORDS); нет — токен без стороны (разрешает вызывающий по уровням
+      ответа) или None;
+    cond — (токен входа, токен ожидания): условный вход («ВОЙТИ на откате», BUY_LIMIT, «ВОЙТИ позже», «ВОЙТИ, но на
+      откате») → ожидание;
+    combine — {(токен первого предложения, токен второго): итог} («ВЫЙТИ, ПЕРЕЗАЙТИ на 296.6» → ВЫЙТИ_И_ПЕРЕЗАЙТИ)."""
+    side: tuple | None = None
+    cond: tuple | None = None
+    combine: dict | None = None
 
 
 def _norm_word(x: Any) -> str:
@@ -230,13 +285,16 @@ def _norm_word(x: Any) -> str:
 
 
 def decision_raw(obj: Any, keys: tuple[str, ...] = DECISION_KEYS) -> str:
-    """Сырое слово решения из ответа: строка как есть или первый непустой ключ из keys (без учёта регистра)."""
+    """Сырое слово решения из ответа: строка как есть или первый непустой ключ из keys (без учёта регистра).
+    v5.4.4: список из одного слова (["КУПИТЬ"]) — это слово; список из нескольких — решения нет («»)."""
     if isinstance(obj, str):
         return obj.strip()
     if isinstance(obj, dict):
         low = {str(k).strip().lower(): v for k, v in obj.items()}
         for k in keys:
             v = low.get(k)
+            if isinstance(v, list) and len(v) == 1 and isinstance(v[0], (str, int, float)) and str(v[0]).strip():
+                return str(v[0]).strip()
             if v not in (None, "") and not isinstance(v, (dict, list)):
                 return str(v).strip()
     return ""
@@ -257,87 +315,240 @@ def _prefix_hit(words: list[str], idx: dict[str, set[str]]) -> tuple[str | None,
     return None, 0
 
 
-def decision_of(raw: Any, table: dict[str, tuple[str, ...]]) -> str | None:
-    """Каноническое решение узла или None. table: {токен узла: синонимы} (токен сам себе синоним).
-    Решение — в первом предложении ответа (граница — запятая, тире, «;», «:», скобка):
-      «КУПИТЬ_СЕЙЧАС — анализ подтверждён» → КУПИТЬ_СЕЙЧАС; «ДЕРЖАТЬ, не надо сливать» → ДЕРЖАТЬ.
-    Отрицание сразу после слова решения в том же предложении — переспрос: «ВОЙТИ нельзя», «ВОЙТИ не сейчас, …».
-    «X, но не …» — переспрос. «НЕ X — Y» — решение Y, только если Y другое, чем отвергнутый X («НЕ СЛИВАТЬ —
-    держать» → держать; «НЕ ВХОДИТЬ — вход выше 101» → переспрос). «… или …» и два решения сразу — переспрос."""
-    import re
-    text = str(raw or "")
-    words = _norm_word(text).split()
-    if not words:
-        return None
+def _index(table: dict[str, tuple[str, ...]]) -> dict[str, set[str]]:
     idx: dict[str, set[str]] = {}
     for tok, syns in table.items():
         for w in (tok, *syns):
             idx.setdefault("_".join(_norm_word(w).split()), set()).add(tok)
+    return idx
+
+
+def text_side(raw: Any) -> str | None:
+    """v5.4.4: сторона, названная словами ответа: «long» (купить / на покупку / в лонг / BUY), «short» (продать / на
+    продажу / шорт / SELL); обе или ни одной — None."""
+    words = set(_norm_word(raw).split())
+    lg, sh = bool(words & _LONG_WORDS), bool(words & _SHORT_WORDS)
+    return "long" if lg and not sh else "short" if sh and not lg else None
+
+
+def side_by_levels(obj: Any, price: Any = None) -> str | None:
+    """v5.4.4: сторона входа по уровням ответа (вход назван без стороны: «ЗАСАДА», «ВОЙТИ»): стоп ниже уровня входа
+    (entry, нет — цена снимка price) и тейк выше — лонг; зеркально — шорт; уровни спорят или их нет — None."""
+    if not isinstance(obj, dict):
+        return None
+
+    def num(v) -> float | None:
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return None
+        return x if x > 0 else None
+
+    ref = num(obj.get("entry")) or num(price)
+    if not ref:
+        return None
+    votes = set()
+    inv, take = num(obj.get("invalidation")), num(obj.get("take"))
+    if inv is not None and inv != ref:
+        votes.add("long" if inv < ref else "short")
+    if take is not None and take != ref:
+        votes.add("long" if take > ref else "short")
+    return next(iter(votes)) if len(votes) == 1 else None
+
+
+def _conditional(words: list[str]) -> bool:
+    return any(w in _COND_WORDS or w.startswith(_COND_STEMS) for w in words)
+
+
+def _side_of(tok: str | None, text: str, table: dict) -> str | None:
+    """Вход без стороны (DecisionTable.side) → сторона по словам ответа; нет — токен без стороны или None."""
+    sd = getattr(table, "side", None)
+    if not sd or tok is None or tok != sd[0]:
+        return tok
+    side = text_side(text)
+    if side == "long":
+        return sd[1]
+    if side == "short":
+        return sd[2]
+    return tok if sd[3] else None
+
+
+def _decide(text: str, table: dict, idx: dict[str, set[str]]) -> str | None:
+    """Разбор одного ответа (без проверки эха схемы — она в decision_of)."""
+    import re
+    words = _norm_word(text).split()
+    if not words:
+        return None
+    cond = getattr(table, "cond", None)
     whole = idx.get("_".join(words))       # точное слово словаря целиком («NO_TRADE») — раньше проверки отрицания
     if whole:
-        return next(iter(whole)) if len(whole) == 1 else None
+        tok = next(iter(whole)) if len(whole) == 1 else None
+        if cond and tok == cond[0] and _conditional(words):
+            return cond[1]                 # «КУПИТЬ_НА_ОТКАТЕ» у двери — ждать уровня
+        return _side_of(tok, text, table)
     if "ИЛИ" in words or "OR" in words:
         return None                        # «ВОЙТИ или ЖДАТЬ» — решения нет, переспросить
     clauses = [c for c in re.split(_CLAUSE_SEP, text.strip()) if _norm_word(c)]
     if not clauses:
         return None
     first = _norm_word(clauses[0]).split()
-    if first[0] in _NEGATIONS:
-        # «НЕ СЛИВАТЬ — держать»: отвергнутое — в первом предложении, выбранное — дальше, и они должны различаться
+    if any(w in _PARTIAL for w in first):
+        return None                        # «ЗАКРЫТЬ ПОЛОВИНУ», «ЧАСТИЧНО ВЫЙТИ» — частичного выхода нет, переспросить
+    hit, n = _prefix_hit(first, idx)
+    if first[0] in _NEGATIONS and not (hit and n >= 2):
+        # «НЕ СЛИВАТЬ — держать»: отвергнутое — в первом предложении, выбранное — дальше, и они должны различаться;
+        # фраза с отрицанием из словаря («НЕ_ВХОДИТЬ», «НЕ_ЗАКРЫВАТЬ», «НЕ_СЕЙЧАС») — сама решение
         neg, _n = _prefix_hit(first[1:], idx) if len(first) > 1 else (None, 0)
         if neg is None or len(clauses) < 2:
             return None
-        alt = decision_of(", ".join(clauses[1:]), table)
+        alt = _decide(", ".join(clauses[1:]), table, idx)
         return alt if alt is not None and alt != neg else None
-    hit, n = _prefix_hit(first, idx)
     if hit is None:
         return None
     tail = first[n:n + 2]
     if tail and (tail[0] in _NEG_WORDS or "_".join(tail) in _POST_NEG):
         return None                        # «ВОЙТИ нельзя», «ВОЙТИ не сейчас» — не решение войти
-    if len(clauses) > 1:
-        nxt = _norm_word(clauses[1]).split()
-        if nxt and nxt[0] in _CONTRAST and any(w in _NEG_WORDS for w in nxt):
-            return None                    # «ВОЙТИ, но не сейчас»
-    return hit
+    nxt = _norm_word(clauses[1]).split() if len(clauses) > 1 else []
+    if nxt and nxt[0] in _CONTRAST and any(w in _NEG_WORDS for w in nxt):
+        return None                        # «ВОЙТИ, но не сейчас»
+    if cond and hit == cond[0] and _conditional(first[n:] + (nxt if nxt and nxt[0] in _CONTRAST else [])):
+        return cond[1]                     # «ВОЙТИ на откате 296.6», «ВОЙТИ позже», «ВОЙТИ, но на откате» — ждать уровня
+    comb = getattr(table, "combine", None)
+    for more in ((first[n:], nxt) if comb else ()):
+        k = 0
+        while k < len(more) and more[k] in _FILLER:
+            k += 1
+        h2 = _prefix_hit(more[k:], idx)[0] if k < len(more) else None
+        if (hit, h2) in comb:
+            return comb[(hit, h2)]         # «ВЫЙТИ, ПЕРЕЗАЙТИ на 296.6», «ВЫЙТИ и потом ПЕРЕЗАЙТИ ниже»
+    return _side_of(hit, text, table)
+
+
+def echo_of(raw: Any, table: dict[str, tuple[str, ...]]) -> bool:
+    """v5.4.4: ответ — эхо схемы: «|» или «/» разделяют РАЗНЫЕ решения («КУПИТЬ | ПРОДАТЬ | НОВЫЙ_АНАЛИЗ | ЖДЁМ»,
+    «ВОЙТИ|ОТМЕНИТЬ|ЖДАТЬ», «СЛИТЬ|ЖДАТЬ»). Вход без стороны рядом со стороной («КУПИТЬ/ЗАСАДА») — не спор."""
+    import re
+    text = str(raw or "")
+    if not re.search(_ECHO_SEP, text):
+        return False
+    idx = _index(table)
+    if idx.get("_".join(_norm_word(text).split())):
+        return False                       # «ВЫЙТИ/ПЕРЕЗАЙТИ» — слово словаря целиком
+    parts = [p for p in re.split(_ECHO_SEP, text) if _norm_word(p)]
+    if len(parts) < 2:
+        return False
+    toks = {_decide(p, table, idx) for p in parts} - {None}
+    sd = getattr(table, "side", None)
+    if sd and sd[0] in toks and toks - {sd[0]} <= {sd[1], sd[2]}:
+        toks.discard(sd[0])                # «КУПИТЬ/ЗАСАДА» — засада на покупку, а «ЗАСАДА/ЖДЁМ» — спор
+    return len(toks) > 1
+
+
+_AMBUSH_STEMS = ("ЗАСАД", "ВЗВЕД", "ВЗВЕСТ", "ЛИМИТ", "LIMIT", "AMBUSH")
+
+
+def ambush_of(raw: Any) -> bool:
+    """v5.4.4: в первом предложении ответа — засада / лимитка / «вход взведён»: такой вход без уровня (entry) не вход
+    («ЗАСАДА» без числа — вызывающий переспрашивает, а не входит по текущей цене)."""
+    import re
+    clauses = [c for c in re.split(_CLAUSE_SEP, str(raw or "").strip()) if _norm_word(c)]
+    return bool(clauses) and any(w.startswith(_AMBUSH_STEMS) for w in _norm_word(clauses[0]).split())
+
+
+def partial_of(raw: Any) -> bool:
+    """v5.4.4: в первом предложении ответа — частичное закрытие/выход («ЗАКРЫТЬ ПОЛОВИНУ», «ЧАСТИЧНО ВЫЙТИ»,
+    «СОКРАТИТЬ»): такого решения у пилота нет (вызывающий переспрашивает с пометкой «ЗАКРЫТЬ всё или ДЕРЖАТЬ»)."""
+    import re
+    clauses = [c for c in re.split(_CLAUSE_SEP, str(raw or "").strip()) if _norm_word(c)]
+    return bool(clauses) and any(w in _PARTIAL for w in _norm_word(clauses[0]).split())
+
+
+def decision_of(raw: Any, table: dict[str, tuple[str, ...]]) -> str | None:
+    """Каноническое решение узла или None. table: {токен узла: синонимы} (токен сам себе синоним); DecisionTable —
+    ещё и правила (сторона входа по словам, условный вход, сочетание двух предложений).
+    Решение — в первом предложении ответа (граница — запятая, тире, «;», «:», скобка):
+      «КУПИТЬ_СЕЙЧАС — анализ подтверждён» → КУПИТЬ_СЕЙЧАС; «ДЕРЖАТЬ, не надо сливать» → ДЕРЖАТЬ.
+    Отрицание сразу после слова решения в том же предложении — переспрос: «ВОЙТИ нельзя», «ВОЙТИ не сейчас, …».
+    «X, но не …» — переспрос. «НЕ X — Y» — решение Y, только если Y другое, чем отвергнутый X («НЕ ПОКУПАТЬ, ЖДЁМ» →
+    ждём; «НЕ ВХОДИТЬ — вход выше 101» у двери → переспрос); фраза с отрицанием из словаря узла («НЕ ЗАКРЫВАТЬ» в
+    позиции, «НЕ СЛИВАТЬ» у троса, «НЕ СЕЙЧАС» у двери) — решение. «… или …», два решения сразу и эхо схемы через «|» / «/»
+    («КУПИТЬ | ПРОДАТЬ | НОВЫЙ_АНАЛИЗ | ЖДЁМ») — переспрос. Частичное закрытие («ЗАКРЫТЬ ПОЛОВИНУ») — переспрос."""
+    text = str(raw or "")
+    if not _norm_word(text):
+        return None
+    if echo_of(text, table):
+        return None
+    return _decide(text, table, _index(table))
 
 
 def _side_syn(side: str | None, long_syn: tuple[str, ...], short_syn: tuple[str, ...]) -> tuple[str, ...]:
     return long_syn if side == "long" else short_syn if side == "short" else ()
 
 
-def review_table(in_pos: bool, side: str | None = None) -> dict[str, tuple[str, ...]]:
-    """Перепроверка дежурного PRO. «ВОЙТИ» без стороны сюда не входит — иначе скрытый крен в лонг (находка проверяющего).
-    В позиции «SELL» у лонга — закрыть, «BUY» у лонга — добрать (зеркально для шорта)."""
+def review_table(in_pos: bool, side: str | None = None, armed: bool = False,
+                 sideless: bool = False) -> dict[str, tuple[str, ...]]:
+    """Перепроверка дежурного PRO. В позиции «SELL» у лонга — закрыть, «BUY» у лонга — добрать (зеркально для шорта);
+    «подтянуть трос», «стоп в безубыток», «не закрывать» — держать (канон ЖДЁМ, числа — в invalidation/take).
+    Вне рынка (v5.4.4): «засада / войти / вход взведён / LIMIT / AMBUSH» — вход, сторона по словам ответа («на
+    покупку», «в лонг», LIMIT_BUY); без стороны — ENTRY_ANY при sideless=True (MissionPilot._parse_choice решает по
+    уровням ответа — side_by_levels), иначе None: скрытого крена в лонг нет (находка проверяющего 5.4.2). «Пас / нет
+    входа / не входить / ожидание» — ЖДЁМ. armed (взведён вход без позиции — засада, вход у двери, заявка в полёте):
+    ОТМЕНИТЬ_ВХОД — снять его («ОТМЕНИТЬ», «СНЯТЬ ЗАСАДУ», «ВНЕ РЫНКА», «пас / нет входа»); ЖДЁМ / «ДЕРЖАТЬ ЗАСАДУ» —
+    взведённый вход остаётся."""
     if in_pos:
-        return {"ЗАКРЫТЬ": SYN_CLOSE + SYN_OUT + _side_syn(side, SYN_SELL, SYN_BUY),
-                "ЖДЁМ": SYN_WAIT + SYN_HOLD,
-                "ДОБРАТЬ": SYN_ADD + _side_syn(side, SYN_BUY, SYN_SELL),
-                "ПЕРЕВЕРНУТЬ": SYN_FLIP,
-                "НОВЫЙ_АНАЛИЗ": SYN_COUNCIL}
-    return {"КУПИТЬ_СЕЙЧАС": SYN_BUY, "ПРОДАТЬ_СЕЙЧАС": SYN_SELL, "ЖДЁМ": SYN_WAIT + SYN_OUT + SYN_HOLD,
-            "НОВЫЙ_АНАЛИЗ": SYN_COUNCIL}
+        return DecisionTable({"ЗАКРЫТЬ": SYN_CLOSE + SYN_OUT + _side_syn(side, SYN_SELL, SYN_BUY),
+                              "ЖДЁМ": SYN_WAIT + SYN_HOLD + SYN_TRAIL + ("НЕ_ЗАКРЫВАТЬ",),
+                              "ДОБРАТЬ": SYN_ADD + _side_syn(side, SYN_BUY, SYN_SELL),
+                              "ПЕРЕВЕРНУТЬ": SYN_FLIP,
+                              "НОВЫЙ_АНАЛИЗ": SYN_COUNCIL})
+    t = DecisionTable({"КУПИТЬ_СЕЙЧАС": SYN_BUY + ("ДОКУПИТЬ",), "ПРОДАТЬ_СЕЙЧАС": SYN_SELL,
+                       ENTRY_ANY: SYN_ENTER + SYN_AMBUSH})
+    if armed:
+        t[REVIEW_CANCEL] = SYN_CANCEL + SYN_UNARM + SYN_OUT + SYN_NO_ENTRY
+        t["ЖДЁМ"] = SYN_WAIT + SYN_HOLD
+    else:
+        t["ЖДЁМ"] = SYN_WAIT + SYN_OUT + SYN_HOLD + SYN_NO_ENTRY
+    t["НОВЫЙ_АНАЛИЗ"] = SYN_COUNCIL
+    t.side = (ENTRY_ANY, "КУПИТЬ_СЕЙЧАС", "ПРОДАТЬ_СЕЙЧАС", bool(sideless))
+    return t
 
 
 def door_table(side: str | None) -> dict[str, tuple[str, ...]]:
-    """Проверка входа у двери: BUY/LONG — «войти» только для плана лонга, SELL/SHORT — только для шорта."""
-    return {"ВОЙТИ": SYN_ENTER + _side_syn(side, SYN_BUY, SYN_SELL), "ЖДАТЬ": SYN_WAIT + SYN_OUT, "ОТМЕНИТЬ": SYN_CANCEL}
+    """Проверка входа у двери: BUY/LONG — «войти» только для плана лонга, SELL/SHORT — только для шорта. v5.4.4:
+    «ДЕРЖАТЬ (засаду)», «отложить», «повременить», «засада», «не сейчас», «пока нет», «ожидание» — ЖДАТЬ; условный вход
+    («ВОЙТИ на откате 296.6», «КУПИТЬ_НА_ПРОБОЕ», BUY_LIMIT, «ВОЙТИ позже», «ВОЙТИ, но на откате», «вход взведён») — ЖДАТЬ
+    (уровень — в entry ответа), а не вход по текущей цене; «ДА» — не ответ (как было)."""
+    t = DecisionTable({"ВОЙТИ": SYN_ENTER + _side_syn(side, SYN_BUY, SYN_SELL),
+                       "ЖДАТЬ": SYN_WAIT + SYN_OUT + SYN_HOLD + (
+                           "ДЕРЖАТЬ_ЗАСАДУ", "ОСТАВИТЬ_ЗАСАДУ", "ОТЛОЖИТЬ", "ОТКЛАДЫВАЕМ", "ПОВРЕМЕНИТЬ", "ЗАСАДА",
+                           "ЗАСАДУ", "НЕ_СЕЙЧАС", "ПОКА_НЕТ", "ПОЗЖЕ", "НЕ_СПЕШИТЬ", "ВХОД_ВЗВЕДЕН", "LATER", "NOT_YET"),
+                       "ОТМЕНИТЬ": SYN_CANCEL + SYN_UNARM})
+    t.cond = ("ВОЙТИ", "ЖДАТЬ")
+    return t
 
 
 def profit_table(side: str | None) -> dict[str, tuple[str, ...]]:
-    """Мысль о прибыли: «SELL» у лонга (и «BUY» у шорта) — выйти."""
-    return {"ВЫЙТИ": SYN_CLOSE + SYN_OUT + _side_syn(side, SYN_SELL, SYN_BUY), "ВЫЙТИ_И_ПЕРЕЗАЙТИ": SYN_REENTER,
-            "СОВЕТ": SYN_COUNCIL, "ДЕРЖАТЬ": SYN_HOLD + SYN_WAIT}
+    """Мысль о прибыли: «SELL» у лонга (и «BUY» у шорта) — выйти. v5.4.4: «подтянуть трос / стоп», «запереть прибыль» —
+    ДЕРЖАТЬ (замок — в lock_price); «ВЫЙТИ, ПЕРЕЗАЙТИ на …» — ВЫЙТИ_И_ПЕРЕЗАЙТИ; «звать совет» — СОВЕТ; «частично
+    выйти» — переспрос (частичного выхода нет)."""
+    t = DecisionTable({"ВЫЙТИ": SYN_CLOSE + SYN_OUT + _side_syn(side, SYN_SELL, SYN_BUY),
+                       "ВЫЙТИ_И_ПЕРЕЗАЙТИ": SYN_REENTER, "СОВЕТ": SYN_COUNCIL,
+                       "ДЕРЖАТЬ": SYN_HOLD + SYN_WAIT + SYN_TRAIL})
+    t.combine = {("ВЫЙТИ", "ВЫЙТИ_И_ПЕРЕЗАЙТИ"): "ВЫЙТИ_И_ПЕРЕЗАЙТИ"}
+    return t
 
 
 def guard_table() -> dict[str, tuple[str, ...]]:
-    """Мягкий стоп у троса: СЛИТЬ = выйти, ЖДАТЬ = держать и передать совету."""
-    return {"СЛИТЬ": SYN_CLOSE + SYN_OUT, "ЖДАТЬ": SYN_WAIT + SYN_HOLD}
+    """Мягкий стоп у троса: СЛИТЬ = выйти, ЖДАТЬ = держать и передать совету. v5.4.4: «СОВЕТ / звать совет», «НЕ
+    СЛИВАТЬ» — ЖДАТЬ (ожидание у троса и есть передача Совету); CUT / STOP_OUT — СЛИТЬ."""
+    return DecisionTable({"СЛИТЬ": SYN_CLOSE + SYN_OUT + ("CUT", "CUT_LOSS", "CUT_LOSSES", "STOP_OUT", "STOPOUT"),
+                          "ЖДАТЬ": SYN_WAIT + SYN_HOLD + SYN_COUNCIL + ("НЕ_СЛИВАТЬ",)})
 
 
 def take_table() -> dict[str, tuple[str, ...]]:
-    """Мягкий тейк: ЗАФИКСИРОВАТЬ = выйти, ПОДЕРЖАТЬ = держать."""
-    return {"ЗАФИКСИРОВАТЬ": SYN_CLOSE + SYN_OUT, "ПОДЕРЖАТЬ": SYN_HOLD + SYN_WAIT}
+    """Мягкий тейк: ЗАФИКСИРОВАТЬ = выйти, ПОДЕРЖАТЬ = держать (и передать Совету). v5.4.4: «звать совет» — ПОДЕРЖАТЬ
+    (молчание у тейка — фиксация по правилу, а «совет» — не молчание); «частично зафиксировать» — переспрос."""
+    return DecisionTable({"ЗАФИКСИРОВАТЬ": SYN_CLOSE + SYN_OUT, "ПОДЕРЖАТЬ": SYN_HOLD + SYN_WAIT + SYN_COUNCIL})
 
 
 def exec_table(in_pos: bool) -> dict[str, tuple[str, ...]]:
@@ -549,4 +760,27 @@ if __name__ == "__main__":
         "слово словаря целиком — не отрицание"
     assert decision_of("NO BUY", exec_table(False)) is None and decision_of("НЕ ВХОДИТЬ", door_table("long")) is None
     assert decision_raw({}) == "" and decision_raw("ВОЙТИ ") == "ВОЙТИ" and decision_raw({"choice": {"x": 1}}) == ""
+    # v5.4.4: эхо схемы, семейство ЗАСАДА (сторона словами / по уровням), ожидание и пас, ОТМЕНИТЬ при взведённом входе,
+    # «подтянуть трос» и «не закрывать» — держать, частичка — переспрос, условный вход у двери — ЖДАТЬ, «ДА» — не ответ
+    _r0, _rs, _ra = review_table(False), review_table(False, sideless=True), review_table(False, armed=True, sideless=True)
+    assert decision_of("КУПИТЬ | ПРОДАТЬ | НОВЫЙ_АНАЛИЗ | ЖДЁМ", _r0) is None and echo_of("ВОЙТИ/ОТМЕНИТЬ", door_table("long"))
+    assert decision_of("ЗАСАДА", _r0) is None and decision_of("ЗАСАДА", _rs) == ENTRY_ANY
+    assert decision_of("засада на покупку", _rs) == "КУПИТЬ_СЕЙЧАС" and decision_of("LIMIT SELL", _rs) == "ПРОДАТЬ_СЕЙЧАС"
+    assert side_by_levels({"entry": 99, "invalidation": 98}, 100) == "long" and side_by_levels({"invalidation": 102}, 100) == "short"
+    assert side_by_levels({"entry": 99, "invalidation": 98, "take": 97}, 100) is None, "уровни спорят — стороны нет"
+    assert ambush_of("ЗАСАДА у 99") and not ambush_of("КУПИТЬ — без засады") and partial_of("ЗАКРЫТЬ ПОЛОВИНУ")
+    assert decision_of("ОЖИДАНИЕ", _r0) == "ЖДЁМ" and decision_of("ПАС", _r0) == "ЖДЁМ" and decision_of("НЕТ ВХОДА", _r0) == "ЖДЁМ"
+    assert decision_of("ОТМЕНИТЬ", _r0) is None and decision_of("ОТМЕНИТЬ", _ra) == REVIEW_CANCEL
+    assert decision_of("СНЯТЬ ЗАСАДУ", _ra) == REVIEW_CANCEL and decision_of("ДЕРЖАТЬ", _ra) == "ЖДЁМ"
+    assert decision_of("ПОДТЯНУТЬ ТРОС", review_table(True, "long")) == "ЖДЁМ"
+    assert decision_of("НЕ ЗАКРЫВАТЬ", review_table(True, "long")) == "ЖДЁМ"
+    assert decision_of("ЗАКРЫТЬ ПОЛОВИНУ", review_table(True, "long")) is None
+    assert decision_of("ОТЛОЖИТЬ", door_table("long")) == "ЖДАТЬ" and decision_of("НЕ СЕЙЧАС", door_table("long")) == "ЖДАТЬ"
+    assert decision_of("ВОЙТИ на откате 99.5", door_table("long")) == "ЖДАТЬ" and decision_of("ДА", door_table("long")) is None
+    assert decision_of("ВЫЙТИ, ПЕРЕЗАЙТИ на 99.5", profit_table("long")) == "ВЫЙТИ_И_ПЕРЕЗАЙТИ"
+    assert decision_of("ЗВАТЬ СОВЕТ", profit_table("long")) == "СОВЕТ" and decision_of("ЧАСТИЧНО ВЫЙТИ", profit_table("long")) is None
+    assert decision_of("ЗАПЕРЕТЬ ПРИБЫЛЬ", profit_table("long")) == "ДЕРЖАТЬ"
+    assert decision_of("НЕ СЛИВАТЬ", guard_table()) == "ЖДАТЬ" and decision_of("CUT", guard_table()) == "СЛИТЬ"
+    assert decision_of("СОВЕТ", guard_table()) == "ЖДАТЬ" and decision_of("СОВЕТ", take_table()) == "ПОДЕРЖАТЬ"
+    assert decision_raw({"choice": ["КУПИТЬ"]}) == "КУПИТЬ" and decision_raw({"choice": ["КУПИТЬ", "ЖДЁМ"]}) == ""
     print("ai_v5 self-test OK:", s)

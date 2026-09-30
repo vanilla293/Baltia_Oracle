@@ -301,10 +301,17 @@ def test_same_level_does_not_wake_again_within_event_cool(fake):
         p._wake_watch(101.05)
         assert len(wakes(m)) == 1
         fired_ts = p._wake["fired"]
-        # PRO снова ЖДЁМ у 101 (снимок 101.05 → будильник вниз); цена 100.95 — тот же уровень, окно не прошло
+        # v5.4.4: PRO снова ЖДЁМ у 101, а снимок 101.05 — уровень у самой цены (0.05 % < 0.3 %): будильник не ставится,
+        # отказ виден (лестница будильников у цены будила PRO каждые несколько минут)
         p.prices.append(101.05)
         fake.queue("mission_review", {"choice": "ЖДЁМ", "why": "у 101 без объёма", "entry": 101.0})
         await p._review(101.05)
+        assert p._wake is None and "будильник не поставлен" in (m.reviews[-1].get("wake_refused") or ""), m.reviews[-1]
+        assert "код не принял: уровень 101 ближе 0.3 %" in p._situation_text(101.05)
+        # снимок 101.5 (уровень 101 — в 0.49 %) — будильник вниз ставится; цена 100.95 — тот же уровень, окно не прошло
+        p.prices.append(101.5)
+        fake.queue("mission_review", {"choice": "ЖДЁМ", "why": "у 101 без объёма", "entry": 101.0})
+        await p._review(101.5)
         assert p._wake and p._wake["dir"] == "down" and not p._wake["fired"]
         p._last_review_ts -= mission.EVENT_MIN_GAP_SEC + 60
         for px in (100.95, 101.06, 100.94):
