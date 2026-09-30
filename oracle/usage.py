@@ -9,7 +9,8 @@
 Отсюда дашборд и `/status` берут:
   • `record(...)`  — записать один вызов и вернуть его стоимость;
   • `summary(...)` — сводку за N дней (по маршрутам, дням и моделям);
-  • `balance(...)` — живой остаток на счёте DeepSeek (read-only, ключ не логируется).
+  • `balance(...)` — живой остаток на счёте DeepSeek (read-only, ключи не логируются;
+                    при нескольких ключах опрашивает каждый и помечает «живой»).
 
 Маршрут вызова помечается контекстным менеджером `route("deep")`: агент оборачивает
 им свои этапы, а `record` без явного `route` берёт текущий из контекста.
@@ -261,41 +262,77 @@ def _to_float(v: Any) -> float:
         return 0.0
 
 
-async def balance(cfg: Any, http: httpx.AsyncClient | None = None) -> dict | None:
-    """Остаток на счёте DeepSeek: {is_available, balances: [{currency, total}]} или None.
+async def _key_balance(client: httpx.AsyncClient, url: str, key: str,
+                       label: str = "") -> dict | None:
+    """Остаток по одному ключу: {is_available, balances: [{currency, total}]} или None при ошибке.
 
-    Работает только для DeepSeek (cfg.is_deepseek) и при наличии ключа. Любая сетевая/HTTP
-    ошибка → None (пишется в лог без ключа). Клиент можно подставить (тесты: MockTransport).
+    Ключ уходит только в заголовок запроса; в лог — никогда (лишь порядковый номер, если задан).
+    """
+    where = f" ({label})" if label else ""
+    try:
+        r = await client.get(url, headers={"Authorization": f"Bearer {key}",
+                                           "Accept": "application/json"})
+        if r.status_code != 200:
+            log.warning("баланс DeepSeek%s: HTTP %s", where, r.status_code)
+            return None
+        data = r.json()
+    except (httpx.HTTPError, ValueError) as e:
+        log.warning("баланс DeepSeek%s недоступен: %s", where, type(e).__name__)   # ключ не логируем
+        return None
+    infos = data.get("balance_infos") or []
+    balances = [{"currency": str(b.get("currency") or ""), "total": _to_float(b.get("total_balance"))}
+                for b in infos]
+    return {"is_available": bool(data.get("is_available")), "balances": balances}
+
+
+async def balance(cfg: Any, http: httpx.AsyncClient | None = None, *,
+                  live_index: int | None = None) -> dict | None:
+    """Остаток на счёте DeepSeek (read-only, ключи не логируются).
+
+    Один ключ → прежний контракт: {is_available, balances: [{currency, total}]} или None.
+
+    Несколько ключей (DEEPSEEK_API_KEY=k1,k2 — клиент уходит на запасной при 401/402): опрашиваем
+    каждый и добавляем разбивку `keys` [{index, live, is_available, balances}] с пометкой «живого».
+    Ошибка по конкретному ключу → его is_available/balances = None (остальные не страдают).
+    Верхний уровень (is_available/balances — его читает дашборд) показывает баланс живого ключа,
+    если он известен (live_index — это LLM._key_idx, см. cross_group), иначе первого доступного,
+    иначе первого ответившего — так на панели не всплывёт «ноль» мёртвого запасного ключа.
+
+    Работает только для DeepSeek (cfg.is_deepseek) и при наличии хотя бы одного ключа.
+    Клиент можно подставить (тесты: MockTransport).
     """
     if not getattr(cfg, "is_deepseek", False):
         return None
-    keys = getattr(cfg, "api_keys", ()) or ()
+    keys = tuple(getattr(cfg, "api_keys", ()) or ())
     if not keys:
         return None
-    key = keys[0]
     base = str(getattr(cfg, "llm_base_url", "https://api.deepseek.com")).rstrip("/")
     url = f"{base}/user/balance"
 
     own = http is None
     client = http or httpx.AsyncClient(timeout=httpx.Timeout(15.0))
     try:
-        r = await client.get(url, headers={"Authorization": f"Bearer {key}",
-                                           "Accept": "application/json"})
-        if r.status_code != 200:
-            log.warning("баланс DeepSeek: HTTP %s", r.status_code)
-            return None
-        data = r.json()
-    except (httpx.HTTPError, ValueError) as e:
-        log.warning("баланс DeepSeek недоступен: %s", type(e).__name__)   # ключ не логируем
-        return None
+        if len(keys) == 1:                       # один ключ — прежний контракт без разбивки
+            return await _key_balance(client, url, keys[0])
+        per_key = [await _key_balance(client, url, k, f"ключ №{i + 1}")
+                   for i, k in enumerate(keys)]
     finally:
         if own:
             await client.aclose()
 
-    infos = data.get("balance_infos") or []
-    balances = [{"currency": str(b.get("currency") or ""), "total": _to_float(b.get("total_balance"))}
-                for b in infos]
-    return {"is_available": bool(data.get("is_available")), "balances": balances}
+    live = live_index % len(keys) if isinstance(live_index, int) else None
+    entries = [{"index": i + 1, "live": i == live,
+                "is_available": (b["is_available"] if b else None),
+                "balances": (b["balances"] if b else None)}
+               for i, b in enumerate(per_key)]
+    # верхний уровень (совместимость с дашбордом): живой ключ, иначе первый с доступным счётом,
+    # иначе первый ответивший — чтобы не показать остаток мёртвого/пустого ключа
+    primary = per_key[live] if (live is not None and per_key[live]) else None
+    primary = primary or next((b for b in per_key if b and b["is_available"]), None)
+    primary = primary or next((b for b in per_key if b), None)
+    primary = primary or {"is_available": False, "balances": []}
+    return {"is_available": primary["is_available"], "balances": primary["balances"],
+            "keys": entries, "live_index": (live + 1) if live is not None else None}
 
 
 # ── хук для интегратора ───────────────────────────────────────────────────────

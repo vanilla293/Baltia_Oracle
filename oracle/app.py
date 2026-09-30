@@ -78,8 +78,13 @@ class TwinHint(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args if isinstance(record.args, tuple) else ()
         now = self._clock()
+        # args = (тип исключения, само исключение) — см. aiogram: "Failed to fetch updates - %s: %s".
+        # Conflict есть в имени типа (TelegramConflictError) и у второго поллера, и у оставшегося
+        # вебхука; различаем их по тексту ошибки (str(e) вебхука: «…webhook is active…»).
         if args and "Conflict" in str(args[0]):
             self._conflict_at = now
+            detail = str(args[1]) if len(args) > 1 else ""
+            webhook = "webhook" in detail.lower()
             if self._runtime is not None:
                 try:
                     self._runtime.note_conflict()
@@ -87,10 +92,16 @@ class TwinHint(logging.Filter):
                     pass
             if self._last is None or now - self._last > self.HINT_EVERY:
                 self._last = now
-                log.warning("Бот запущен дважды: с этим токеном работает ещё одна программа (старое окно бота, "
-                            "Pythia, другой компьютер). Пока она работает, часть сообщений и кнопок уходит ей. "
-                            "Закрой её — или в @BotFather /revoke и новый токен в BOT_TOKEN. "
-                            "(Повторы этой ошибки скрыты, напомню через 10 минут, если не пройдёт.)")
+                if webhook:
+                    log.warning("На токене остался вебхук — из-за него getUpdates не работает и я не вижу "
+                                "сообщений. Обычно снимаю его сам при старте; если это повторяется — открой в "
+                                "браузере https://api.telegram.org/bot<ТВОЙ_ТОКЕН>/deleteWebhook и перезапусти "
+                                "меня. (Повторы этой ошибки скрыты, напомню через 10 минут, если не пройдёт.)")
+                else:
+                    log.warning("Бот запущен дважды: с этим токеном работает ещё одна программа (старое окно бота, "
+                                "Pythia, другой компьютер). Пока она работает, часть сообщений и кнопок уходит ей. "
+                                "Закрой её — или в @BotFather /revoke и новый токен в BOT_TOKEN. "
+                                "(Повторы этой ошибки скрыты, напомню через 10 минут, если не пройдёт.)")
             return False
         msg = record.msg if isinstance(record.msg, str) else ""
         if msg.startswith("Sleep for") and self._conflict_at is not None \
@@ -228,6 +239,19 @@ def build_dispatcher(cfg: config.Settings, deps: Any, runtime: Any = None) -> An
     return dp
 
 
+async def clear_webhook(bot: Any) -> None:
+    """Снять вебхук перед опросом. Вебхук мог остаться на токене (когда-то вызвали setWebhook, токен
+    общий со старой «Пифией» — вебхуки переживают /revoke). Пока он активен, getUpdates бесконечно
+    отвечает 409, и бот, успешно пройдя whoami, «запущен», но не видит НИ ОДНОГО сообщения.
+    start_polling сам вебхук не снимает. Накопленные обновления не сбрасываем (drop_pending=False).
+    Нет вебхука — это no-op. Не вышло снять — только пишем в лог и работаем дальше."""
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception as e:
+        log.warning("не смог снять вебхук перед опросом (%s: %s) — если бот молчит на все сообщения, "
+                    "сними вебхук вручную (…/deleteWebhook) и перезапусти", type(e).__name__, e)
+
+
 async def whoami(bot: Any, *, first_delay: float = 2.0, max_delay: float = TELEGRAM_RETRY_MAX) -> Any:
     """Кто я в Telegram (bot.me() — запоминается, polling второй раз не спросит). Сети нет или Telegram
     лежит — ждём и повторяем, пока не ответит. Токен не принят → None."""
@@ -361,7 +385,10 @@ class DashboardStateImpl:
             log.debug("панель: расходы недоступны", exc_info=True)
         balance = None
         try:
-            balance = await usage.balance(self.cfg)
+            # какой ключ реально в работе (LLM переключается на запасной при 401/402) — чтобы
+            # панель показывала баланс живого ключа, а не мёртвого cfg.api_keys[0]
+            live = getattr(getattr(self.deps, "llm", None), "_key_idx", None)
+            balance = await usage.balance(self.cfg, live_index=live)
         except Exception:
             balance = None
         twins = rt.get("twins") or []
@@ -707,6 +734,8 @@ async def main() -> int:
                     await warn_owner(notifier, holders)
         except Exception:
             log.debug("проверка чужих держателей токена не удалась", exc_info=True)
+
+        await clear_webhook(bot)          # иначе getUpdates вечно отвечает 409 и бот «глухой»
 
         # сессию бота закрываем сами, в самом конце: дорабатывающим ответам она ещё нужна.
         # Параллельно ждём просьбу о перезапуске (панель): пришла — гасим поллер и выходим RESTART_CODE.

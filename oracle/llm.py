@@ -57,6 +57,7 @@ class LLMResponse:
     finish_reason: str = ""
     usage: dict = field(default_factory=dict)
     model: str = ""
+    thinking: bool = False       # ответ пришёл в режиме размышления (см. to_message)
 
     def to_message(self) -> dict:
         """Ассистентское сообщение для продолжения диалога (с tool_calls и reasoning_content)."""
@@ -65,8 +66,13 @@ class LLMResponse:
             msg["tool_calls"] = [
                 {"id": c.id, "type": "function", "function": {"name": c.name, "arguments": c.arguments}}
                 for c in self.tool_calls]
-            if self.reasoning:
-                msg["reasoning_content"] = self.reasoning
+            # DeepSeek в режиме размышления требует reasoning_content во ВСЕХ последующих
+            # ассистентских сообщениях с tool_calls — даже если размышление пустое: пропустишь
+            # его на одном шаге многошагового глубокого хода → следующий запрос падает с 400.
+            # Поэтому кладём поле всегда, когда ход был «думающим» (self.thinking), а не только
+            # когда размышление непустое.
+            if self.thinking or self.reasoning:
+                msg["reasoning_content"] = self.reasoning or ""
         return msg
 
 
@@ -262,12 +268,20 @@ class LLM:
                 if self._next_key(e, keys_tried):     # запасной ключ — сразу, без паузы
                     keys_tried += 1
                     continue
-                # глубокая модель недоступна (сняли с API) — один раз уходим на быструю
+                # глубокая модель недоступна (сняли с API) — один раз уходим на быструю.
+                # Пересобираем запрос целиком под быструю модель: иначе в payload остаётся
+                # reasoning_effort и нет thinking:{type:disabled}, и «быстрая» модель всё равно
+                # думает на полном effort с глубоким потолком токенов/таймаутом — минуты вместо секунд.
                 if e.kind == "model" and deep and not fell_back \
                         and payload["model"] != self.cfg.llm_model:
-                    log.warning("глубокая модель %s не принята — переключаюсь на %s",
+                    log.warning("глубокая модель %s не принята — переключаюсь на быструю %s",
                                 payload["model"], self.cfg.llm_model)
-                    payload["model"] = self.cfg.llm_model
+                    payload = self.build_payload(messages, tools=tools, deep=False, json_mode=json_mode,
+                                                 max_tokens=max_tokens, temperature=temperature,
+                                                 tool_choice=tool_choice, model=self.cfg.llm_model)
+                    if timeout is None:            # держим быстрый бюджет времени, а не глубокий
+                        limit = self.cfg.llm_fast_timeout
+                    deep = False
                     fell_back = True
                     continue
                 if e.fatal or attempt == self.RETRIES:
@@ -316,6 +330,14 @@ class LLM:
             return 5.0 * attempt
         return 2.0 * attempt
 
+    def _thinking(self, payload: dict) -> bool:
+        """Ушёл ли запрос в режим размышления (по собранному payload). Нужно для to_message:
+        у DeepSeek размышление включено по умолчанию и выключается только thinking:{type:disabled},
+        так что «думающим» считается любой DeepSeek-запрос, где размышление явно не выключили."""
+        if not (self.cfg.is_deepseek or _is_deepseek_model(payload.get("model", ""))):
+            return False
+        return payload.get("thinking") != {"type": "disabled"}
+
     async def _post(self, payload: dict) -> LLMResponse:
         http = await self._http()
         try:
@@ -332,7 +354,9 @@ class LLM:
             data = r.json()
         except ValueError:
             raise LLMError("ответ сервера — не JSON", status=r.status_code)
-        return self._parse(data, payload.get("model", ""))
+        resp = self._parse(data, payload.get("model", ""))
+        resp.thinking = self._thinking(payload)     # чтобы to_message вернул reasoning_content
+        return resp
 
     def _parse(self, data: dict, model: str) -> LLMResponse:
         choices = data.get("choices") or []

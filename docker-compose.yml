@@ -4,6 +4,12 @@
 #   поменял .env:        docker compose up -d --force-recreate
 #   обновил код:         docker compose up -d --build
 #   вход userbot:        docker compose run --rm oracle python -m oracle.userbot_login
+#
+# ВАЖНО: выбери ОДНО — либо Docker, либо start.sh/start.bat, но не оба сразу. Контейнер с
+# restart: unless-stopped работает в фоне невидимо; если потом запустить ещё и лаунчер, получится
+# ДВЕ копии на одном токене — ответы начнут прыгать между ними, а обе будут писать в один
+# ./data/oracle.db. Замок ./data/oracle.lock ловит и этот случай (одна из копий сразу выйдет).
+# Забыл, что где-то крутится Docker? Проверь: docker compose ps  — и погаси: docker compose down.
 services:
   oracle:
     build:

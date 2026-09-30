@@ -383,9 +383,13 @@ def fallback_text(d: dict) -> str:
 
 
 # ── главное ──────────────────────────────────────────────────────────────────
-async def morning_brief(ctx: ToolContext, *, mode: str = "morning") -> str:
+async def morning_brief(ctx: ToolContext, *, mode: str = "morning", strict: bool = False) -> str:
     """Утренняя сводка владельцу. mode="now" — сводка на остаток дня (для /today в любое время):
-    без «доброго утра» и без того, что уже прошло. Модель не ответила (LLMError или что угодно) — шаблон."""
+    без «доброго утра» и без того, что уже прошло. Модель не ответила (LLMError или что угодно) — шаблон.
+
+    strict=True (плановая рассылка): при временном сбое модели/сети НЕ подменяем шаблоном, а
+    пробрасываем ошибку, чтобы планировщик повторил сводку в окне догона (A6). Интерактивные пути
+    (/today, кнопка в панели) всегда получают шаблон — владелец ждёт ответ здесь и сейчас."""
     mode = mode if mode in _MODES else "morning"
     try:
         if mode == "now":
@@ -415,6 +419,11 @@ async def morning_brief(ctx: ToolContext, *, mode: str = "morning") -> str:
             return text
         log.warning("сводка: модель вернула пустоту — шлю шаблон")
     except Exception as e:
+        # плановую сводку при временном сбое (модель/сеть моргнули) пробрасываем — планировщик повторит
+        if strict:
+            from .scheduler import transient_job_error
+            if transient_job_error(e):
+                raise
         log.warning("сводка: модель не ответила (%s) — шлю шаблон", e)
     return fallback_text(d)
 

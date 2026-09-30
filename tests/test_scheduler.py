@@ -578,7 +578,7 @@ async def test_send_failure_gives_up_after_a_while(sctx, clock):
 def fake_brief(monkeypatch):
     calls = []
 
-    async def fake(ctx):
+    async def fake(ctx, **kw):
         calls.append(ctx)
         return "Доброе утро! Сегодня пусто — займись отчётом."
 

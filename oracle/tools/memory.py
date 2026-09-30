@@ -24,7 +24,7 @@ import re
 from typing import Any
 
 from .. import timeutil
-from ..db import normalize_text, stem, words
+from ..db import norm_key as _norm_key, normalize_text, stem, words
 from .base import ToolContext, tool
 
 log = logging.getLogger("oracle.tools.memory")
@@ -65,7 +65,6 @@ _STOP = frozenset({
     "the", "a", "an", "of", "to", "and", "or", "is",
 })
 _WORD = re.compile(r"[^\W_]+")          # буквы любых алфавитов и цифры: «Jānis» — одно слово
-_PUNCT = re.compile(r"[^\w\s]|_", re.U)
 # люди и родство: если две формулировки различаются таким словом — это факты о разных людях
 _PERSON_STEMS = frozenset(stem(w) for w in (
     "жена жены жене женой муж мужа мужу мужем сын сына сыну сыном дочь дочка дочки дочке дочери дочерью "
@@ -73,6 +72,15 @@ _PERSON_STEMS = frozenset(stem(w) for w in (
     "отец отца отцу бабушка бабушки дедушка дедушки друг друга другу подруга подруги коллега коллеги "
     "начальник начальника шеф теща тещи свекровь тесть свекор внук внука внучка внучки племянник "
     "племянница дядя тетя ребенок ребенка дети детей сосед соседка партнер партнерша девушка парень").split())
+# распространённые имена (основы): голосовая расшифровка пишет их с маленькой буквы («аня», «оля»),
+# и заглавную им проверять поздно. Список подобран без пересечений с обычными словами — иначе он
+# мешал бы объединять переформулировки. Не имя, но подлежащее в начале — ловит _lead_stem ниже.
+_NAME_HINTS = frozenset(stem(n) for n in (
+    "аня оля ира юля саша маша даша паша наташа настя кристина нина зина дина ваня дима гриша миша "
+    "сережа серёжа витя федя петр пётр павел анна ольга ирина юлия евгения александр александра мария "
+    "анастасия иван николай дмитрий василий григорий михаил сергей геннадий анатолий виктор константин "
+    "борис федор фёдор екатерина елена татьяна светлана валентина марина оксана инна алла лариса людмила "
+    "тамара валерий юрий егор максим антон никита кирилл андрей владимир олег игорь денис руслан").split())
 # мусорные слова из запросов «что ты помнишь про…», «найди…»
 _FILLER = frozenset({
     "про", "о", "об", "обо", "насчет", "что", "ты", "я", "мне", "мой", "моя", "мое", "мои", "моего",
@@ -105,10 +113,10 @@ def _as_int(v: Any, default: int) -> int:
 
 
 def norm(s: Any) -> str:
-    """Для сравнения формулировок: нижний регистр, ё→е, без пунктуации, одиночные пробелы."""
-    t = normalize_text(str(s or ""))
-    t = _PUNCT.sub(" ", t)
-    return " ".join(t.split())
+    """Для сравнения формулировок: нижний регистр, ё→е, без пунктуации, одиночные пробелы.
+    Тот же ключ, что и в колонке facts.norm_key (db.norm_key) — чтобы индексный поиск точного
+    дубля и сравнение в Python не разъезжались."""
+    return _norm_key(s)
 
 
 def stems(s: Any) -> set[str]:
@@ -119,14 +127,34 @@ def stems(s: Any) -> set[str]:
 
 
 def _name_stems(s: Any) -> set[str]:
-    """Основы слов с заглавной буквы (имена: «Маша», «Jānis»)."""
-    return {stem(normalize_text(t)) for t in _WORD.findall(str(s or "")) if t[:1].isupper()}
+    """Основы слов, похожих на имя человека: с заглавной буквы («Маша», «Jānis») ИЛИ из списка
+    распространённых имён в любом регистре («аня», «оля» из голосовой расшифровки)."""
+    out: set[str] = set()
+    for t in _WORD.findall(str(s or "")):
+        st = stem(normalize_text(t))
+        if t[:1].isupper() or st in _NAME_HINTS:
+            out.add(st)
+    return out
+
+
+def _lead_stem(s: Any) -> str:
+    """Основа первого значимого слова — подлежащего факта: «Аня…» → «аня», «Любит…» → «любит».
+    Служебные слова («не», «у») пропускаем: «Не любит…» и «Любит…» — про одного и того же."""
+    ws = words(str(s or ""))
+    for w in ws:
+        if w not in _STOP:
+            return stem(w)
+    return stem(ws[0]) if ws else ""
 
 
 def _about_other_person(a: str, b: str) -> bool:
-    """Формулировки различаются человеком (родство или имя) — это факты о разных людях, не почти-повтор."""
+    """Формулировки — о разных людях (не почти-повтор), если различаются родством или именем,
+    либо у них разное подлежащее в начале («аня не любит…» против «не любит…»). Разное подлежащее
+    ловит и незнакомые имена, которых нет в списке (иначе бы факт про Аню молча затёрся фактом про себя)."""
     diff = stems(a) ^ stems(b)
-    return bool(diff & _PERSON_STEMS or diff & (_name_stems(a) | _name_stems(b)))
+    if diff & _PERSON_STEMS or diff & (_name_stems(a) | _name_stems(b)):
+        return True
+    return _lead_stem(a) != _lead_stem(b)
 
 
 def jaccard(a: set[str], b: set[str]) -> float:
@@ -229,17 +257,23 @@ async def add_fact_ex(db, content: str, category: str = "general", source: str =
     src = source if source in SOURCES else "chat"
     now = _now_iso()
 
-    # 1) точный повтор
+    # 1) точный повтор — по индексу norm_key (WHERE norm_key=?), а не перебором всей таблицы:
+    # на нескольких тысячах фактов скан на каждый remember бил по задержке ответа и по ночной рефлексии
     key = norm(text)
-    for r in await db.fetchall("SELECT id, content, category FROM facts"):
-        if norm(r["content"]) == key:
-            new_cat = cat if cat != "general" else r["category"]
+    r = await db.fetchone(
+        "SELECT id, content, category FROM facts WHERE norm_key=? ORDER BY id LIMIT 1", (key,))
+    if r is not None:
+        new_cat = cat if cat != "general" else r["category"]
+        if new_cat != r["category"]:
+            async with db.transaction() as c:      # строка и её поисковый текст — одной транзакцией
+                await c.execute("UPDATE facts SET updated_at=?, category=? WHERE id=?", (now, new_cat, r["id"]))
+                await db.index_put_tx(c, "fact", r["id"], _fact_body(r["content"], new_cat))
+        else:
             await db.execute("UPDATE facts SET updated_at=?, category=? WHERE id=?", (now, new_cat, r["id"]))
-            if new_cat != r["category"]:
-                await db.index_put("fact", r["id"], _fact_body(r["content"], new_cat))
-            return {"id": int(r["id"]), "created": False, "replaced": None}
+        return {"id": int(r["id"]), "created": False, "replaced": None}
 
-    # 2) почти-повтор: та же мысль другими словами → новая формулировка вместо старой
+    # 2) почти-повтор: та же мысль другими словами → новая формулировка вместо старой.
+    # Кандидатов берём из поискового индекса (не из всей таблицы); о разном человеке — не сливаем.
     mine = stems(text)
     best: tuple[float, dict] | None = None
     for fid in await db.search("fact", text, 5):
@@ -254,17 +288,21 @@ async def add_fact_ex(db, content: str, category: str = "general", source: str =
     if best is not None:
         r = best[1]
         new_cat = cat if cat != "general" else r["category"]
-        await db.execute("UPDATE facts SET content=?, category=?, updated_at=? WHERE id=?",
-                         (text, new_cat, now, r["id"]))
-        await db.index_put("fact", r["id"], _fact_body(text, new_cat))
+        async with db.transaction() as c:          # содержимое, norm_key и индекс — вместе
+            await c.execute("UPDATE facts SET content=?, category=?, norm_key=?, updated_at=? WHERE id=?",
+                            (text, new_cat, key, now, r["id"]))
+            await db.index_put_tx(c, "fact", r["id"], _fact_body(text, new_cat))
         log.info("факт #%s переформулирован: %r → %r", r["id"], r["content"], text)
         return {"id": int(r["id"]), "created": False, "replaced": r["content"]}
 
-    # 3) новый
-    fid = await db.execute(
-        "INSERT INTO facts(content, category, source, created_at, updated_at) VALUES(?,?,?,?,?)",
-        (text, cat, src, now, now))
-    await db.index_put("fact", fid, _fact_body(text, cat))
+    # 3) новый — строку и её поисковый текст пишем одной транзакцией: убьют процесс между ними —
+    # индекс не разъедется (recall не потеряет и не переврёт факт)
+    async with db.transaction() as c:
+        cur = await c.execute(
+            "INSERT INTO facts(content, category, source, norm_key, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?)", (text, cat, src, key, now, now))
+        fid = int(cur.lastrowid or 0)
+        await db.index_put_tx(c, "fact", fid, _fact_body(text, cat))
     return {"id": fid, "created": True, "replaced": None}
 
 
@@ -408,10 +446,12 @@ async def upsert_opinion(db, *, topic: str, stance: str, reasons: str = "", conf
     by_id = await get_opinion(db, opinion_id) if opinion_id not in (None, "") else None
     row = by_id or await match_opinion(db, topic_s)
     if row is None:
-        oid = await db.execute(
-            "INSERT INTO opinions(topic, stance, reasons, confidence, history, created_at, updated_at) "
-            "VALUES(?,?,?,?,'[]',?,?)", (topic_s, stance_s, reasons_s, conf, now, now))
-        await db.index_put("opinion", oid, f"{topic_s} {stance_s}")
+        async with db.transaction() as c:          # строка позиции и её индекс — одной транзакцией
+            cur = await c.execute(
+                "INSERT INTO opinions(topic, stance, reasons, confidence, history, created_at, updated_at) "
+                "VALUES(?,?,?,?,'[]',?,?)", (topic_s, stance_s, reasons_s, conf, now, now))
+            oid = int(cur.lastrowid or 0)
+            await db.index_put_tx(c, "opinion", oid, f"{topic_s} {stance_s}")
         out = await get_opinion(db, oid) or {}
         out.update(changed=False, created=True)
         return out
@@ -426,10 +466,11 @@ async def upsert_opinion(db, *, topic: str, stance: str, reasons: str = "", conf
         new_reasons = reasons_s
     else:
         new_reasons = reasons_s or row["reasons"]
-    await db.execute(
-        "UPDATE opinions SET topic=?, stance=?, reasons=?, confidence=?, history=?, updated_at=? WHERE id=?",
-        (new_topic, stance_s, new_reasons, conf, json.dumps(history, ensure_ascii=False), now, row["id"]))
-    await db.index_put("opinion", row["id"], f"{new_topic} {stance_s}")
+    async with db.transaction() as c:              # содержимое позиции и её индекс — вместе
+        await c.execute(
+            "UPDATE opinions SET topic=?, stance=?, reasons=?, confidence=?, history=?, updated_at=? WHERE id=?",
+            (new_topic, stance_s, new_reasons, conf, json.dumps(history, ensure_ascii=False), now, row["id"]))
+        await db.index_put_tx(c, "opinion", row["id"], f"{new_topic} {stance_s}")
     out = await get_opinion(db, row["id"]) or {}
     out.update(changed=changed, created=False)
     if changed:

@@ -220,9 +220,11 @@ async def _need_project(db, ref: Any) -> dict:
     return p
 
 
-async def _index_project(db, p: dict) -> None:
-    await db.index_put("project", int(p["id"]),
-                       "\n".join(x for x in (p["name"], p.get("description") or "", p.get("goal") or "") if x))
+async def _index_project_tx(db, c, p: dict) -> None:
+    # проект и его текст в поиске пишем одной транзакцией вызывающего (A33): убьют процесс между
+    # записями — индекс не разъедется
+    await db.index_put_tx(c, "project", int(p["id"]),
+                          "\n".join(x for x in (p["name"], p.get("description") or "", p.get("goal") or "") if x))
 
 
 async def _active_duplicate(db, name: str, exclude_id: int | None = None) -> dict | None:
@@ -343,11 +345,13 @@ async def t_create_project(ctx: ToolContext, *, name: str, description: str | No
         raise ValueError(f"проект «{dup['name']}» уже есть (#{dup['id']}) — дополни его через "
                          f"update_project или add_task, а не заводи второй")
     now = _now_iso()
-    pid = await ctx.db.execute(
-        "INSERT INTO projects(name, description, goal, status, created_at, updated_at) "
-        "VALUES(?,?,?,'active',?,?)", (nm, (description or "").strip(), (goal or "").strip(), now, now))
-    p = await _get_project(ctx.db, pid)
-    await _index_project(ctx.db, p)
+    async with ctx.db.transaction() as c:          # проект и его строка в поиске — одной транзакцией (A33)
+        cur = await c.execute(
+            "INSERT INTO projects(name, description, goal, status, created_at, updated_at) "
+            "VALUES(?,?,?,'active',?,?)", (nm, (description or "").strip(), (goal or "").strip(), now, now))
+        pid = int(cur.lastrowid or 0)
+        p = await _get_project(ctx.db, pid)
+        await _index_project_tx(ctx.db, c, p)
     out = {"ok": True, "id": pid, "name": nm, "status": "active"}
     if not (goal or "").strip():
         out["hint"] = "цели нет — спроси, что считать результатом"
@@ -454,9 +458,10 @@ async def t_update_project(ctx: ToolContext, *, project: Any, name: str | None =
         raise ValueError("нечего менять — передай хотя бы одно поле")
     sets["updated_at"] = _now_iso()
     cols = ", ".join(f"{k}=?" for k in sets)
-    await ctx.db.execute(f"UPDATE projects SET {cols} WHERE id=?", (*sets.values(), p["id"]))
-    p = await _get_project(ctx.db, p["id"])
-    await _index_project(ctx.db, p)
+    async with ctx.db.transaction() as c:          # изменения проекта и переиндексация — одной транзакцией (A33)
+        await c.execute(f"UPDATE projects SET {cols} WHERE id=?", (*sets.values(), p["id"]))
+        p = await _get_project(ctx.db, p["id"])
+        await _index_project_tx(ctx.db, c, p)
     out = {"ok": True, "id": p["id"], "name": p["name"], "status": p["status"], "goal": p["goal"],
            "description": p["description"]}
     if p["status"] in ("done", "dropped"):

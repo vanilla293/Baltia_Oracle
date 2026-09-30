@@ -20,6 +20,7 @@ import os
 import re
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable
 
@@ -48,6 +49,8 @@ CREATE TABLE IF NOT EXISTS messages (
     summarized  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_messages_sum ON messages(summarized, id);
+-- рефлексия/тихая проверка фильтруют реплики по роли и времени — без индекса это скан всей таблицы
+CREATE INDEX IF NOT EXISTS ix_messages_role_time ON messages(role, created_at);
 
 -- конспекты старого диалога
 CREATE TABLE IF NOT EXISTS summaries (
@@ -64,6 +67,7 @@ CREATE TABLE IF NOT EXISTS facts (
     content     TEXT NOT NULL,
     category    TEXT NOT NULL DEFAULT 'general',  -- general | person | preference | plan | work | health | other
     source      TEXT NOT NULL DEFAULT 'chat',     -- chat | reflection | manual
+    norm_key    TEXT NOT NULL DEFAULT '',         -- нормализованная формулировка: точный дубль ищется индексом, а не сканом
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -222,6 +226,18 @@ def normalize_text(s: str) -> str:
     return (s or "").lower().replace("ё", "е")
 
 
+# пунктуация и подчёркивание — прочь: ключ сравнения формулировок не зависит от знаков
+_NORM_PUNCT = re.compile(r"[^\w\s]|_", re.U)
+
+
+def norm_key(s: Any) -> str:
+    """Нормализованный ключ формулировки: нижний регистр, ё→е, без пунктуации, одиночные пробелы.
+    Один источник и для сравнения в памяти (memory.norm), и для колонки facts.norm_key — иначе
+    индексный поиск точного дубля разъедется с тем, как дубль ищут в Python."""
+    t = _NORM_PUNCT.sub(" ", normalize_text(str(s or "")))
+    return " ".join(t.split())
+
+
 def words(s: str) -> list[str]:
     """Слова текста в нижнем регистре (ё → е) — как их режет поиск."""
     return _WORD.findall(normalize_text(s))
@@ -319,6 +335,8 @@ class DB:
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages'") == 0
             await self.conn.execute("PRAGMA journal_mode=WAL")
             await self.conn.execute("PRAGMA foreign_keys=ON")
+            # мгновенная блокировка (бэкап, второй читатель) — подождать до 5 с, а не падать «database is locked»
+            await self.conn.execute("PRAGMA busy_timeout=5000")
             await self.conn.executescript(SCHEMA)
             await self.conn.executescript(USAGE_SCHEMA)   # учёт расходов на модель (oracle.usage)
             try:
@@ -329,6 +347,7 @@ class DB:
                 await self.conn.execute(
                     "CREATE TABLE IF NOT EXISTS search_index (kind TEXT, ref_id INTEGER, body TEXT)")
             await self.conn.commit()
+            await self._ensure_facts_norm_key()
             await self._migrate(fresh)
             if self.path != ":memory:":        # WAL и shm SQLite создаёт с правами самой базы
                 for suffix in ("", "-wal", "-shm"):
@@ -372,6 +391,25 @@ class DB:
         async with self.conn.execute(sql) as cur:
             row = await cur.fetchone()
         return row[0] if row else None
+
+    async def _ensure_facts_norm_key(self) -> None:
+        """Колонка facts.norm_key и индекс по ней: точный дубль факта ищется индексом (WHERE norm_key=?),
+        а не перебором всей таблицы на каждый remember. Свежая база уже несёт колонку из SCHEMA — тут
+        только индекс; у старой базы колонку добавляем и один раз заполняем (norm_key нельзя посчитать
+        средствами SQL — та же нормализация, что в Python). Без bump user_version: шаг идемпотентный."""
+        assert self.conn is not None
+        async with self.conn.execute("PRAGMA table_info(facts)") as cur:
+            cols = [str(r[1]) for r in await cur.fetchall()]
+        if "norm_key" not in cols:
+            await self.conn.execute("ALTER TABLE facts ADD COLUMN norm_key TEXT NOT NULL DEFAULT ''")
+            async with self.conn.execute("SELECT id, content FROM facts") as cur:
+                rows = await cur.fetchall()
+            for r in rows:
+                await self.conn.execute("UPDATE facts SET norm_key=? WHERE id=?",
+                                        (norm_key(str(r[1] or "")), int(r[0])))
+            log.info("база: добавил facts.norm_key и заполнил %s строк", len(rows))
+        await self.conn.execute("CREATE INDEX IF NOT EXISTS ix_facts_norm ON facts(norm_key)")
+        await self.conn.commit()
 
     async def _migrate(self, fresh: bool) -> None:
         """Довести схему до SCHEMA_VERSION шагами из MIGRATIONS. Новая база создаётся сразу в последней
@@ -487,12 +525,18 @@ class DB:
         return await self.execute("DELETE FROM kv WHERE key=?", (key,)) > 0
 
     # ── поиск ──
+    async def index_put_tx(self, c: aiosqlite.Connection, kind: str, ref_id: int, body: str) -> None:
+        """То же, что index_put, но внутри уже открытой транзакции вызывающего (`db.transaction()`):
+        строка записи и её текст в поиске коммитятся вместе, поэтому индекс не разъезжается, если
+        процесс убьют между двумя записями (OOM, docker stop, потеря питания)."""
+        await c.execute("DELETE FROM search_index WHERE kind=? AND ref_id=?", (kind, ref_id))
+        await c.execute("INSERT INTO search_index(kind, ref_id, body) VALUES(?,?,?)",
+                        (kind, ref_id, normalize_text(body)))
+
     async def index_put(self, kind: str, ref_id: int, body: str) -> None:
-        """Положить/заменить текст записи в поисковый индекс."""
+        """Положить/заменить текст записи в поисковый индекс (отдельной транзакцией)."""
         async with self.transaction() as c:
-            await c.execute("DELETE FROM search_index WHERE kind=? AND ref_id=?", (kind, ref_id))
-            await c.execute("INSERT INTO search_index(kind, ref_id, body) VALUES(?,?,?)",
-                            (kind, ref_id, normalize_text(body)))
+            await self.index_put_tx(c, kind, ref_id, body)
 
     async def index_delete(self, kind: str, ref_id: int) -> None:
         await self.execute("DELETE FROM search_index WHERE kind=? AND ref_id=?", (kind, ref_id))
@@ -549,6 +593,47 @@ def _quick_check_ro(path: str) -> list[str] | None:
         return [str(e)]
     finally:
         conn.close()
+
+
+async def prune_old(db: "DB", *, keep_messages: int = 5000, keep_summaries: int = 2000,
+                    keep_days_usage: int = 180) -> dict[str, int]:
+    """Необязательная чистка истории, чтобы база не пухла годами. Вызывать из обслуживания
+    (ночью, не с горячего пути ответа) — сам по себе никто её не зовёт, чтобы ничего не удалить
+    без спроса. Режем только то, что не жалко:
+      • свёрнутые реплики (summarized=1) сверх последних keep_messages — их смысл уже в конспектах;
+        несвёрнутый (актуальный контекст) не трогаем никогда;
+      • конспекты сверх последних keep_summaries — вместе с их строками в поисковом индексе;
+      • строки учёта расходов (llm_usage) старше keep_days_usage дней.
+    Долговременную память (facts, opinions, journal) не трогаем. → сколько удалено по таблицам.
+
+    Значения ≤ 0 отключают чистку соответствующей таблицы (ничего не удаляется)."""
+    out = {"messages": 0, "summaries": 0, "llm_usage": 0}
+
+    if keep_messages > 0:
+        cutoff = await db.scalar(
+            "SELECT id FROM messages ORDER BY id DESC LIMIT 1 OFFSET ?", (int(keep_messages),))
+        if cutoff is not None:
+            out["messages"] = await db.execute(
+                "DELETE FROM messages WHERE summarized=1 AND id <= ?", (int(cutoff),))
+
+    if keep_summaries > 0:
+        cutoff = await db.scalar(
+            "SELECT id FROM summaries ORDER BY id DESC LIMIT 1 OFFSET ?", (int(keep_summaries),))
+        if cutoff is not None:
+            async with db.transaction() as c:      # строка и её индекс уходят вместе
+                await c.execute("DELETE FROM search_index WHERE kind='summary' AND ref_id IN "
+                                "(SELECT id FROM summaries WHERE id <= ?)", (int(cutoff),))
+                cur = await c.execute("DELETE FROM summaries WHERE id <= ?", (int(cutoff),))
+                out["summaries"] = int(cur.rowcount or 0)
+
+    if keep_days_usage > 0:
+        since = (now_utc().date() - timedelta(days=int(keep_days_usage) - 1)).isoformat()
+        with contextlib.suppress(Exception):       # таблицы может не быть на совсем свежей базе
+            out["llm_usage"] = await db.execute("DELETE FROM llm_usage WHERE day < ?", (since,))
+
+    if any(out.values()):
+        log.info("чистка истории: удалено %s", out)
+    return out
 
 
 async def open_db(path: str | Path) -> DB:

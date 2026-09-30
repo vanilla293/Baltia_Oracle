@@ -232,6 +232,26 @@ def is_transient(e: BaseException) -> bool:
     return isinstance(e, OSError) and not isinstance(e, (PermissionError, FileNotFoundError))
 
 
+def transient_job_error(e: BaseException) -> bool:
+    """Временный ли сбой ежедневной задачи: модель/сеть моргнули (таймаут, 429, 5xx, обрыв связи) —
+    в окне догона стоит повторить, а не хоронить сводку/дайджест на весь день. Постоянные ошибки
+    (нет/битый ключ, кончились деньги, нет такой модели, переполнен контекст, цензура) повторять
+    бессмысленно — о них сообщаем владельцу и закрываем задачу сразу; не ошибка модели (баг в коде) —
+    тоже не повторяем. LLMError отдаёт .fatal/.status/.kind."""
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    from ..llm import LLMError
+    if isinstance(e, LLMError):
+        if e.fatal or e.kind == "filtered":
+            return False
+        if e.kind == "timeout":
+            return True
+        if e.status is not None:
+            return e.status == 429 or e.status >= 500
+        return True     # нет статуса — обрыв связи/таймаут соединения/пустой ответ: повтор оправдан
+    return False
+
+
 # ── повторы: быстрый пересчёт ────────────────────────────────────────────────
 _PERIOD = {"MINUTELY": timedelta(minutes=1), "HOURLY": timedelta(hours=1),
            "DAILY": timedelta(days=1), "WEEKLY": timedelta(weeks=1)}
@@ -309,6 +329,7 @@ class Scheduler:
         self._job_tasks: dict[str, asyncio.Task] = {}
         self._job_retry_at: dict[str, datetime] = {}
         self._job_fails: dict[str, int] = {}
+        self._job_last_err: dict[str, str] = {}            # последний временный сбой задачи — для «сдаюсь» по истечении окна
         self._job_text: dict[tuple[str, date], str] = {}   # готовый текст сводки/дайджеста — для повтора
         self._job_sent: dict[tuple[str, date], list[int]] = {}   # …и сколько его кусков уже дошло
         self._last_summary: datetime | None = None
@@ -433,15 +454,17 @@ class Scheduler:
             log.exception("не записал недоставленное")
 
     async def _flush_undelivered(self, notifier: Any) -> None:
-        """Связь с владельцем есть — сказать, что раньше не дошло (один раз)."""
+        """Связь с владельцем есть — сказать, что раньше не дошло (один раз). Список чистим ТОЛЬКО после
+        удачной отправки: если и это уведомление не уйдёт (снова RetryAfter, обрыв), владелец не должен
+        молча потерять список — скажем при следующей удачной отправке."""
         try:
             items = await self.ctx.db.kv_get(UNDELIVERED_KEY)
             if not items:
                 return
-            await self.ctx.db.kv_delete(UNDELIVERED_KEY)
             lines = "\n".join(f"• {x}" for x in items if x)
             await asyncio.wait_for(notifier.send(f"⚠️ Раньше Telegram не принимал мои сообщения — "
                                                  f"не дошло:\n{lines}"), SEND_TIMEOUT)
+            await self.ctx.db.kv_delete(UNDELIVERED_KEY)      # только теперь — отправка удалась
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -786,6 +809,11 @@ class Scheduler:
             # дни рождения догоняем весь свой день: поздравление, потерянное в 9 утра, нужно и в 15:00
             if not (name == "birthdays" and day == today) and now - at > CATCH_UP:
                 await self.ctx.db.kv_set(key, day.isoformat())
+                err = self._job_last_err.pop(name, None)
+                if err and name in ("morning", "news"):
+                    # весь срок догона провозились с временным сбоем модели/сети — теперь сдаёмся и говорим прямо
+                    label = "сводку" if name == "morning" else "сводку новостей"
+                    await self._send_once(f"не собрал {label}: {err}")
                 self._job_retry_at.pop(name, None)
                 self._job_fails.pop(name, None)
                 log.info("ежедневная задача %s за %s пропущена: не вышло за %s", name, day, CATCH_UP)
@@ -822,6 +850,7 @@ class Scheduler:
             await self.ctx.db.kv_set(job_key(name), day.isoformat())
             self._job_retry_at.pop(name, None)
             self._job_fails.pop(name, None)
+            self._job_last_err.pop(name, None)
             return
         n = self._job_fails[name] = self._job_fails.get(name, 0) + 1
         pause = JOB_RETRY[min(n, len(JOB_RETRY)) - 1]
@@ -855,7 +884,9 @@ class Scheduler:
         try:
             if name == "morning":
                 from . import brief
-                text = await self._text_for(name, day, lambda: brief.morning_brief(ctx))
+                # strict=True: плановую сводку при временном сбое модели/сети НЕ подменяем шаблоном,
+                # а пробрасываем ошибку — пусть JOB_RETRY переберёт её в окне догона (A6)
+                text = await self._text_for(name, day, lambda: brief.morning_brief(ctx, strict=True))
                 if text:
                     if not await self._send_once(text, progress=self._job_sent.setdefault((name, day), [0])):
                         return False
@@ -883,12 +914,28 @@ class Scheduler:
                     log.info("рефлексия: агента нет — пропускаю")
                     return True
                 await agent.reflect()
+                # раз в сутки, не с горячего пути ответа: подрезаем историю, чтобы база не пухла
+                # годами (свёрнутые реплики, старые конспекты, старый учёт расходов). Память
+                # (факты/позиции/дневник) и актуальный контекст не трогаются. Ошибка чистки не должна
+                # заваливать саму рефлексию — рефлексия уже прошла, повторять её из-за неё не надо.
+                try:
+                    from .. import db as dbmod
+                    await dbmod.prune_old(ctx.db, keep_messages=5000, keep_summaries=2000,
+                                          keep_days_usage=180)
+                except Exception as e:
+                    log.warning("чистка истории не вышла: %s", _err(e))
             else:
                 log.warning("неизвестная ежедневная задача %s", name)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log.exception("ежедневная задача %s упала", name)
+            if transient_job_error(e):
+                # временный сбой (модель/сеть моргнули): задачу сделанной НЕ помечаем и «не собрал» не шлём —
+                # пусть JOB_RETRY переберёт её в окне догона, вдруг модель оживёт через пару минут
+                self._job_last_err[name] = _err(e)
+                return False
+            # постоянная ошибка — повтор не поможет: скажем владельцу прямо и закроем задачу на сегодня
             if name == "morning":
                 await self._send_once(f"не собрал сводку: {_err(e)}")
             elif name == "news":

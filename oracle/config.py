@@ -392,12 +392,17 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
     api_key = (ds_key or other_key) if "deepseek" in base_url.lower() else (other_key or ds_key)
     # OWNER_ID — один человек: берём первое положительное число, остальное молча игнорируем
     # (старый формат «id1,id2» больше не заводит второе пространство — версия на одного)
+    raw_owner = _get("OWNER_ID", "")
     owner_id = 0
-    for part in re.split(r"[,;\s]+", _get("OWNER_ID", "")):
+    owner_has_int = False            # встретилось хоть одно число (иначе OWNER_ID — не число: @имя, ФИО)
+    for part in re.split(r"[,;\s]+", raw_owner):
+        if not part:
+            continue
         try:
             v = int(part)
         except ValueError:
             continue
+        owner_has_int = True
         if v > 0:
             owner_id = v
             break
@@ -406,6 +411,10 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
     api_key = api_keys[0] if api_keys else ""
 
     warnings: list[str] = []
+    # OWNER_ID вписан, но там не число (@имя, отображаемое имя) — не молчим: без этого бот тихо ушёл бы
+    # в режим настройки и отвечал бы владельцу «я ещё не настроен», хотя тот OWNER_ID задал
+    if raw_owner and not owner_has_int:
+        warnings.append(f"OWNER_ID={raw_owner!r} — не число; пришли боту /start и впиши числовой id")
     raw_fast = _get("LLM_FAST_THINKING", "off")
     fast_thinking, ok = clean_effort(raw_fast, fast=True)
     if not ok:

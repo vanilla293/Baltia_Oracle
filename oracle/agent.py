@@ -75,12 +75,14 @@ REFLECT_REASONS_MAX = 150    # доводы позиции в материале
 # время
 MIN_STEP_SEC = 5.0           # меньше осталось от бюджета хода — новый шаг не начинаем
 SLOW_NOTICE_SEC = 20.0       # модель молчит дольше — сказать владельцу, что ждём
+DEEP_SLOW_NOTICE_SEC = 60.0  # в глубоком режиме порог выше: там долгий ответ — норма, но совсем молчать нельзя
 QUEUE_NOTICE_SEC = 3.0       # сообщение ждёт прошлый ход дольше — сказать, что оно в очереди
 LATE_AFTER_SEC = 60.0        # отстояло в очереди дольше — модели сообщается время прихода
 SLOW_TEXT = "⏳ Отвечаю дольше обычного — DeepSeek (или сеть) медлит, жду. Если не дождусь, напишу, что случилось."
+DEEP_SLOW_TEXT = "⏳ Ещё думаю над этим в глубоком режиме — это может занять несколько минут, не пропал."
 QUEUE_TEXT = "⏳ Ещё дорешиваю прошлое сообщение — это в очереди, отвечу следом."
 OUT_OF_TIME = "⏳ Не успел договорить: DeepSeek медлит, а время на ответ вышло."
-ESCALATE_TEXT = "🧠 Тут надо подумать как следует — включаю глубокий режим, это до пары минут."
+ESCALATE_TEXT = "🧠 Тут надо подумать как следует — включаю глубокий режим, это может занять несколько минут."
 THINK_DEEPER = "think_deeper"
 # не инструмент из реестра, а сигнал агенту: быстрая модель сама решает, что вопрос ей не по зубам
 THINK_DEEPER_SCHEMA = {"type": "function", "function": {
@@ -584,8 +586,9 @@ class TurnGuard:
 class Agent:
     """Мозг бота. Один на процесс; регистрирует себя в `ctx.services.agent`."""
 
-    slow_notice_after = SLOW_NOTICE_SEC     # через сколько секунд молчания модели сказать «медлит»
-    queue_notice_after = QUEUE_NOTICE_SEC   # через сколько секунд ожидания в очереди сказать об этом
+    slow_notice_after = SLOW_NOTICE_SEC          # через сколько секунд молчания модели сказать «медлит»
+    deep_slow_notice_after = DEEP_SLOW_NOTICE_SEC  # то же для глубокого режима (порог выше)
+    queue_notice_after = QUEUE_NOTICE_SEC        # через сколько секунд ожидания в очереди сказать об этом
 
     def __init__(self, ctx: ToolContext):
         self.ctx = ctx
@@ -643,7 +646,11 @@ class Agent:
         try:
             if deep is None:
                 deep_v = await self._deep_mode()
-            if not deep_v:                    # о глубоком режиме бот и так предупредил («пару минут»)
+            # молчать нельзя ни в быстром, ни в глубоком режиме: в глубоком порог выше и текст честнее
+            # («несколько минут»), но признак жизни владелец получает и там — иначе выглядит как зависание
+            if deep_v:
+                slow = self._notice_later(self.deep_slow_notice_after, DEEP_SLOW_TEXT)
+            else:
                 slow = self._notice_later(self.slow_notice_after, SLOW_TEXT)
             await self.db.add_message("user", text, via if via in ("text", "voice") else "text")
             extra = [VOICE_NOTE] if via == "voice" else []
@@ -666,8 +673,9 @@ class Agent:
                     log.info("ход: быстрая модель передала вопрос глубокой (%s)", esc.reason)
                     deep_v = True
                     await _stop(slow)
-                    slow = None
                     await self._say(ESCALATE_TEXT)
+                    # глубокая половина эскалации тоже не должна молчать — свой признак жизни
+                    slow = self._notice_later(self.deep_slow_notice_after, DEEP_SLOW_TEXT)
                     system = await self._system(text, deep=True, extra="\n".join(extra))
                     msgs = await self._history(system, fallback=text, owner_urls=set())
                     with usage.route("deep"):
@@ -1071,12 +1079,10 @@ class Agent:
                 await c.execute(
                     "UPDATE messages SET summarized=1 WHERE summarized=0 AND id BETWEEN ? AND ?",
                     (first["id"], last["id"]))
-            # в индекс — после транзакции (index_put берёт ту же блокировку записи): recall найдёт
-            # решённое неделю назад, хотя в промпт идут только последние конспекты
-            try:
-                await db.index_put("summary", int(sid), content)
-            except Exception:
-                log.exception("конспект #%s не попал в поиск", sid)
+                # конспект и его текст в поиске коммитятся одной транзакцией: убьют процесс между
+                # записями (OOM, docker stop, потеря питания) — индекс не разъедется (A33). recall найдёт
+                # решённое неделю назад, хотя в промпт идут только последние конспекты
+                await db.index_put_tx(c, "summary", int(sid), content)
             log.info("свернул реплики #%s–#%s в конспект", first["id"], last["id"])
             return True
 
@@ -1110,17 +1116,35 @@ class Agent:
                       .replace("{owner}", f" ({owner})" if owner else ""))
             if persona.is_female(getattr(cfg, "owner_gender", "m")):
                 system += "\n" + persona.FEMALE_NOTE
-            try:
-                with usage.route("reflect"):
-                    data = await self.llm.ask_json(system, user, deep=True)
-            except LLMError as e:
-                log.warning("рефлексия: модель не ответила: %s", e)
-                return None
-            except ValueError as e:
-                log.warning("рефлексия: ответ не JSON: %s", e)
-                return None
+            # JSON-режим вместе с размышлением у DeepSeek ненадёжен (может вернуть пустое или 400),
+            # поэтому пробуем глубоко, а если не вышло — тем же промптом без размышления: быстрая
+            # модель JSON держит стабильно. Лучше дневник от быстрой модели, чем молча пропущенная ночь.
+            data = None
+            retry: LLMError | None = None    # временный сбой на последней попытке — планировщику стоит повторить
+            for deep in (True, False):
+                retry = None
+                try:
+                    with usage.route("reflect"):
+                        data = await self.llm.ask_json(system, user, deep=deep)
+                except LLMError as e:
+                    log.warning("рефлексия: модель не ответила (%s): %s", "глубоко" if deep else "быстро", e)
+                    from .services.scheduler import transient_job_error
+                    if transient_job_error(e):
+                        retry = e
+                    continue
+                except ValueError as e:
+                    log.warning("рефлексия: ответ не JSON (%s): %s", "глубоко" if deep else "быстро", e)
+                    continue
+                if isinstance(data, dict):
+                    break
+                log.warning("рефлексия: ответ не объект (%s): %r", "глубоко" if deep else "быстро", str(data)[:200])
+                data = None
             if not isinstance(data, dict):
-                log.warning("рефлексия: ответ не объект: %r", str(data)[:200])
+                # обе попытки провалились, причём последняя — по временному сбою модели/сети: пусть
+                # планировщик повторит рефлексию в окне догона, а не хоронит ночь молча (A6). Постоянные
+                # ошибки (нет ключа, 400, не-JSON) повторять бессмысленно — просто None.
+                if retry is not None:
+                    raise retry
                 return None
             return await self._persist_reflection(data, max_followups=max_followups)
 

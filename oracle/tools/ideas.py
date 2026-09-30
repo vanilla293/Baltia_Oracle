@@ -203,9 +203,11 @@ async def recent_ideas(db, status: str | None = None, limit: int = 15) -> list[d
     return await db.fetchall("SELECT * FROM ideas ORDER BY updated_at DESC, id DESC LIMIT ?", (lim,))
 
 
-async def _reindex(db, row: dict) -> None:
+async def _reindex_tx(db, c, row: dict) -> None:
+    # строку идеи и её текст в поиске пишем одной транзакцией вызывающего (A33): убьют процесс между
+    # записями — индекс не разъедется, идея останется находимой по своим словам
     body = " ".join(str(row.get(k) or "") for k in ("title", "content", "tags", "evaluation"))
-    await db.index_put("idea", row["id"], body)
+    await db.index_put_tx(c, "idea", row["id"], body)
 
 
 async def _idea_or_fail(db, idea_id: Any) -> dict:
@@ -459,11 +461,13 @@ async def t_save_idea(ctx: ToolContext, *, title: str, content: str, evaluation:
     sc = clean_score(score)
     tags_s = clean_tags(tags)
     now = _now_iso()
-    iid = await ctx.db.execute(
-        "INSERT INTO ideas(title, content, evaluation, score, tags, status, created_at, updated_at) "
-        "VALUES(?,?,?,?,?,'new',?,?)", (title_s, content_s, eval_s, sc, tags_s, now, now))
-    row = await load_idea(ctx.db, iid) or {}
-    await _reindex(ctx.db, row)
+    async with ctx.db.transaction() as c:          # идея и её строка в поиске — одной транзакцией (A33)
+        cur = await c.execute(
+            "INSERT INTO ideas(title, content, evaluation, score, tags, status, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,'new',?,?)", (title_s, content_s, eval_s, sc, tags_s, now, now))
+        iid = int(cur.lastrowid or 0)
+        row = await load_idea(ctx.db, iid) or {}
+        await _reindex_tx(ctx.db, c, row)
     await _mirror(ctx, row)                       # зеркалим идею markdown-файлом в рабочей папке
     ctx.outbox.append(OutItem(kind="text", text=f"💡 Идея #{iid} «{title_s}» сохранена · {sc}/10",
                               buttons=deep_buttons(iid)))
@@ -566,13 +570,14 @@ async def t_update_idea(ctx: ToolContext, *, id: Any, title: str | None = None, 
     if not changed:
         raise ValueError("нечего менять — передай хотя бы одно поле: title, content, note, status, tags, score")
     now = _now_iso()
-    await ctx.db.execute(
-        "UPDATE ideas SET title=?, content=?, status=?, tags=?, score=?, updated_at=? WHERE id=?",
-        (new["title"], new["content"], new["status"], new["tags"], new["score"], now, row["id"]))
-    if "status" in changed:          # статус сменили руками — прежний статус из пометки разбора устарел
-        await ctx.db.execute("DELETE FROM kv WHERE key=?", (DEEP_KEY.format(row["id"]),))
-    fresh = await load_idea(ctx.db, row["id"]) or new
-    await _reindex(ctx.db, fresh)
+    async with ctx.db.transaction() as c:          # правка идеи и переиндексация — одной транзакцией (A33)
+        await c.execute(
+            "UPDATE ideas SET title=?, content=?, status=?, tags=?, score=?, updated_at=? WHERE id=?",
+            (new["title"], new["content"], new["status"], new["tags"], new["score"], now, row["id"]))
+        if "status" in changed:      # статус сменили руками — прежний статус из пометки разбора устарел
+            await c.execute("DELETE FROM kv WHERE key=?", (DEEP_KEY.format(row["id"]),))
+        fresh = await load_idea(ctx.db, row["id"]) or new
+        await _reindex_tx(ctx.db, c, fresh)
     return {"ok": True, "id": fresh["id"], "title": fresh["title"], "status": fresh["status"],
             "tags": fresh["tags"], "score": fresh["score"], "changed": changed}
 

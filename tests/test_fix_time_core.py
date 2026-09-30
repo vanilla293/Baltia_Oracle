@@ -217,7 +217,7 @@ async def test_morning_brief_recorded_only_after_delivery(ctx, clock, monkeypatc
     jobs(ctx, morning_brief_time="08:00")
     made = []
 
-    async def fake(c):
+    async def fake(c, **kw):
         made.append(1)
         return "Доброе утро! Сегодня пусто."
 
@@ -239,7 +239,7 @@ async def test_morning_brief_recorded_only_after_delivery(ctx, clock, monkeypatc
 async def test_morning_brief_gives_up_after_catch_up_window(ctx, clock, monkeypatch):
     jobs(ctx, morning_brief_time="08:00")
 
-    async def fake(c):
+    async def fake(c, **kw):
         return "сводка"
 
     monkeypatch.setattr(brief, "morning_brief", fake)
@@ -263,7 +263,7 @@ async def test_daily_job_cancelled_mid_run_reruns_after_restart(ctx, clock, monk
     jobs(ctx, morning_brief_time="08:00")
     gate = asyncio.Event()
 
-    async def slow(c):
+    async def slow(c, **kw):
         await gate.wait()
         return "сводка"
 
