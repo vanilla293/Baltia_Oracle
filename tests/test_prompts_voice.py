@@ -15,6 +15,9 @@ v5.4.3 «РЕШИТЕЛЬНЫЙ ПИЛОТ» (воля владельца 30.09.
 через цену ожидания, засаду у уровня, порядок вариантов и требование числа (не голым «будь агрессивнее»): доктрина —
 спор сигналов не повод стоять, у ожидания тоже цена, ожидаемый итог лучших ходов; «ждёшь пробоя» — засада, а не
 ЖДЁМ/WAIT; ожидание и удержание в списках последними; метки перепроверки без «_СЕЙЧАС» (канон кода прежний).
+Ревью 5.4.3: промпт обещает только то, что делает код (будильник — поле entry, ДЕРЖАТЬ — новые числа или null, трос —
+hold_until_price как новый триггер, засада совета — дверь и срок, итог совета — перевод 1:1, прокол — толкование школы);
+подробно — tests/test_review543_prompts.py.
 Без сети: ИИ не зовётся (money_json — на подменённых pro_json/flash_json)."""
 import asyncio
 
@@ -169,8 +172,9 @@ def test_decisive_tilt_543():
     # перепроверка: ждать пробоя — засада, ЖДЁМ с числом, описание рынка — не решение, entry при ЖДЁМ — будильник
     sr, _ = MISSION["review"]
     for piece in ("это засада", "а не ЖДЁМ", "описание рынка, а не решение", "будильник", "почему не засада",
-                  "уровень числом или время МСК", "в диапазоне играют от границ", "invalidation обязателен",
-                  "а не потому, что картина неясна", "на ближайшие 30 мин", "трос и тейк встанут туда"):
+                  "какое число (уровень или время МСК) изменит решение", "в диапазоне играют от границ",
+                  "invalidation обязателен", "а не потому, что картина неясна", "на ближайшие 30 мин",
+                  "не меняешь — null: прежние числа не повторяй"):
         assert piece in sr, piece
     assert "КУПИТЬ_СЕЙЧАС" not in sr and "ПРОДАТЬ_СЕЙЧАС" not in sr
     # списки choice: ожидание / удержание последними во всех режимах, «_СЕЙЧАС» в метках нет, всё разбирается в канон
@@ -198,14 +202,14 @@ def test_decisive_tilt_543():
     assert "назови lock_price" in sp and "а не просто спорная картина" in sp and "ни один ответ не выбор по умолчанию" in sp
     assert "Выйти, выйти и перезайти, держать или звать совет?" in up
     # приказ: «войти, если пробьёт X» — BUY/SELL с засадой, а не WAIT; WAIT — с числом; invalidation для входа обязателен
-    assert "а не WAIT" in pm.EXEC_RULE and "засаду пилот исполнит сам" in pm.EXEC_RULE
+    assert "а не WAIT" in pm.EXEC_RULE and "исполнит сам" not in pm.EXEC_RULE and "(засада)" in pm.EXEC_RULE
     assert "уровень числом и/или время МСК" in pm.EXEC_RULE and "«подтверждение» — только с числом" in pm.EXEC_RULE
     assert "при проходе которых разбудить дежурного PRO" in pm.EXEC_RULE and '"levels":[число]' in pm.EXEC_SCHEMA
     assert "что изменит решение" in pm.EXEC_SCHEMA and "чего ждём" not in pm.EXEC_SCHEMA and "что отменяет идею" in pm.EXEC_SCHEMA
     assert "invalidation обязателен для BUY/SELL" in MISSION["exec_order"][0]
     # вердикт, анализ и критика миссии: ждать пробоя — вход на пробитии; «вне рынка» — с числом; упущенный ход в %
     sv = MISSION["verdict"][0]
-    assert "пилот исполнит его сам, а не «вне рынка»" in sv and "какое число изменит решение" in sv
+    assert "а не «вне рынка»: засаду пилот взведёт сам" in sv and "какое число изменит решение" in sv
     assert "что отменяет план" in sv and "чего ждёшь" not in sv and "подтверждение, время" not in sv
     assert "ждёшь пробоя или отката — дай уровень входа, стоп и цель" in MISSION["analysis"][0]
     sc = MISSION["critique"][0]
@@ -215,6 +219,7 @@ def test_decisive_tilt_543():
     # трос, тейк, триаж: ожидание не бесплатно
     sg = MISSION["stop_guard"][0]
     assert "докажи числами" in sg and "иначе это надежда, а не картина" in sg and "назови hold_until_price" in sg
+    assert "слом докажи числами" in sg, "бремя чисел у обоих ответов троса"
     assert "можешь назвать новый уровень" not in sg
     assert "lock_price обязателен" in MISSION["take_guard"][0]
     st = MISSION["event_triage"][0]
@@ -226,14 +231,15 @@ def test_decisive_tilt_543():
     for name in ("analysis_daily", "analysis_update", "analysis_human", "critique", "verdict"):
         s = COUNCIL[name][0]
         assert "нет данных по слою — скажи и решай по тому, что есть" in s and "так и скажи" not in s, name
-    # совет: идея со стороной и уровнем — вход с триггером, а не «смотреть»; итог кладёт её в picks
+    # совет: идея со стороной и уровнем — вход с триггером, а не «смотреть» (решает председатель); итог переводит 1:1
     svc, ssc, scc = COUNCIL["verdict"][0], COUNCIL["summary"][0], COUNCIL["critique"][0]
     assert "только идеи без стороны" in svc and "это вход с триггером, а не «смотреть»" in svc and "уровень входа числом" in svc
-    assert "даже если вердикт назвал её «смотреть»" in ssc and "в обе стороны с равным усердием" in scc and "«ждать пробоя»" in scc
+    assert "даже если вердикт назвал её «смотреть»" not in ssc and "это перевод, не оценка" in ssc
+    assert "в обе стороны с равным усердием" in scc and "«ждать пробоя»" in scc
     # прокол: одна оговорка-критерий у всех ролей, без голого «или ложный прокол»
     assert all(pm.PUNCTURE_FALSE in v for v in pm.PUNCTURE_ROLES.values())
     assert not any("или ложный прокол" in v for v in pm.PUNCTURE_ROLES.values())
-    assert "засада за полосой опоздает" in pm.PUNCTURE_ROLES["вне рынка"]
+    assert "засада" not in pm.PUNCTURE_ROLES["вне рынка"] and "засада за полосой может не успеть" in pm.PUNCTURE_SCHOOL
 
 
 def test_guards_ask_by_picture_not_by_rule():
