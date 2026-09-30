@@ -7,6 +7,10 @@ build()  — полное досье биржи (pipeline.collect_dossier → re
            методы старой Пифии 4.x, каждый готовым текстом для ИИ:
              wyckoff_text          — Вайкофф D1/H1: бокс (лёд/крик), «куда
                                      ближе», расстояния до событий;
+             wyckoff_box           — края боксов по TF (ревью 5.4.3): миссия
+                                     хранит их с временем и ценой совета —
+                                     перепроверка видит расстояния от текущей
+                                     цены (render_wyckoff_now);
              xray / xray_text      — рентген стакана (microstructure.xray_live);
              reactor / reactor_text — реактор неба (reactor_sky);
              calendar / calendar_text — календарь Матьё + тег плотности среды;
@@ -209,6 +213,33 @@ WYCKOFF_SCHOOL = ("Как читают (школа Вайкоффа): сприн
                   "бокс, тем длиннее ход из него; усилие без результата — поглощение.")
 
 
+def _box_pos(lo: float, hi: float, p: float) -> str:
+    """«на 54% высоты бокса» (+ «— НАД криком / ПОД льдом, вне бокса») — положение цены p в боксе lo…hi."""
+    pos = (p - lo) / (hi - lo) * 100.0
+    s = f"на {pos:.0f}% высоты бокса"
+    if pos > 100:
+        s += " — НАД криком, вне бокса"
+    elif pos < 0:
+        s += " — ПОД льдом, вне бокса"
+    return s
+
+
+def _box_dist(lo: float, hi: float, box_atr: float, p: float) -> str:
+    """«до льда −1.33% (−4, ~1.5 ATR), до крика +1.33% (+4, ~1.5 ATR) → ближе к …» — от цены p до краёв бокса;
+    ATR этого TF в цене — ширина бокса / box_atr (нет box_atr — без ATR). Числа только из бокса и цены."""
+    atr = (hi - lo) / box_atr if box_atr > 0 else None
+    d_ice, d_creek = lo - p, hi - p
+
+    def _d(dv: float) -> str:
+        s = f"{dv / p * 100:+.2f}% ({dv:+.10g}"
+        if atr:
+            s += f", ~{abs(dv) / atr:.1f} ATR"
+        return s + ")"
+    near = ("льду" if abs(d_ice) < abs(d_creek) else
+            "крику" if abs(d_creek) < abs(d_ice) else "середине (равноудалена)")
+    return f"до льда {_d(d_ice)}, до крика {_d(d_creek)} → ближе к {near}"
+
+
 def _wyckoff_tf(w: dict, tf: str, price) -> list[str]:
     lo, hi = _f(w.get("box_low")), _f(w.get("box_high"))
     p = _f(price) or _f(w.get("last_close"))
@@ -217,27 +248,11 @@ def _wyckoff_tf(w: dict, tf: str, price) -> list[str]:
          f"bias {bias:+d} (−100…+100)"]
     box_atr = _f(w.get("box_atr"), 0.0) or 0.0
     box_ok = lo is not None and hi is not None and hi > lo
-    atr = (hi - lo) / box_atr if (box_ok and box_atr > 0) else None   # ATR этого TF в цене
     if box_ok and p:
-        pos = (p - lo) / (hi - lo) * 100.0
-        line = (f"бокс: лёд {_fp(lo)} … крик {_fp(hi)} (ширина {(hi - lo) / p * 100:.2f}%"
-                + (f", ≈ {box_atr:g} ATR" if box_atr > 0 else "")
-                + f"); цена {_fp(p)} на {pos:.0f}% высоты бокса")
-        if pos > 100:
-            line += " — НАД криком, вне бокса"
-        elif pos < 0:
-            line += " — ПОД льдом, вне бокса"
-        L.append(line)
-        d_ice, d_creek = lo - p, hi - p
-
-        def _d(dv: float) -> str:
-            s = f"{dv / p * 100:+.2f}% ({dv:+.10g}"
-            if atr:
-                s += f", ~{abs(dv) / atr:.1f} ATR"
-            return s + ")"
-        near = ("льду" if abs(d_ice) < abs(d_creek) else
-                "крику" if abs(d_creek) < abs(d_ice) else "середине (равноудалена)")
-        L.append(f"до льда {_d(d_ice)}, до крика {_d(d_creek)} → ближе к {near}")
+        L.append(f"бокс: лёд {_fp(lo)} … крик {_fp(hi)} (ширина {(hi - lo) / p * 100:.2f}%"
+                 + (f", ≈ {box_atr:g} ATR" if box_atr > 0 else "")
+                 + f"); цена {_fp(p)} {_box_pos(lo, hi, p)}")
+        L.append(_box_dist(lo, hi, box_atr, p))
     else:
         L.append("бокс: границы не определены")
     if w.get("vol_character"):
@@ -268,6 +283,44 @@ def render_wyckoff(wy, price=None) -> str:
             L.extend(_wyckoff_tf(w, tf, price))
     L.append(WYCKOFF_SCHOOL)
     return "\n".join(L)
+
+
+def wyckoff_box(wy) -> dict:
+    """Края боксов расчёта Вайкоффа по TF — {"D1"|"H1": {"lo", "hi", "atr"}}, только где бокс определён (hi > lo).
+    Ревью 5.4.3 (находка стенда): миссия хранит их с временем и ценой совета, чтобы перепроверка видела расстояния до
+    краёв от ТЕКУЩЕЙ цены (render_wyckoff_now), а не только от цены совета."""
+    out: dict = {}
+    if not isinstance(wy, dict):
+        return out
+    for key, tf in (("daily", "D1"), ("hourly", "H1")):
+        w = wy.get(key)
+        if not isinstance(w, dict):
+            continue
+        lo, hi = _f(w.get("box_low")), _f(w.get("box_high"))
+        if lo is not None and hi is not None and hi > lo:
+            out[tf] = {"lo": lo, "hi": hi, "atr": _f(w.get("box_atr"), 0.0) or 0.0}
+    return out
+
+
+def render_wyckoff_now(box, price) -> str:
+    """Строка «сейчас» к слою Вайкоффа совета: где живая цена в боксах того расчёта и сколько до льда/крика —
+    те же формулы, что в render_wyckoff, числа только из краёв бокса и цены. Нет бокса или цены — пусто."""
+    p = _f(price)
+    if not p or p <= 0 or not isinstance(box, dict):
+        return ""
+    L = []
+    for tf in ("D1", "H1"):
+        b = box.get(tf)
+        if not isinstance(b, dict):
+            continue
+        lo, hi = _f(b.get("lo")), _f(b.get("hi"))
+        if lo is None or hi is None or hi <= lo:
+            continue
+        atr = _f(b.get("atr"), 0.0) or 0.0
+        L.append(f"{tf} бокс {_fp(lo)} … {_fp(hi)}: цена {_box_pos(lo, hi, p)}; {_box_dist(lo, hi, atr, p)}")
+    if not L:
+        return ""
+    return f"СЕЙЧАС от цены {_fp(p)} (края бокса — расчёт совета): " + "; ".join(L)
 
 
 # ── рентген стакана (микроструктура) ───────────────────────────────────────────
@@ -709,7 +762,7 @@ async def build(ticker: str, asset_class: str, *, full: bool = True) -> dict:
     out: dict = {"dossier": {}, "text": "", "price": None, "astro": "", "astro_line": "",
                  "aether": "", "kuramoto": None, "kuramoto_text": "",
                  "bifurcation": None, "bif_text": "",
-                 "wyckoff_text": "", "xray": None, "xray_text": "",
+                 "wyckoff_text": "", "wyckoff_box": {}, "xray": None, "xray_text": "",
                  "reactor": None, "reactor_text": "", "calendar": None, "calendar_text": "",
                  "sync": None, "sync_text": "", "weather": None, "weather_text": "",
                  "oracle": None, "directive": None, "oracle_text": "",
@@ -755,6 +808,7 @@ async def build(ticker: str, asset_class: str, *, full: bool = True) -> dict:
         if not wy and d and wyckoff is not None:
             wy = wyckoff.analyze_dossier(d)
         out["wyckoff_text"] = render_wyckoff(wy, price)
+        out["wyckoff_box"] = wyckoff_box(wy)       # ревью 5.4.3: края боксов — перепроверке от текущей цены
     except Exception as e:                           # noqa: BLE001
         errors.append(f"вайкофф: {str(e)[:100]}")
         out["wyckoff_text"] = f"Вайкофф: слой недоступен: {str(e)[:100]}"
@@ -1247,6 +1301,15 @@ if __name__ == "__main__":
         assert "ВАЙКОФФ D1" in wt and "ВАЙКОФФ H1" in wt and "до льда" in wt and "ближе к" in wt, wt
         assert "СПРИНГ" in wt and "ЗНАК СИЛЫ" in wt and "% от цены" in wt and "Как читают" in wt
         assert "лёд 98.6 … крик 105" in wt and "ближе к крику" in wt, wt
+        # ревью 5.4.3: края боксов — отдельно (перепроверка считает расстояния от текущей цены); та же формула
+        bx = ctx["wyckoff_box"]
+        assert set(bx) <= {"D1", "H1"} and bx and all(v["hi"] > v["lo"] for v in bx.values()), bx
+        tf0 = next(iter(bx))
+        now_l = render_wyckoff_now(bx, 104.9)
+        assert now_l.startswith("СЕЙЧАС от цены 104.9 (края бокса — расчёт совета): ") and f"{tf0} бокс" in now_l, now_l
+        for tf_, b_ in bx.items():                     # та же формула «до льда … до крика …», что в слое совета
+            assert _box_dist(b_["lo"], b_["hi"], b_["atr"], 104.9) in wt and _box_dist(b_["lo"], b_["hi"], b_["atr"], 104.9) in now_l
+        assert render_wyckoff_now(bx, None) == "" and render_wyckoff_now({}, 104.9) == "" and wyckoff_box(None) == {}
         xt = ctx["xray_text"]
         assert "OBI" in xt and "CVD +4000" in xt and "VPIN 0.40" in xt and "классификатор" in xt, xt
         assert "Хёрст" in xt and "норме 3.0" in xt and "прокси-нормы" in xt and ctx["xray"]["available"]

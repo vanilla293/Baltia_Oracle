@@ -17,15 +17,19 @@ ai_v5.decision_of по словарям узлов (review_table / door_table / 
 совета проходит mission._validate_exec и adopt_forecast; история сцены (тики цены) идёт через настоящие наблюдатели
 тика — _shock_watch (окно хода цены, резкий ход), _wait_watch (уровни будильника WAIT), _flat_track («вне рынка с»),
 _wake_watch (будильник ЖДЁМ); прокол сканера — настоящий _puncture_watch (в позиции — через _apply_triage), ответ у
-двери — настоящий _apply_gate, повод «серьёзная новость» — настоящий _ask_review; запись перепроверки — той же формы,
-что пишет MissionPilot._review. Из боевого кода идут: ситуация пилота (_situation_for_ai: ПРИКАЗ СОВЕТА / ВХОД ВЗВЕДЁН /
-ПРОБОЙ ПРОЙДЕН / Прошлая перепроверка с ценой / ЖДЁМ подряд / БУДИЛЬНИК / Последний полный совет, длился …), приказ
-(_exec_text), план и прошлые ответы у двери (_plan_text, _gates_text), ход цены (_history_text), прошлые ответы у
-троса/тейка и мысли о прибыли, повод мысли о прибыли (_profit_trigger), новости перепроверки / двери / совета
-(_gather_news / _news_quick / _news_for над newsflow.render), заметки дозора (_watch_text), итог общего совета
+двери — настоящий _apply_gate, повод «серьёзная новость» — настоящий _ask_review; ответ перепроверки — настоящие
+MissionPilot._review_answered и _review_record (ревью 5.4.3 после F1: запись с in_pos/pos_side, метка модели в
+last_review, ДЕРЖАТЬ в позиции — _retune, будильник — _wake_after_review, серия ЖДЁМ — m.wait_streak через
+_streak_after_review, цена за серию — по тикам _flat_track). Из боевого кода идут: ситуация пилота (_review_situation /
+_situation_for_ai: ПРИКАЗ СОВЕТА / ВХОД ВЗВЕДЁН / ПРОБОЙ ПРОЙДЕН / Прошлая перепроверка с ценой и меткой модели / ЖДЁМ
+подряд / БУДИЛЬНИК / Последний полный совет: приказ пришёл …), приказ (_exec_text), план и прошлые ответы у двери
+(_plan_text, _gates_text), ход цены (_history_text), прошлые ответы у троса/тейка и мысли о прибыли, повод и план мысли о
+прибыли (_profit_trigger, _profit_plan_text), новости перепроверки / двери / совета (_gather_news / _news_quick /
+_news_for над newsflow.render; свежая новость по тикеру — один раз), заметки дозора (_watch_text), итог общего совета
 (_council_text → council.summary_text), отчёт сканера (_scan_text → maya_scan.render_for_ai), блок prev совета
 (_prev_text), связанные бумаги (correlate.text), Вайкофф (market_ctx.render_wyckoff; перепроверка видит слой времени
-совета — m.layers, как в бою). Вручную, в формате источника: шапка живого рынка (market_ctx.light: цена, стакан, стены,
+совета — m.layers — под подписью «на момент совета HH:MM, цена тогда P» и со строкой расстояний от текущей цены:
+_review_wyckoff по m.wy_at, как в бою). Вручную, в формате источника: шапка живого рынка (market_ctx.light: цена, стакан, стены,
 лента, крупные; рентген и Майя — настоящие microstructure.classify + _xray_line / _maya_line), разведка (scout.fetch),
 досье (market_ctx.build), память миссии (абзац FLASH по правилам explain 5.4.3 — «в чью пользу»), анализ и критика
 (тексты PRO). Склейку боевых узлов стенд не повторяет на веру: combat_prompt(id) прогоняет настоящие
@@ -309,6 +313,14 @@ def wyckoff_text(d1: dict, h1: dict, price: float) -> str:
     return market_ctx.render_wyckoff({"daily": d1, "hourly": h1}, price)
 
 
+def wyckoff_ctx(d1: dict, h1: dict, price: float, at: float) -> dict:
+    """Слой Вайкоффа совета так, как его отдаёт market_ctx.build: текст (render_wyckoff), края боксов (wyckoff_box),
+    цена расчёта и время сборки — из них mission._council кладёт m.layers["wyckoff"] и m.wy_at."""
+    wy = {"daily": d1, "hourly": h1}
+    return {"wyckoff_text": market_ctx.render_wyckoff(wy, price), "wyckoff_box": market_ctx.wyckoff_box(wy),
+            "price": float(price), "ts": float(at)}
+
+
 def scout_text(at: str, mx: tuple, vtbr: tuple, si: tuple) -> str:
     """ДАННЫЕ РАЗВЕДКИ — формат scout.fetch (котировка и изменение за день по каждому запросу)."""
     rows = [("MX (фьючерс на индекс MOEX)", mx, "рынок в целом"), ("VTBR (ВТБ)", vtbr, "связанная бумага, ρ=+0.78"),
@@ -502,14 +514,15 @@ VOL_SUPPLY = "объём на росте ×0.71 к объёму на паден�
 H1_BEAR = wy_tf(300, "РАСПРЕДЕЛЕНИЕ", "D — знак слабости (откаты к LPSY)", -33, 300.2, 305.8, 2.1, VOL_SUPPLY,
                 H1_DOWN_EVENTS)
 
-# слой Вайкоффа времени совета: перепроверка видит m.layers["wyckoff"] досье последнего совета (с его ценой и событиями)
-WY_RANGE_0922 = wyckoff_text(D1_RANGE, h1_range("ХАРАКТЕР НЕ ОПРЕДЕЛЁН", "B — построение причины", 4, H1_EVENTS[:4]),
-                             299.8)
-WY_LONG_0922 = wyckoff_text(D1_RANGE, h1_range("СКЛОНЯЕТСЯ К НАКОПЛЕНИЮ", "C — спринг (тест предложения)", 20,
-                                               H1_EVENTS[:4] + [H1_SPRING]), 298.0)
-WY_RANGE_1017 = wyckoff_text(D1_RANGE, h1_range("ХАРАКТЕР НЕ ОПРЕДЕЛЁН", "B — построение причины", 2, H1_EVENTS), 300.1)
-WY_BEAR_0952 = wyckoff_text(D1_TREND_DOWN, H1_BEAR, 300.3)
-WY_BEAR_0947 = wyckoff_text(D1_BEAR_RANGE, H1_BEAR, 303.0)
+# слой Вайкоффа времени совета: (D1, H1, цена расчёта) — перепроверка видит m.layers["wyckoff"] досье последнего совета
+# (с его ценой и событиями) под подписью «на момент совета HH:MM, цена тогда P» и строкой расстояний от текущей цены
+# (m.wy_at — MissionPilot._review_wyckoff); время расчёта — начало совета сцены (как ctx["ts"] market_ctx.build)
+WY_RANGE_0922 = (D1_RANGE, h1_range("ХАРАКТЕР НЕ ОПРЕДЕЛЁН", "B — построение причины", 4, H1_EVENTS[:4]), 299.8)
+WY_LONG_0922 = (D1_RANGE, h1_range("СКЛОНЯЕТСЯ К НАКОПЛЕНИЮ", "C — спринг (тест предложения)", 20,
+                                   H1_EVENTS[:4] + [H1_SPRING]), 298.0)
+WY_RANGE_1017 = (D1_RANGE, h1_range("ХАРАКТЕР НЕ ОПРЕДЕЛЁН", "B — построение причины", 2, H1_EVENTS), 300.1)
+WY_BEAR_0952 = (D1_TREND_DOWN, H1_BEAR, 300.3)
+WY_BEAR_0947 = (D1_BEAR_RANGE, H1_BEAR, 303.0)
 
 
 # ══ бой на данных сцены ══════════════════════════════════════════════════════════════════════════════════════
@@ -663,11 +676,15 @@ class Scene:
                     raise ValueError(f"пилот не принял приказ сцены: {p.last_action}")
         return self
 
-    def memory(self, text: str, at: str, wyckoff: str | None = None) -> "Scene":
-        """Память миссии (абзац FLASH) и время её сведения; wyckoff — слой Вайкоффа досье этого совета (m.layers)."""
+    def memory(self, text: str, at: str, wyckoff: tuple | None = None) -> "Scene":
+        """Память миссии (абзац FLASH) и время её сведения; wyckoff — (D1, H1, цена) слоя Вайкоффа досье этого совета:
+        m.layers["wyckoff"] и метка m.wy_at — настоящим mission._wyckoff_at по контексту формы market_ctx.build
+        (время расчёта — начало совета m.council_ts, как в _council)."""
         self.m.memory, self.m.memory_ts = text, ts(at)
         if wyckoff is not None:
-            self.m.layers = {"wyckoff": wyckoff}
+            ctx = wyckoff_ctx(*wyckoff, at=self.m.council_ts)
+            self.m.layers = {"wyckoff": ctx["wyckoff_text"]}
+            self.m.wy_at = mission._wyckoff_at(ctx, self.m.council_ts)
         return self
 
     def hold(self, side: str, lots: int, entry: float, opened: str, inv: float, take: float) -> "Scene":
@@ -707,33 +724,23 @@ class Scene:
         self.p._review_busy, self.p._review_started_ts = True, ts(at)
         return self
 
-    def review(self, at: str, choice: str, why: str, price: float, *, entry: float | None = None) -> "Scene":
-        """Ответ перепроверки — как MissionPilot._review после разбора слова (choice — канон кода: КУПИТЬ_СЕЙЧАС,
-        ЖДЁМ …): повод сброшен, запись {ts, choice, why, note, entry, …, price, in_pos} и last_review с ценой решения;
-        ЖДЁМ вне рынка с уровнем entry — будильник. Сверка с настоящим _review — tests/test_prompt_bench.py."""
+    def review(self, at: str, choice: str, why: str, price: float, *, entry: float | None = None,
+               entry_kind: str | None = None, inv: float | None = None, take: float | None = None) -> "Scene":
+        """Ответ перепроверки (choice — канон кода: КУПИТЬ_СЕЙЧАС, ЖДЁМ …) — теми же функциями, что MissionPilot._review
+        после разбора слова: тик цены ответа, _review_answered (повод и пейсинг сброшены) и _review_record (last_review с
+        ценой решения, разбор прокола, запись m.reviews с in_pos/pos_side, ДЕРЖАТЬ в позиции — _retune, будильник ЖДЁМ
+        — _wake_after_review, серия ЖДЁМ — m.wait_streak через _streak_after_review). Сверка с настоящим _review —
+        check_review_record и tests/test_prompt_bench.py."""
         self.tick(at, price)
-        p, m, t = self.p, self.m, ts(at)
-        p._review_busy = False
-        p._last_review_ts = t
-        if p._review_pulled:
-            p._last_event_review_ts = t
-        p._review_reason, p._review_kind, p._review_pulled = None, None, False
-        p._review_deferred = None
-        p._council_blocked = ""
-        p.last_review = {"choice": choice, "why": why, "ts": t, "price": float(price)}
-        if p.puncture and p.puncture.get("pending"):
-            p.puncture["pending"] = False
-            p.puncture["state"] = f"PRO решил: {choice} — {why[:120]}"
-        rec = {"ts": t, "choice": choice, "why": why, "note": "", "entry": entry, "entry_kind": None,
-               "invalidation": None, "take": None, "price": float(price), "in_pos": p.position is not None}
-        p._wake = None
-        lvl = float(entry or 0.0)
-        if choice == "ЖДЁМ" and not p.position and not p.plan and not p.pending and lvl > 0 and abs(lvl - price) > 1e-9:
-            p._wake = {"level": lvl, "ref": float(price), "dir": "up" if lvl > price else "down", "ts": t,
-                       "why": why[:120], "fired": None}
-            rec["wake"] = lvl
-        m.reviews.append(rec)
-        m.reviews_since_memory += 1
+        p = self.p
+        with self.combat(ts(at)):
+            p._review_busy = False                   # AIPilot._review_bg: PRO ответил
+            p._review_answered()
+            in_pos = p.position is not None
+            obj = {"choice": choice, "why": why, "entry": entry, "entry_kind": entry_kind, "invalidation": inv,
+                   "take": take}
+            p._review_record(obj, choice, choice, str(why)[:300], "", float(price), in_pos,
+                             (p.position or {}).get("side"))
         return self
 
     def handoff(self, at: str, reason: str, kind: str = "council") -> "Scene":
@@ -799,15 +806,13 @@ class Scene:
             news_txt = _drive(p._gather_news())
             if not news_txt.strip():
                 news_txt = NEWS_EMPTY
-            situation = p._situation_for_ai(p.prices[-1])
-            if p._review_reason:
-                situation += f"\nПОВОД ПЕРЕПРОВЕРКИ (внеплановая): {p._review_reason}"
-            if p._council_blocked:
-                situation += f"\nСОВЕТ: {p._council_blocked}"
+            price = p.prices[-1]
+            situation = p._review_situation(price)
+            wy_at, wy_txt = p._review_wyckoff(price, m.layers.get("wyckoff") or "")
             return {"situation": situation, "light": self.light, "council_text": mission._council_text(),
                     "prev_exec": mission._exec_text(m), "news": news_txt,
                     "watch": mission._watch_text(p._last_review_ts or p.started_ts), "astro_line": "",
-                    "scan": mission._scan_text(m), "wyckoff": (m.layers.get("wyckoff") or ""), "scout": self.scout,
+                    "scan": mission._scan_text(m), "wyckoff": wy_txt, "wyckoff_at": wy_at, "scout": self.scout,
                     "partners": self.partners, "memory": m.memory or ""}
 
     def door_args(self) -> dict:
@@ -836,15 +841,8 @@ class Scene:
             reason = p._profit_trigger(self.price, pos)
             if not reason:
                 raise ValueError("сцена: повода мысли о прибыли нет")
-            plan_txt = mission._exec_text(m)
-            if m.reviews:
-                plan_txt += "\nПерепроверки: " + "; ".join(
-                    f"{ai_v5.fmt_ts(r.get('ts'))} {r.get('choice')} — {str(r.get('why') or '')}" for r in m.reviews[-3:])
-            plan_txt += (f"\nУРОВНИ ПОЗИЦИИ: вход {mission._f(pos.get('entry'), 0.0):g}, триггер (мягкий стоп) "
-                         f"{pos.get('invalidation')}, {p._hard_name()} {pos.get('hard_stop')}, тейк {pos.get('take')}"
-                         + ("; прибыль уже заперта триггером" if pos.get("profit_lock") or pos.get("take_holds") else ""))
             return {"profit": reason, "situation": p._situation_for_ai(p.prices[-1]),
-                    "history": p._history_text(self.price), "light": self.light, "plan": plan_txt,
+                    "history": p._history_text(self.price), "light": self.light, "plan": p._profit_plan_text(pos),
                     "news": p._news_quick(), "council_text": mission._council_text(), "scan": mission._scan_text(m),
                     "scout": self.scout, "partners": self.partners, "memory": m.memory or "",
                     "guards": p._guards_text(), "thoughts": p._profits_text(pos)}
@@ -1903,9 +1901,17 @@ FORMAT_PIECES: tuple[tuple[str, str], ...] = (
                        "дежурного PRO; это не вход"),
     ("range_mid_wait", "Прошлая перепроверка (30 мин назад, цена 300.1): ЖДЁМ — цена 300.1 посередине коридора"),
     ("range_mid_wait", "; с тех пор 300 (-0.03 %)"),
-    ("range_mid_wait", "ЖДЁМ подряд: 2 за 66 мин; вне рынка с 09:40, цена за это время 299.4–303.8 (размах 1.47 %), "
-                       "от первого ЖДЁМ -0.73 %"),
-    ("range_mid_wait", "Последний полный совет: 118 мин назад, длился 18 мин (пока совет идёт"),
+    # серия ЖДЁМ — по счётчику m.wait_streak (настоящий _streak_after_review), цена за серию — с первого ЖДЁМ 10:14
+    ("range_mid_wait", "ЖДЁМ подряд: 2 за 66 мин (с 30.09 10:14); вне рынка с 30.09 09:40; цена за серию 299.4–302.2 "
+                       "(размах 0.94 %), от первого ЖДЁМ (302.2) -0.73 %"),
+    # находка стенда (3): возраст совета — от приказа (09:40), а не от начала (09:22)
+    ("range_mid_wait", "Последний полный совет: приказ пришёл 100 мин назад (совет шёл 18 мин, начат 09:22); пока совет "
+                       "идёт"),
+    # находка стенда (1): Вайкофф совета — с подписью времени и цены расчёта и расстояниями от текущей цены
+    ("range_mid_wait", "═══ ВАЙКОФФ (на момент совета 09:22, 118 мин назад, цена тогда 299.8) ═══\nСЕЙЧАС от цены 300 "
+                       "(края бокса — расчёт совета): D1 бокс 288.4 … 309.6: цена на 55% высоты бокса; до льда -3.87% "
+                       "(-11.6, ~1.7 ATR), до крика +3.20% (+9.6, ~1.4 ATR) → ближе к крику; H1 бокс 296 … 304: цена на "
+                       "50% высоты бокса"),
     ("range_mid_wait", "С тех пор цена 299.8 → 300 (+0.07 %). Будильник кода у уровней 304, 296 — проход цены будит"),
     ("range_mid_wait", "\nКак совет видел ведение 100 мин назад (прошлое мнение): план — вне рынка;"),
     ("range_mid_wait", "— новости до совета 30.09 09:22 (1 шт.) ужаты в блок ПАМЯТЬ МИССИИ"),
@@ -1914,7 +1920,8 @@ FORMAT_PIECES: tuple[tuple[str, str], ...] = (
     ("range_mid_wait", "Killswitch: ок (дневной лимит -6000.0)"),
     ("breakout_hold", "ПОВОД ПЕРЕПРОВЕРКИ (внеплановая): прокол сканера вверх 61 % (вне рынка: полоса 305.3–305.7, "
                       "без плана)"),
-    ("breakout_hold", "ЖДЁМ подряд: 3 за 66 мин"),
+    ("breakout_hold", "ЖДЁМ подряд: 3 за 66 мин (с 30.09 10:14); вне рынка с 30.09 09:40; цена за серию 300.3–305.3"),
+    ("breakout_hold", "H1 бокс 296 … 304: цена на 114% высоты бокса — НАД криком, вне бокса; до льда -2.98%"),
     ("false_breakout", "ПОВОД ПЕРЕПРОВЕРКИ (внеплановая): WAIT: цена 304.1 прошла уровень 304 из приказа совета — реши "
                        "по живой картине"),
     ("trend_no_pullback", "ВХОД ВЗВЕДЁН (лимит на откате): short @302 — до уровня +1.68 %, стоп 304.6, тейк 292.0; "
@@ -1922,12 +1929,22 @@ FORMAT_PIECES: tuple[tuple[str, str], ...] = (
     ("news_shock", "ПОВОД ПЕРЕПРОВЕРКИ (внеплановая): резкий ход: +1.07% за 10 мин (цена 302.1); серьёзная новость: ЦБ "
                    "внепланово снизил"),
     ("news_shock", "30.09 10:41 · серьёзность 5 · ЦБ внепланово снизил"),
-    ("dead_market", "ЖДЁМ подряд: 6 за 206 мин"),
+    # находка стенда (2): свежая новость по тикеру — один раз (в «свежих»), «по инструменту» — остальные
+    ("news_shock", "— по инструменту (кроме свежих выше):\n[b71e04] 30.09 09:30 · rbc · Минфин разместит ОФЗ"),
+    ("dead_market", "ЖДЁМ подряд: 6 за 206 мин (с 30.09 10:14)"),
+    ("dead_market", "Последний полный совет: приказ пришёл 240 мин назад (совет шёл 18 мин, начат 09:22)"),
     ("long_resistance", "ПОЗИЦИЯ: long 30 лот @298, в рынке 95 мин, плавающий P/L +1080 ₽, триггер (мягкий стоп) @296.4"),
+    # метка модели: ЖДЁМ в позиции — «ДЕРЖАТЬ» (в записи канон прежний)
+    ("long_resistance", "Прошлая перепроверка (30 мин назад, цена 299.8): ДЕРЖАТЬ — long +0.6%"),
+    ("long_resistance", "═══ ВАЙКОФФ (на момент совета 09:22, 118 мин назад, цена тогда 298) ═══\nСЕЙЧАС от цены 301.6"),
     ("long_pressure", "ПРОКОЛ СКАНЕРА: сторона ВНИЗ, стойкость 63 %"),
     ("long_pressure", "плавающий P/L -450 ₽"),
+    ("long_pressure", "Прошлая перепроверка (22 мин назад, цена 300.2): ДЕРЖАТЬ — long −0.1%"),
+    ("long_pressure", "— по инструменту: только свежие выше"),
     ("short_add", "ПОЗИЦИЯ: short 30 лот @303, в рынке 70 мин, плавающий P/L +1050 ₽"),
     ("door_now", "ВХОЖУ: long сейчас, стоп 297.8, тейк 306.0"),
+    # находка стенда (3): приказ пришёл 12 мин назад — раньше модель видела «50 мин назад» (от начала совета 10:30)
+    ("door_now", "Последний полный совет: приказ пришёл 12 мин назад (совет шёл 38 мин, начат 10:30)"),
     ("door_now", "ПЛАН ПИЛОТА (по нему готов войти сейчас, цена 300.5): long сейчас"),
     ("door_now", "ЖДАТЬ по этому плану: 1 раз за 11 мин; цена 300.3 → 300.5 (+0.07 % в сторону плана); план "
                  "протухнет через 78 мин"),
@@ -1938,6 +1955,7 @@ FORMAT_PIECES: tuple[tuple[str, str], ...] = (
     ("door_breakout", "За 10 мин: 11:10 303.2 → 11:11 303.3"),
     ("profit_fade", "ПРИБЫЛЬ: пройдено 77 % хода от входа 298 до тейка 305 (порог 60 %)"),
     ("profit_fade", "УРОВНИ ПОЗИЦИИ: вход 298, триггер (мягкий стоп) 296.4"),
+    ("profit_fade", "Перепроверки: 30.09 10:20 ДЕРЖАТЬ — long +0.5% (цена 299.5)"),
     ("verdict_split", "Перепроверки: 30.09 10:20 ЖДЁМ @298.4 → сейчас 299.2 (+0.27 %)"),
     ("verdict_split", "Передачи совету: 30.09 10:01 WAIT: цена 295.9 прошла уровень 296 из приказа совета"),
     ("verdict_split", "Пилот: вне рынка; результат сессии +0 ₽ за 0 сделок"),
@@ -1957,13 +1975,15 @@ def check_review_record(sid: str, answer: dict) -> None:
     MissionPilot._review на том же ответе ИИ: запись m.reviews, last_review с ценой решения, будильник ЖДЁМ, прокол."""
     sc, calls = combat_node(sid, dict(answer))
     assert len(calls) == 1 and calls[0][2] == "mission_review", calls
-    choice = ai_v5.decision_of(ai_v5.decision_raw(answer), ai_v5.review_table(sc.p.position is not None, sc.side()))
     ref = SCENES[sid]()
-    ref.review(ref.now, choice, answer["why"], ref.price, entry=answer.get("entry"))
+    choice = ai_v5.decision_of(ai_v5.decision_raw(answer), ai_v5.review_table(ref.p.position is not None, ref.side()))
+    ref.review(ref.now, choice, answer["why"], ref.price, entry=answer.get("entry"), entry_kind=answer.get("entry_kind"),
+               inv=answer.get("invalidation"), take=answer.get("take"))
     got, want = sc.m.reviews[-1], ref.m.reviews[-1]
-    want = dict(want, entry_kind=str(answer.get("entry_kind") or "")[:12] or None)   # вид уровня сцена не хранит
     assert got == want, (sid, got, want)
     assert sc.p.last_review == ref.p.last_review and sc.p._wake == ref.p._wake, (sid, sc.p._wake, ref.p._wake)
+    assert sc.m.wait_streak == ref.m.wait_streak, (sid, sc.m.wait_streak, ref.m.wait_streak)
+    assert sc.p._last_review_ts == ref.p._last_review_ts and sc.p._review_reason == ref.p._review_reason
     pu, pr = sc.p.puncture or {}, ref.p.puncture or {}
     assert (pu.get("pending"), pu.get("state")) == (pr.get("pending"), pr.get("state")), (sid, pu, pr)
 
@@ -2008,6 +2028,14 @@ def _selftest() -> None:
     assert s1["situation"].startswith("Цена сейчас: 300\nРЫНОК: рынок открыт: торги идут (основная сессия)")
     assert BY_ID["breakout_hold"]["args"]["situation"].startswith("ПРОКОЛ СКАНЕРА: сторона ВВЕРХ, стойкость 61 %")
     assert "ПРОВЕРКА ВХОДА:" not in build(BY_ID["door_now"])[1], "у двери — без дубля строки о проверке входа"
+    # история сцены — настоящими функциями mission.py: серия ЖДЁМ по счётчику, запись с pos_side, метка модели
+    sc0 = SCENES["range_mid_wait"]()
+    assert sc0.m.wait_streak["n"] == 2 and sc0.m.wait_streak["price"] == 302.2, sc0.m.wait_streak
+    assert SCENES["long_pressure"]().m.reviews[-1]["pos_side"] == "long"
+    # находки стенда в бою: Вайкофф совета с подписью и от текущей цены, новость — один раз, возраст — от приказа
+    assert s1["wyckoff_at"].startswith("на момент совета 09:22") and s1["wyckoff"].startswith("СЕЙЧАС от цены 300 ")
+    assert build(BY_ID["news_shock"])[1].count("[7c21e0]") == 1
+    assert "приказ пришёл 12 мин назад (совет шёл 38 мин" in BY_ID["door_now"]["args"]["situation"]
     lt = BY_ID["range_low_buyer"]["args"]["light"]
     assert lt.startswith("SBER: цена 296.4 (30.09.2026 11:20 МСК, среда)") and "Рентген: OBI +0.31" in lt and "Майя: тяга вверх" in lt
     assert "Лента 15 мин: 3900 сделок, объём 162200, агрессор — покупатели (63% покупок), дельта +41400" in lt

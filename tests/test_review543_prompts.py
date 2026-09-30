@@ -7,8 +7,10 @@
   несработавший будильник, другой entry переставляет; время будильник не ставит; сработавший уровень снова будит не
   раньше PYTHIA_EVENT_COOL_SEC (D2);
 - ДЕРЖАТЬ в позиции (D6): новые invalidation/take или null, прежние числа не повторять;
-- трос (D5): hold_until_price — новый триггер при условии сторон, до срока hold_minutes вопроса нет и держит только
-  аварийный трос, после срока — вопрос снова до лимита ожиданий, дальше слив по правилу; бремя чисел у обоих ответов;
+- трос (D5, по коду F1): hold_until_price строго между аварийным тросом и ценой — новый триггер, у него вопрос сразу
+  (hold_minutes не действует); не принят — триггер прежний, вопрос снова через hold_minutes (без него
+  PYTHIA_SOFT_STOP_GRACE_SEC), до того держит аварийный трос; на лимите ожиданий — слив по правилу сразу; бремя чисел у
+  обоих ответов;
 - засада совета (D4): пилот взводит, у двери сверяет дежурный, живёт PLAN_TTL_SEC от приказа — числа из кода; засада
   перепроверки — правило свежести как есть;
 - дверь: уровень и срок вместе — вход у уровня не раньше срока; прибыль: условие принятия lock_price; триаж: цена
@@ -137,18 +139,25 @@ def test_review_ambush_freshness_rule_as_is(monkeypatch):
 
 # ── D5: трос ─────────────────────────────────────────────────────────────────────────────────────────────────────
 def test_stop_guard_text_says_what_the_trigger_does(monkeypatch):
+    """Текст троса = код F1 (AIPilot._apply_guard / tick): принятый hold_until_price — новый триггер, вопрос у него
+    сразу, срок hold_minutes — только при прежнем триггере; лимит ожиданий — слив по правилу сразу."""
     s = _systems()["stop_guard"]
     for piece in ("Оба ответа равноправны", "бремя чисел у обоих: слом докажи числами (агрессор ленты, объём за "
                   "уровнем, нет возврата), вынос стопов — тоже числами (объём, лента, возврат за уровень), иначе это "
                   "надежда, а не картина",
-                  "назови hold_until_price — новый триггер (код ставит его, только если он с безопасной стороны от цены "
-                  "и не за аварийным тросом, иначе триггер прежний)",
-                  "срок hold_minutes (1–60 мин; без него 3 мин): пока срок идёт, вопроса у триггера нет и держит только "
-                  "аварийный трос; после срока цена за триггером — тебя спросят снова, пока не кончился лимит ожиданий, "
-                  "дальше слив по правилу"):
+                  "назови hold_until_price, и код сделает так: это новый триггер, если он строго между аварийным тросом "
+                  "и ценой (у лонга трос < X < цена, у шорта цена < X < трос); цена его пройдёт — тебя спросят сразу, "
+                  "hold_minutes тогда не действует",
+                  "числа нет или оно вне этого коридора — триггер прежний (цена уже за ним), тебя спросят снова через "
+                  "hold_minutes (1–60 мин; без него 3 мин), а до того позицию держит только аварийный трос",
+                  "Каждое ЖДАТЬ идёт в лимит ожиданий: на лимите цена за триггером — слив по правилу сразу, без вопроса и "
+                  "без срока; счёт заново, когда цена по безопасную сторону триггера, а с ответа прошло больше 3 мин"):
         assert piece in s, piece
+    # старое обещание F2 («пока срок идёт, вопроса у триггера нет» и у нового триггера) код F1 не делает
+    assert "пока срок идёт" not in s and "с безопасной стороны от цены и не за аварийным тросом" not in s
     monkeypatch.setattr(config, "PYTHIA_SOFT_STOP_GRACE_SEC", 300, raising=False)
-    assert "без него 5 мин" in pm.stop_guard("TEST", "Тест", "long", trigger="t", history="", plan="", **KW)[0]
+    s5 = pm.stop_guard("TEST", "Тест", "long", trigger="t", history="", plan="", **KW)[0]
+    assert "без него 5 мин" in s5 and "а с ответа прошло больше 5 мин" in s5
 
 
 # ── дверь, прибыль, триаж, прокол ─────────────────────────────────────────────────────────────────────────────────
@@ -407,32 +416,53 @@ async def _open_long(p, fake, inv=98.0, take=110.0):
 
 
 def test_code_guard_hold_until_price_is_a_trigger_not_an_exit(fake):
-    """D5: ЖДАТЬ с hold_until_price — новый триггер (сторона и трос проверяются), до срока вопроса нет и позиция не
-    закрывается и за новым триггером (держит аварийный трос), после срока — вопрос снова; после лимита — слив."""
+    """D5 — то, что обещает промпт троса, делает код F1 (AIPilot._apply_guard / tick):
+    · hold_until_price строго между аварийным тросом и ценой — новый триггер (трос на месте), hold_minutes не действует:
+      цена прошла новый триггер — вопрос сразу;
+    · число не принято (выше цены / за аварийным тросом) — триггер прежний, вопрос снова через hold_minutes, без него —
+      PYTHIA_SOFT_STOP_GRACE_SEC; до срока за триггером ни вопроса, ни выхода (держит аварийный трос);
+    · каждое ЖДАТЬ — +1 к holds; на лимите PYTHIA_SOFT_STOP_MAX_HOLDS за триггером — слив по правилу сразу, без вопроса
+      и без срока; за аварийным тросом — слив без вопроса всегда."""
     async def scenario():
         m, p = make_pilot()
-        pos = await _open_long(p, fake)
+        pos = await _open_long(p, fake)                            # триггер 98, аварийный трос 98 − 1.5 %
         hard = float(pos["hard_stop"])
-        assert 0 < hard < 97.0, pos
+        assert 96.0 < hard < 97.0, pos
         fake.queue("mission_guard", {"decision": "ЖДАТЬ", "why": "вынос стопов: объём 3×, возврат", "hold_until_price": 97.0,
                                      "hold_minutes": 10})
         await tick(p, 97.9)                                        # за триггером 98 — вопрос у троса
         assert fake.count("mission_guard") == 1 and p.position and float(pos["invalidation"]) == 97.0, p.last_action
         assert float(pos["hard_stop"]) == hard, "аварийный трос на месте"
-        assert 590 <= pos["guard_next"] - time.time() <= 601, "срок hold_minutes"
+        assert pos["guard_next"] == 0.0 and pos["holds"] == 1, "новый триггер: срока нет, вопрос у него сразу"
+        g = p.guards[-1]
+        assert g["hold_until"] == 97.0 and g["hold_minutes"] is None and "у него спрошу снова" in p.last_action, g
         placed = len(p.broker.placed)
-        await tick(p, 96.9)                                        # за новым триггером, до срока: ни вопроса, ни выхода
-        assert fake.count("mission_guard") == 1 and p.position and len(p.broker.placed) == placed, p.last_action
+        # цена прошла новый триггер — вопрос сразу (hold_minutes 10 из прошлого ответа не действует)
+        fake.queue("mission_guard", {"decision": "ЖДАТЬ", "why": "поглощение", "hold_until_price": 99.0, "hold_minutes": 5})
+        await tick(p, 96.9)
+        assert fake.count("mission_guard") == 2 and p.position and len(p.broker.placed) == placed, p.last_action
+        g = p.guards[-1]
+        assert float(pos["invalidation"]) == 97.0, "hold_until_price выше цены — не принят, триггер прежний"
+        assert g["hold_until"] is None and g["hold_until_ai"] == 99.0 and "не принят" in g["hold_note"], g
+        assert 295 <= pos["guard_next"] - time.time() <= 301 and pos["holds"] == 2, "прежний триггер — срок hold_minutes"
+        await tick(p, 96.8)                                        # за триггером, до срока: ни вопроса, ни выхода
+        assert fake.count("mission_guard") == 2 and p.position and len(p.broker.placed) == placed, p.last_action
         pos["guard_next"] = 0.0                                    # срок вышел — тот же вопрос снова
-        fake.queue("mission_guard", {"decision": "ЖДАТЬ", "why": "поглощение", "hold_until_price": 99.0})
-        await tick(p, 96.9)
-        assert fake.count("mission_guard") == 2 and p.position, p.last_action
-        assert float(pos["invalidation"]) == 97.0, "hold_until_price не с безопасной стороны от цены — триггер прежний"
+        fake.queue("mission_guard", {"decision": "ЖДАТЬ", "why": "стена bid 96.7", "hold_until_price": 96.0})
+        await tick(p, 96.8)
+        g = p.guards[-1]
+        assert fake.count("mission_guard") == 3 and p.position and float(pos["invalidation"]) == 97.0, p.last_action
+        assert "за аварийным тросом" in g["hold_note"], "96.0 за тросом — не принят"
         assert 170 <= pos["guard_next"] - time.time() <= 181, "без hold_minutes — PYTHIA_SOFT_STOP_GRACE_SEC"
-        pos["guard_next"] = 0.0
-        pos["holds"] = 3                                           # лимит ожиданий — слив по правилу, без вопроса
-        await tick(p, 96.9)
-        assert fake.count("mission_guard") == 2 and len(p.broker.placed) > placed, p.last_action
+        assert pos["holds"] == 3
+        await tick(p, 96.8)                                        # лимит 3 из 3 — слив по правилу сразу, срок не ждём
+        assert fake.count("mission_guard") == 3 and len(p.broker.placed) > placed, p.last_action
+        # за аварийным тросом — слив без вопроса всегда
+        m2, p2 = make_pilot()
+        pos2 = await _open_long(p2, fake)
+        n0, placed2 = fake.count("mission_guard"), len(p2.broker.placed)
+        await tick(p2, round(float(pos2["hard_stop"]) - 0.1, 2))
+        assert fake.count("mission_guard") == n0 and len(p2.broker.placed) > placed2, p2.last_action
 
     asyncio.run(scenario())
 
@@ -498,6 +528,12 @@ def test_code_profit_lock_acceptance(fake):
         assert float(pos["invalidation"]) == 101.5 and pos.get("profit_lock"), applied
         p._profit_lock(pos, 101.0, 0.0, 103.0, applied)            # не лучше нынешнего триггера — не принят
         assert float(pos["invalidation"]) == 101.5 and "не лучше триггера" in applied[-1], applied
+        # следующая мысль видит, что код сделал с числом (промпт: «не принят — триггер не тронут»), а не «триггер → X»
+        p.prices.append(103.0)
+        await p._apply_profit({"decision": "ДЕРЖАТЬ", "why": "ход жив", "lock_price": 99.0}, 103.0, pos, "повод: тест")
+        th = p._profits_text(pos)
+        assert "[код: lock_price 99 не принят: не между входом" in th and "триггер → 99" not in th, th
+        assert float(pos["invalidation"]) == 101.5
 
     asyncio.run(scenario())
 

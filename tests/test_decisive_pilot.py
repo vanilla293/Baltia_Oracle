@@ -326,8 +326,10 @@ def test_council_stores_exec_price_and_duration(monkeypatch):
             assert m.council_dur is not None and 0.0 <= m.council_dur < 60.0, m.council_dur
             assert saved and saved[-1]["council_dur"] == m.council_dur and saved[-1]["exec"]["price"] == 100.0
             sit = m.pilot._situation_text(100.5)
-            assert ("Последний полный совет: 0 мин назад, длился 0 мин (пока совет идёт, пилот не входит и не "
-                    "перепроверяет, взведённый вход без позиции снимается)") in sit, sit
+            # ревью 5.4.3 (находка стенда): возраст — от приказа, длительность и начало совета — рядом
+            assert (f"Последний полный совет: приказ пришёл 0 мин назад (совет шёл 0 мин, начат "
+                    f"{m.pilot._hhmm(m.council_ts)}); пока совет идёт, пилот не входит и не перепроверяет, взведённый "
+                    "вход без позиции снимается") in sit, sit
             assert "цена тогда 100" in mission._exec_text(m)
         finally:
             m.task.cancel()
@@ -531,9 +533,15 @@ def test_wait_without_levels_takes_numbers_from_wait_for_and_wakes():
 # ── 7. цена НОВЫЙ_АНАЛИЗ: длительность прошлого совета и что пилот делает, пока совет идёт ───────────────────────────
 def test_council_line_shows_duration_and_freeze():
     m, p = make_pilot()
-    m.council_ts, m.council_dur = time.time() - 600, 420.0
+    now = time.time()
+    m.council_ts, m.council_dur, m.exec_ts = now - 600, 420.0, now - 180     # совет 10 мин назад, шёл 7, приказ — 3 мин
     sit = p._situation_text(100.0)
-    assert ("Последний полный совет: 10 мин назад, длился 7 мин (пока совет идёт, пилот не входит и не перепроверяет, "
-            "взведённый вход без позиции снимается)") in sit, sit
+    assert (f"Последний полный совет: приказ пришёл 3 мин назад (совет шёл 7 мин, начат {p._hhmm(m.council_ts)}); пока "
+            "совет идёт, пилот не входит и не перепроверяет, взведённый вход без позиции снимается") in sit, sit
+    assert "10 мин назад" not in sit, "возраст совета — от приказа, а не от начала"
     m.council_dur = None
-    assert "Последний полный совет: 10 мин назад (пока совет идёт" in p._situation_text(100.0)
+    assert f"Последний полный совет: приказ пришёл 3 мин назад (совет начат {p._hhmm(m.council_ts)}); пока совет идёт" \
+        in p._situation_text(100.0)
+    m.exec_ts, m.council_dur = now - 3600, 420.0                                # приказ старше совета: совет без приказа
+    assert (f"Последний полный совет: начат {p._hhmm(m.council_ts)} (10 мин назад), шёл 7 мин, нового приказа не дал; "
+            "пока совет идёт") in p._situation_text(100.0)

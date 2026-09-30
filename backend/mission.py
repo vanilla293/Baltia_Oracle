@@ -261,6 +261,10 @@ class Mission:
         self.open_trade: dict | None = None
         self.reason = ""
         self.layers: dict = {}          # тексты слоёв последнего разбора (Вайкофф, рентген, свод, сканер)
+        # ревью 5.4.3 (находка стенда): слой Вайкоффа совета — когда и при какой цене посчитан и края его боксов
+        # {ts, price, box: {"D1"|"H1": {lo, hi, atr}}} — перепроверка подписывает слой честно и считает расстояния до
+        # краёв от текущей цены (MissionPilot._review_wyckoff)
+        self.wy_at: dict | None = None
         self.sizes: dict = {}           # размеры промптов/ответов по стадиям (симв.) — для панели
         self.account_pos = ""           # позиция по инструменту прямо на счёте (до пилота), строкой
         self.scout_reqs: list = []      # запросы разведки FLASH (перепроверка и трос берут их свежими)
@@ -304,7 +308,7 @@ def _persist(m: Mission) -> bool:
             "council_dur": m.council_dur,
             "news": m.news, "reviews": m.reviews[-REVIEWS_KEEP:], "handoffs": m.handoffs[-50:],
             "note": m.note, "error": m.error, "ctx_price": m.ctx_price, "reason": m.reason,
-            "layers": m.layers, "sizes": m.sizes, "scout_reqs": m.scout_reqs[:30],
+            "layers": m.layers, "wy_at": m.wy_at, "sizes": m.sizes, "scout_reqs": m.scout_reqs[:30],
             "partners": m.partners[:10], "partners_text": m.partners_text,
             "explain": m.explain[-40:], "memory": m.memory, "memory_ts": m.memory_ts, "memory_n": m.memory_n,
             "reviews_since_memory": m.reviews_since_memory, "wait_streak": m.wait_streak,
@@ -336,6 +340,7 @@ def _from_store(ticker: str) -> Mission | None:
     m.handoffs, m.note = d.get("handoffs") or [], d.get("note") or ""
     m.error, m.ctx_price, m.reason = d.get("error"), _f(d.get("ctx_price")), d.get("reason") or ""
     m.layers = d.get("layers") if isinstance(d.get("layers"), dict) else {}
+    m.wy_at = d.get("wy_at") if isinstance(d.get("wy_at"), dict) else None
     m.sizes = d.get("sizes") if isinstance(d.get("sizes"), dict) else {}
     m.scout_reqs = d.get("scout_reqs") if isinstance(d.get("scout_reqs"), list) else []
     m.partners = d.get("partners") if isinstance(d.get("partners"), list) else []
@@ -970,6 +975,45 @@ def _position_age(m: Mission) -> float | None:
 
 
 # ── толмач и память (v5.3) ─────────────────────────────────────────────────────
+def _wyckoff_at(ctx: dict, council_ts: float | None = None) -> dict | None:
+    """Ревью 5.4.3 (находка стенда): метка слоя Вайкоффа совета — когда посчитан (время сборки контекста ctx["ts"],
+    нет — начало совета), при какой цене (ctx["price"]) и края боксов (ctx["wyckoff_box"], market_ctx.wyckoff_box).
+    Слоя нет — None."""
+    if not isinstance(ctx, dict):
+        return None
+    box = ctx.get("wyckoff_box") if isinstance(ctx.get("wyckoff_box"), dict) else {}
+    t = _f(ctx.get("ts")) or _f(council_ts)
+    px = _f(ctx.get("price"))
+    if not (box or t or px):
+        return None
+    return {"ts": t, "price": px, "box": box}
+
+
+def _news_key(x) -> tuple:
+    """Ключ новости для правила «одна новость — один раз»: id хранилища, иначе (заголовок, время)."""
+    if not isinstance(x, dict):
+        return ("obj", id(x))
+    if x.get("id"):
+        return ("id", str(x["id"]))
+    ai = x.get("ai") if isinstance(x.get("ai"), dict) else {}
+    return ("t", str(x.get("title") or ai.get("one_liner") or ""), _f(x.get("ts")))
+
+
+def _news_not_shown(items: list[dict], shown: list[dict]) -> tuple[list[dict], int]:
+    """Ревью 5.4.3 (находка стенда): новости инструмента без тех, что уже показаны блоком «свежие» того же промпта —
+    свежая новость по тикеру раньше шла дважды. Возврат: (оставшиеся, сколько убрано как дубль)."""
+    keys = {_news_key(x) for x in shown or []}
+    out = [x for x in items or [] if _news_key(x) not in keys]
+    return out, len(items or []) - len(out)
+
+
+def _own_news_block(nf, own: list[dict], dup: int) -> str:
+    """Блок «по инструменту» после снятия дублей: дубли были — так и сказано (новость не пропала, она выше)."""
+    if own:
+        return ("— по инструменту (кроме свежих выше):\n" if dup else "— по инструменту:\n") + _render_all(nf, own)
+    return "— по инструменту: только свежие выше" if dup else ""
+
+
 def _split_news(items: list[dict], since: float) -> tuple[list[dict], list[dict]]:
     """(свежие после момента since, старые до него); без ts — свежие (честно, не теряем)."""
     fresh, old = [], []
@@ -1161,6 +1205,7 @@ async def _council(m: Mission, reason: str, first: bool) -> dict | None:
         blocks, squeezed = await _fit_blocks({k: pctx.get(k) or "" for k in keys})
         pctx.update(blocks)
         m.layers = {k: pctx.get(k) or "" for k in ("wyckoff", "xray", "oracle", "scan")}
+        m.wy_at = _wyckoff_at(ctx, m.council_ts)     # ревью 5.4.3: время, цена и края бокса слоя Вайкоффа совета
 
         # 2. PRO: анализ → критика → вердикт (стрим); анализ/критика уходят дальше целиком,
         #    пока ≤ PYTHIA_CTX_LIMIT, выше — FLASH ужимает (shrink/fit), ножниц нет
@@ -1455,6 +1500,7 @@ class MissionPilot(ai_pilot.AIPilot):
             await _enrich_news(m, m.run_id, timeout=180.0)
         since = self._last_review_ts or self.started_ts
         blocks = []
+        fresh: list[dict] = []
         try:
             fresh = nf.fresh_since(since) or []
             if fresh:
@@ -1466,8 +1512,10 @@ class MissionPilot(ai_pilot.AIPilot):
             own, dropped = self._news_after_council(own)
             if dropped:
                 blocks.append(dropped)
-            if own:
-                blocks.append("— по инструменту:\n" + _render_all(nf, own))
+            own, dup = _news_not_shown(own, fresh)   # ревью 5.4.3: свежая новость по тикеру — один раз, в «свежих»
+            own_txt = _own_news_block(nf, own, dup)
+            if own_txt:
+                blocks.append(own_txt)
         except Exception as e:                       # noqa: BLE001
             log.info("новости по тикеру недоступны: %s", str(e)[:60])
         return "\n\n".join(blocks)                   # целиком: окно DeepSeek V4 — 1M токенов
@@ -2099,20 +2147,34 @@ class MissionPilot(ai_pilot.AIPilot):
                          f"(уже {int(max(0.0, now - m.council_ts) // 60)} мин)"
                          + (f"; прошлый длился {int(dur // 60)} мин" if dur is not None else "") + f" ({frz})")
             elif self._reanalyzing:                   # совет запрошен, задача ещё не стартовала
-                L.append(f"Полный совет запрошен, пилот ждёт его; прошлый был {int((now - m.council_ts) // 60)} мин "
-                         f"назад" + (f", длился {int(dur // 60)} мин" if dur is not None else "") + f" ({frz})")
+                L.append(f"Полный совет запрошен, пилот ждёт его; прошлый — {self._council_age(m, now)}; {frz}")
             elif cut and abs(cut - float(m.council_ts)) < 1.0:   # окно совета считается от обрыва — это не новый приказ
                 L.append(f"Последний полный совет прерван {int((now - cut) // 60)} мин назад (не уложился в срок"
                          + (f", шёл {int(dur // 60)} мин" if dur is not None else "") + f") — действующий приказ "
                          f"прежний; {frz}")
             else:
-                L.append(f"Последний полный совет: {int((now - m.council_ts) // 60)} мин назад"
-                         + (f", длился {int(dur // 60)} мин" if dur is not None else "") + f" ({frz})")
+                # ревью 5.4.3 (стенд): возраст — от приказа, а не от начала совета («50 мин назад» при приказе 12 мин назад)
+                L.append(f"Последний полный совет: {self._council_age(m, now)}; {frz}")
         sr = self.session_risk.state() if self.session_risk else {}
         if sr:
             L.append(f"Killswitch: {'ЗАБЛОКИРОВАН' if sr.get('locked') else 'ок'}"
                      f" (дневной лимит {sr.get('day_loss_limit')})")
         return "\n".join(L)
+
+    def _council_age(self, m: "Mission", now: float) -> str:
+        """Ревью 5.4.3 (находка стенда): возраст последнего полного совета — от его ПРИКАЗА, а не от начала (совет идёт
+        десятки минут: «50 мин назад» при приказе 12 мин назад вводил в заблуждение). Приказ пришёл после начала совета
+        (m.exec_ts ≥ m.council_ts) — «приказ пришёл N мин назад (совет шёл M мин, начат HH:MM)»; совет кончился без
+        приказа (упал, приказ не собрался) — «начат HH:MM (N мин назад), шёл M мин, нового приказа не дал». Числа — из
+        записи миссии (council_ts, council_dur, exec_ts)."""
+        c0 = _f(getattr(m, "council_ts", None), 0.0) or 0.0
+        dur = _f(getattr(m, "council_dur", None))
+        ex_ts = _f(getattr(m, "exec_ts", None), 0.0) or 0.0
+        if ex_ts and ex_ts >= c0:
+            went = f"совет шёл {int(dur // 60)} мин, " if dur is not None else "совет "
+            return f"приказ пришёл {int(max(0.0, now - ex_ts) // 60)} мин назад ({went}начат {self._hhmm(c0)})"
+        return (f"начат {self._hhmm(c0)} ({int(max(0.0, now - c0) // 60)} мин назад)"
+                + (f", шёл {int(dur // 60)} мин" if dur is not None else "") + ", нового приказа не дал")
 
     def _review_silent(self, reason: str) -> None:
         """v5.3 фаза 3: PRO промолчал на перепроверке (таймаут / сеть / не JSON) — не ждать плановой
@@ -2176,6 +2238,90 @@ class MissionPilot(ai_pilot.AIPilot):
         «не разобрано» (решения нет, переспрос), а не молчаливый ЖДЁМ базового разбора подстрок."""
         return ai_v5.decision_of(raw, ai_v5.review_table(in_pos, side))
 
+    def _review_situation(self, price: float) -> str:
+        """Ситуация перепроверки: _situation_for_ai (ПРОКОЛ СКАНЕРА первым, пока PRO его не разобрал) + повод
+        внеплановой и отказ окна совета — ровно то, что видит дежурный PRO (сборка синхронная, без сети)."""
+        situation = self._situation_for_ai(price)
+        if self._review_reason:
+            situation += f"\nПОВОД ПЕРЕПРОВЕРКИ (внеплановая): {self._review_reason}"
+        if self._council_blocked:
+            situation += f"\nСОВЕТ: {self._council_blocked}"
+        return situation
+
+    def _review_wyckoff(self, price: float, text: str) -> tuple[str, str]:
+        """Ревью 5.4.3 (находка стенда): слой Вайкоффа у перепроверки — расчёт последнего совета (m.layers), а не
+        свежий: живой снимок (market_ctx.light) свечей не несёт, а новый сбор свечей на каждую перепроверку — сеть и
+        время. Поэтому честно: заголовок блока — «на момент совета HH:MM, N мин назад, цена тогда P» (m.wy_at), первой
+        строкой — где ТЕКУЩАЯ цена в боксах того расчёта и сколько до льда/крика (market_ctx.render_wyckoff_now; числа
+        только из краёв бокса и цены). Метки нет (состояние до 5.4.3) — «расчёт последнего совета; время не сохранено».
+        Возврат: (подпись для заголовка блока, текст блока)."""
+        m = self.mission
+        if m is None or not (text or "").strip():
+            return "", text or ""
+        wa = m.wy_at if isinstance(getattr(m, "wy_at", None), dict) else {}
+        t0, p0 = _f(wa.get("ts")), _f(wa.get("price"))
+        if t0:
+            head = f"на момент совета {self._hhmm(t0)}, {int(max(0.0, time.time() - t0) // 60)} мин назад"
+        else:
+            head = "расчёт последнего совета; время расчёта не сохранено"
+        if p0:
+            head += f", цена тогда {p0:g}"
+        now_line = ""
+        try:
+            now_line = market_ctx.render_wyckoff_now(wa.get("box"), price) if wa.get("box") else ""
+        except Exception as e:                       # noqa: BLE001
+            log.info("миссия %s: Вайкофф от текущей цены: %s", self.base, str(e)[:80])
+        return head, (f"{now_line}\n{text}" if now_line else text)
+
+    def _review_answered(self) -> None:
+        """Ответ перепроверки разобран: время ответа, пейсинг событий (от ответа PRO), повод, отложенное решение и
+        отказ окна совета сброшены — PRO их только что видел."""
+        self._last_review_ts = time.time()
+        if self._review_pulled:
+            self._last_event_review_ts = self._last_review_ts   # пейсинг событий — от ответа PRO
+        self._review_reason, self._review_kind, self._review_pulled = None, None, False
+        self._review_deferred = None                 # отложенное решение (если было) PRO только что видел в поводе
+        self._council_blocked = ""
+
+    def _review_record(self, obj: dict, choice: str, ai_choice: str, why: str, note: str, price: float,
+                       in_pos: bool, pos_side0: str | None) -> tuple[dict, dict]:
+        """Запись решения перепроверки (канон кода choice; ai_choice — что ответил ИИ, если код переписал): last_review с
+        ценой решения, разбор прокола, запись m.reviews, ДЕРЖАТЬ в позиции — уровни ставит/отклоняет код до записи
+        (_retune), будильник ЖДЁМ (_wake_after_review), серия ЖДЁМ (_streak_after_review). price — снимок, по которому
+        думал PRO. Стенд промптов (prompt_bench) строит историю сцен этой же функцией. Возврат: (запись, retune)."""
+        m = self.mission
+        self.last_review = {"choice": choice, "why": why, "ts": time.time(), "price": price, "in_pos": in_pos}
+        if self.puncture and self.puncture.get("pending"):    # W3: PRO разобрал прокол — блок больше не первым
+            self.puncture["pending"] = False
+            self.puncture["state"] = f"PRO решил: {_choice_label(self.last_review)} — {why[:120]}"
+        rec = {"ts": time.time(), "choice": choice, "why": why, "note": note,
+               "entry": _f(obj.get("entry")), "entry_kind": str(obj.get("entry_kind") or "")[:12] or None,
+               "invalidation": _f(obj.get("invalidation")), "take": _f(obj.get("take")), "price": price,
+               # v5.4.3: решение в позиции или вне — для строки «ЖДЁМ подряд»; ревью 5.4.3: и сторона позиции на
+               # момент промпта — память показывает ход «за лонг/шорт» (explain._review_how)
+               "in_pos": in_pos, "pos_side": pos_side0 if in_pos else None}
+        if ai_choice != choice:
+            rec["ai_choice"] = ai_choice                 # что ответил ИИ (запись — что сделал код и почему)
+        cur = self.prices[-1] if self.prices else price
+        # ревью 5.4.3 (D6): ДЕРЖАТЬ в позиции — уровни ставит или отклоняет код ДО записи: запись, толмач и следующая
+        # ситуация видят применённое и отказы (сторона, не число, повтор прежнего стопа под запертой прибылью), а не
+        # числа ИИ. Позиция сменилась, пока PRO думал, — ответ относился к прежней: уровни не трогаем
+        retune: dict = {}
+        if choice == "ЖДЁМ" and in_pos and self.position and self.position.get("side") == pos_side0:
+            retune = self._retune(obj, cur)
+            if retune.get("applied") or retune.get("refused"):
+                rec["retune"] = {"applied": retune["applied"], "refused": retune["refused"]}
+                self.last_review["retune"] = rec["retune"]
+        # v5.4.3: будильник ЖДЁМ — уровень из entry ответа ЖДЁМ вне рынка; ревью 5.4.3 (D1/D2) — _wake_after_review
+        self._wake_after_review(choice, rec, in_pos, price, why)
+        self._streak_after_review(choice, in_pos, price)          # ревью 5.4.3: серия ЖДЁМ вне рынка — свой счётчик
+        if m is not None:
+            m.reviews.append(rec)
+            del m.reviews[:-REVIEWS_KEEP]
+            m.reviews_since_memory += 1
+            _persist(m)
+        return rec, retune
+
     async def _review(self, price: float) -> None:
         m = self.mission
         in_pos = self.position is not None
@@ -2207,11 +2353,9 @@ class MissionPilot(ai_pilot.AIPilot):
             "partners": partners_txt, "memory": (m.memory if m else "") or ""})
         # v5.4.2: снимок решения — цена, которую PRO видит в промпте (после сбора данных, а не при запуске задачи)
         price, snap_ts = (self.prices[-1] if self.prices else price), time.time()
-        situation = self._situation_for_ai(price)     # W3: блок ПРОКОЛ СКАНЕРА первым, пока PRO его не разобрал
-        if self._review_reason:
-            situation += f"\nПОВОД ПЕРЕПРОВЕРКИ (внеплановая): {self._review_reason}"
-        if self._council_blocked:
-            situation += f"\nСОВЕТ: {self._council_blocked}"
+        situation = self._review_situation(price)     # W3: блок ПРОКОЛ СКАНЕРА первым, пока PRO его не разобрал
+        # ревью 5.4.3: Вайкофф совета — с честной подписью (время, цена тогда) и расстояниями от текущей цены
+        wy_at, blocks["wyckoff"] = self._review_wyckoff(price, blocks["wyckoff"])
         s, u = prompts_mission.review(
             self.base, self.name, self._play(), situation=situation,
             light=blocks["light"], council_text=blocks["council"], prev_exec=blocks["prev_exec"],
@@ -2220,7 +2364,7 @@ class MissionPilot(ai_pilot.AIPilot):
             review_min=int(float(getattr(config, "PYTHIA_REVIEW_SEC", 1800)) // 60),
             scan=blocks["scan"], wyckoff=blocks["wyckoff"], scout=blocks["scout"], partners=blocks["partners"],
             memory=blocks["memory"], side=(self.position or {}).get("side"),
-            council_min=max(1, int(float(getattr(config, "PYTHIA_COUNCIL_GAP_SEC", 1800)) // 60)))
+            council_min=max(1, int(float(getattr(config, "PYTHIA_COUNCIL_GAP_SEC", 1800)) // 60)), wyckoff_at=wy_at)
         sb = {"situation": situation, **blocks}
         if m is not None:
             m.sizes["review"] = _sizes_rec(len(u), sb)
@@ -2246,12 +2390,7 @@ class MissionPilot(ai_pilot.AIPilot):
         if choice is None:
             self._review_silent(f"ответ не разобран: {raw_choice[:60] or 'пусто'}")
             return
-        self._last_review_ts = time.time()
-        if self._review_pulled:
-            self._last_event_review_ts = self._last_review_ts   # пейсинг событий — от ответа PRO
-        self._review_reason, self._review_kind, self._review_pulled = None, None, False
-        self._review_deferred = None                 # отложенное решение (если было) PRO только что видел в поводе
-        self._council_blocked = ""
+        self._review_answered()
         if m is not None:
             m.sizes["review"] = _sizes_rec(len(u), sb, _json_len(obj))
         why = str(obj.get("why") or "")[:300]
@@ -2267,37 +2406,10 @@ class MissionPilot(ai_pilot.AIPilot):
                                                        or (pos_side == "short" and play == "short")):
             why = f"[ПЕРЕВЕРНУТЬ против режима {play} — только ЗАКРЫТЬ] " + why
             choice = "ЗАКРЫТЬ"
-        self.last_review = {"choice": choice, "why": why, "ts": time.time(), "price": price, "in_pos": in_pos}
-        if self.puncture and self.puncture.get("pending"):    # W3: PRO разобрал прокол — блок больше не первым
-            self.puncture["pending"] = False
-            self.puncture["state"] = f"PRO решил: {_choice_label(self.last_review)} — {why[:120]}"
-        rec = {"ts": time.time(), "choice": choice, "why": why, "note": note,
-               "entry": _f(obj.get("entry")), "entry_kind": str(obj.get("entry_kind") or "")[:12] or None,
-               "invalidation": _f(obj.get("invalidation")), "take": _f(obj.get("take")), "price": price,
-               # v5.4.3: решение в позиции или вне — для строки «ЖДЁМ подряд»; ревью 5.4.3: и сторона позиции на
-               # момент промпта — память показывает ход «за лонг/шорт» (explain._review_how)
-               "in_pos": in_pos, "pos_side": pos_side0 if in_pos else None}
-        if ai_choice != choice:
-            rec["ai_choice"] = ai_choice                 # что ответил ИИ (запись — что сделал код и почему)
+        rec, retune = self._review_record(obj, choice, ai_choice, why, note, price, in_pos, pos_side0)
         cur = self.prices[-1] if self.prices else price
-        # ревью 5.4.3 (D6): ДЕРЖАТЬ в позиции — уровни ставит или отклоняет код ДО записи: запись, толмач и следующая
-        # ситуация видят применённое и отказы (сторона, не число, повтор прежнего стопа под запертой прибылью), а не
-        # числа ИИ. Позиция сменилась, пока PRO думал, — ответ относился к прежней: уровни не трогаем
-        retune: dict = {}
-        if choice == "ЖДЁМ" and in_pos and self.position and self.position.get("side") == pos_side0:
-            retune = self._retune(obj, cur)
-            if retune.get("applied") or retune.get("refused"):
-                rec["retune"] = {"applied": retune["applied"], "refused": retune["refused"]}
-                self.last_review["retune"] = rec["retune"]
-        # v5.4.3: будильник ЖДЁМ — уровень из entry ответа ЖДЁМ вне рынка; ревью 5.4.3 (D1/D2) — _wake_after_review
-        self._wake_after_review(choice, rec, in_pos, price, why)
         lvl_w = _f((self._wake or {}).get("level"), 0.0) or 0.0
-        self._streak_after_review(choice, in_pos, price)          # ревью 5.4.3: серия ЖДЁМ вне рынка — свой счётчик
         if m is not None:
-            m.reviews.append(rec)
-            del m.reviews[:-REVIEWS_KEEP]
-            m.reviews_since_memory += 1
-            _persist(m)
             _bg(bus.stage("mission", m.run_id, "review", "done", ticker=self.base,
                           detail=f"{_choice_label(rec)}: {why}", data=rec))   # метка модели; канон — в data
             # v5.4.3: у ЖДЁМ уровень — будильник, не «вход» (вне рынка без будильника entry не используется). Ревью
@@ -3125,10 +3237,11 @@ class MissionPilot(ai_pilot.AIPilot):
         if not nf:
             return ""
         out = []
+        fresh: list[dict] = []
         try:
-            fresh = nf.fresh_since(self._last_review_ts or self.started_ts) or []
+            fresh = (nf.fresh_since(self._last_review_ts or self.started_ts) or [])[:40]
             if fresh:
-                out.append("— свежие:\n" + _render_all(nf, fresh[:40]))
+                out.append("— свежие:\n" + _render_all(nf, fresh))
         except Exception as e:                       # noqa: BLE001
             log.info("новости у троса: %s", str(e)[:60])
         try:
@@ -3136,8 +3249,10 @@ class MissionPilot(ai_pilot.AIPilot):
             own, dropped = self._news_after_council(own)
             if dropped:
                 out.append(dropped)
-            if own:
-                out.append("— по инструменту:\n" + _render_all(nf, own[:40]))
+            own, dup = _news_not_shown(own, fresh)   # ревью 5.4.3: как у перепроверки — одна новость один раз
+            own_txt = _own_news_block(nf, own[:40], dup)
+            if own_txt:
+                out.append(own_txt)
         except Exception as e:                       # noqa: BLE001
             log.info("новости у троса: %s", str(e)[:60])
         return "\n\n".join(out)
@@ -4129,13 +4244,33 @@ class MissionPilot(ai_pilot.AIPilot):
 
     def _profits_text(self, pos: dict | None = None) -> str:
         """Прошлые мысли о прибыли (по этой позиции, если она дана) — для промпта. v5.4.2: молчание и непонятный
-        ответ — «ответа не было … решения не было» (запись кода), не «ДЕРЖАТЬ» от имени ИИ."""
+        ответ — «ответа не было … решения не было» (запись кода), не «ДЕРЖАТЬ» от имени ИИ. Ревью 5.4.3 (сверка промпта
+        с кодом): у ДЕРЖАТЬ/СОВЕТ — что код сделал с lock_price и take (applied: «прибыль заперта триггером X» или
+        «lock_price X не принят: …»), а не число ИИ как факт «триггер → X» (промпт обещает: не принят — триггер не тронут)."""
         since = _f((pos or {}).get("opened_ts"), 0.0)
+
+        def _done(x: dict) -> str:
+            if x.get("decision") in ("ДЕРЖАТЬ", "СОВЕТ") and x.get("applied"):
+                return f" [код: {x['applied']}]"
+            return ((f" (триггер → {x.get('lock_price')})" if x.get("lock_price") else "")
+                    + (f" (цель → {x.get('take')})" if x.get("take") else ""))
         return "\n".join((f"{ai_v5.fmt_ts(x.get('ts'))} @{x.get('price')}: {x.get('why')}" if x.get("silent") else
-                          f"{ai_v5.fmt_ts(x.get('ts'))} @{x.get('price')}: {x.get('decision')} — {x.get('why')}"
-                          + (f" (триггер → {x.get('lock_price')})" if x.get("lock_price") else "")
-                          + (f" (цель → {x.get('take')})" if x.get("take") else ""))
+                          f"{ai_v5.fmt_ts(x.get('ts'))} @{x.get('price')}: {x.get('decision')} — {x.get('why')}" + _done(x))
                          for x in self.profits[-5:] if _f(x.get("ts"), 0.0) >= since)
+
+    def _profit_plan_text(self, pos: dict) -> str:
+        """Блок ПЛАН И ПРОШЛЫЕ РЕШЕНИЯ мысли о прибыли: приказ (_exec_text), три последние перепроверки метками модели
+        (_choice_label: КУПИТЬ, ДЕРЖАТЬ) и строка УРОВНИ ПОЗИЦИИ — фактические вход, триггер, трос, тейк (стенд промптов
+        берёт этот же текст)."""
+        m = self.mission
+        plan_txt = _exec_text(m) if m else ""
+        if m and m.reviews:
+            plan_txt += "\nПерепроверки: " + "; ".join(
+                f"{ai_v5.fmt_ts(r.get('ts'))} {_choice_label(r)} — {str(r.get('why') or '')}" for r in m.reviews[-3:])
+        plan_txt += (f"\nУРОВНИ ПОЗИЦИИ: вход {_f(pos.get('entry'), 0.0):g}, триггер (мягкий стоп) {pos.get('invalidation')}, "
+                     f"{self._hard_name()} {pos.get('hard_stop')}, тейк {pos.get('take')}"
+                     + (f"; прибыль уже заперта триггером" if pos.get("profit_lock") or pos.get("take_holds") else ""))
+        return plan_txt
 
     async def _profit_think(self, price: float, pos: dict, reason: str) -> dict:
         """Вопрос PRO о прибыли: те же данные, что у троса/тейка, + повод + прошлые мысли →
@@ -4159,13 +4294,7 @@ class MissionPilot(ai_pilot.AIPilot):
             except Exception as e:                   # noqa: BLE001
                 return f"(живой рынок недоступен: {str(e)[:60]})"
 
-        plan_txt = _exec_text(m) if m else ""
-        if m and m.reviews:
-            plan_txt += "\nПерепроверки: " + "; ".join(
-                f"{ai_v5.fmt_ts(r.get('ts'))} {_choice_label(r)} — {str(r.get('why') or '')}" for r in m.reviews[-3:])
-        plan_txt += (f"\nУРОВНИ ПОЗИЦИИ: вход {_f(pos.get('entry'), 0.0):g}, триггер (мягкий стоп) {pos.get('invalidation')}, "
-                     f"{self._hard_name()} {pos.get('hard_stop')}, тейк {pos.get('take')}"
-                     + (f"; прибыль уже заперта триггером" if pos.get("profit_lock") or pos.get("take_holds") else ""))
+        plan_txt = self._profit_plan_text(pos)
         got = {"light": "(живой рынок не успел собраться)", "scout": "", "partners": ""}
 
         def _src() -> dict:
@@ -5333,6 +5462,13 @@ if __name__ == "__main__":
     # ревью 5.4.2: ручки «свободного пилота» — на умолчаниях (data/config_user.json и окружение владельца не роняют тест)
     config.pin_free_pilot_defaults()
     ai_pilot.TICK_SEC = 0.01
+    # ревью 5.4.3 (находки стенда): одна новость — один раз; метка слоя Вайкоффа совета
+    _n1, _n2 = {"id": "a", "ts": 1.0, "title": "x"}, {"id": "b", "ts": 2.0, "title": "y"}
+    assert _news_not_shown([_n1, _n2], [dict(_n1)]) == ([_n2], 1) and _news_not_shown([_n1], []) == ([_n1], 0)
+    assert _news_key({"ts": 5.0, "ai": {"one_liner": "z"}}) == ("t", "z", 5.0)
+    assert _wyckoff_at({"ts": 10.0, "price": 99.5, "wyckoff_box": {"H1": {"lo": 98.0, "hi": 101.0, "atr": 3.0}}}) == \
+        {"ts": 10.0, "price": 99.5, "box": {"H1": {"lo": 98.0, "hi": 101.0, "atr": 3.0}}}
+    assert _wyckoff_at({}, None) is None and _wyckoff_at({"price": 99.0}, 7.0)["ts"] == 7.0
     # FakeBroker below fills orders without updating FakeTinkoff.portfolio.
     # Its empty snapshot must not randomly erase a position while assertions run;
     # account reconciliation has its own scenarios in ai_pilot's self-test.
@@ -5939,7 +6075,10 @@ if __name__ == "__main__":
         assert "триггер (мягкий стоп) @98" in ur and "аварийный трос биржи @" in ur, ur[:1200]
         assert "размер входа/добора считает биржа" not in ur or "свободно" in ur
         assert fake_ai.calls.count("scout") == 1, "перепроверка НЕ спрашивает FLASH заново — только свежие числа"
-        assert "ПОВОД ПЕРЕПРОВЕРКИ" not in ur and "Последний полный совет: 0 мин назад" in ur, ur[:900]
+        # ревью 5.4.3 (находки стенда): возраст совета — от приказа; Вайкофф совета — с подписью времени и цены тогда
+        assert "ПОВОД ПЕРЕПРОВЕРКИ" not in ur and "Последний полный совет: приказ пришёл 0 мин назад (совет шёл" in ur, ur[:900]
+        assert f"═══ ВАЙКОФФ (на момент совета {p._hhmm(m.wy_at['ts'])}, 0 мин назад, цена тогда " in ur, ur[:1500]
+        assert "ВАЙКОФФ (на момент разбора)" not in ur
         assert m.sizes["review"]["prompt"] == len(ur) and m.sizes["review"]["answer"] > 0
         assert m.sizes["review"]["blocks"]["scan"] > 0 and not fake_ai.shrink_calls
         assert len(StubNews.enriched) >= 2, "перед перепроверкой — целевые новости"

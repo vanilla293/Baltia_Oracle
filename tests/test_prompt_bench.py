@@ -6,8 +6,11 @@
 JSON-узлов, время МСК) и воспроизводимо; тексты, которые в бою собирает mission.py (ситуация, приказ, план и ответы у
 двери, ход цены, новости, итог совета, сканер, prev совета), — из боевых сборщиков на сцене (настоящие Mission +
 MissionPilot, замороженное время), и промпт стенда совпадает байт в байт с тем, что собирает настоящий узел
-(MissionPilot._review / _entry_check / _profit_think) на тех же данных; запись перепроверки сцены — та же, что пишет
-_review; вызовы ИИ — те же маршруты, что у mission.py (mission_review / mission_entry / mission_profit /
+(MissionPilot._review / _entry_check / _profit_think) на тех же данных; история сцены — настоящими функциями 5.4.3
+(после F1): ответ перепроверки — _review_answered / _review_record (запись с in_pos/pos_side, метка модели, будильник,
+серия ЖДЁМ m.wait_streak), и запись сцены — та же, что пишет _review; находки стенда исправлены в бою (Вайкофф совета
+с подписью и расстояниями от текущей цены, новость — один раз, возраст совета — от приказа); вызовы ИИ — те же
+маршруты, что у mission.py (mission_review / mission_entry / mission_profit /
 mission_verdict; у денег — срок попытки); слово решения — ai_v5.decision_of по словарям узлов, неразобранное и сбой —
 silent («ответа не было»), стенд идёт дальше; отчёты (текст, markdown, JSON) содержат все ситуации; --dump пишет 28
 файлов без ИИ; без ключа и без мока — код 2. Без сети: ai_v5.pro_json / money_json / pro_text подменены; в data/ ничего
@@ -66,10 +69,12 @@ def test_prompts_are_reproducible_and_selfcheck_passes():
 
 @pytest.mark.parametrize("sid,piece", pb.FORMAT_PIECES)
 def test_blocks_in_combat_format(sid, piece):
-    """Строки mission.py 5.4.3 в промптах стенда: цена ожидания (приказ WAIT — цена тогда → сейчас, ориентир — не
-    условие), прошлая перепроверка с ценой решения, «ЖДЁМ подряд», будильник, длительность совета, взведённый вход,
-    пройденный пробой, дверь без петли своих отговорок (ЖДАТЬ — факт с исходом по цене), повод перепроверки из
-    наблюдателей тика, prev совета со свёрнутыми перепроверками."""
+    """Строки mission.py 5.4.3 (после F1 и находок стенда) в промптах стенда: цена ожидания (приказ WAIT — цена тогда →
+    сейчас, ориентир — не условие), прошлая перепроверка с ценой решения и меткой модели (ДЕРЖАТЬ в позиции), «ЖДЁМ
+    подряд» по счётчику серии (с какого времени, цена за серию), будильник, возраст совета от приказа, Вайкофф совета с
+    подписью и расстояниями от текущей цены, новость по тикеру — один раз, взведённый вход, пройденный пробой, дверь без
+    петли своих отговорок (ЖДАТЬ — факт с исходом по цене), повод перепроверки из наблюдателей тика, prev совета со
+    свёрнутыми перепроверками."""
     system, user = pb.build(pb.BY_ID[sid])
     assert piece in user or piece in system, (sid, piece)
 
@@ -114,6 +119,52 @@ def test_bench_prompt_equals_combat_node(sid):
 def test_scene_review_record_is_combat(sid, answer):
     """Запись перепроверки, которую сцена кладёт в историю, — та же, что пишет настоящий MissionPilot._review."""
     pb.check_review_record(sid, answer)
+
+
+def test_scene_history_goes_through_combat_functions():
+    """История сцен — настоящими функциями mission.py 5.4.3 (после F1): серия ЖДЁМ — счётчик m.wait_streak
+    (_streak_after_review + мин/макс по тикам _flat_track), запись с in_pos/pos_side (_review_record), будильник ЖДЁМ
+    без entry остаётся (_wake_after_review), метка модели ДЕРЖАТЬ в позиции."""
+    sc = pb.SCENES["range_mid_wait"]()
+    ws = sc.m.wait_streak
+    assert ws["n"] == 2 and ws["ts"] == pb.ts("10:14") and ws["price"] == 302.2, ws
+    assert (ws["lo"], ws["hi"]) == (299.4, 302.2), "цена за серию — с первого ЖДЁМ, по тикам"
+    assert sc.m.reviews[-1]["in_pos"] is False and sc.m.reviews[-1]["pos_side"] is None
+    assert sc.p._wake["level"] == 304.0 and sc.m.reviews[-1]["wake"] == 304.0
+    dm = pb.SCENES["dead_market"]()
+    assert dm.m.wait_streak["n"] == 6 and len(dm.m.reviews) == 6
+    lp = pb.SCENES["long_pressure"]()
+    rec = lp.m.reviews[-1]
+    assert rec["in_pos"] is True and rec["pos_side"] == "long" and lp.m.wait_streak is None, rec
+    assert lp.p.last_review["in_pos"] is True and mission._choice_label(lp.p.last_review) == "ДЕРЖАТЬ"
+    # ЖДЁМ без entry оставляет несработавший будильник (ревью 5.4.3, D1) — сцена идёт через настоящую функцию
+    sc2 = pb.SCENES["range_mid_wait"]()
+    sc2.review("11:20", "ЖДЁМ", "без нового уровня", 300.0)
+    assert sc2.p._wake["level"] == 304.0 and sc2.m.reviews[-1].get("wake_kept") is True
+    assert sc2.m.wait_streak["n"] == 3
+
+
+def test_bench_findings_are_fixed_in_combat_code():
+    """Три находки стенда исправлены в боевом коде (промпт стенда = боевой узел байт в байт):
+    (1) Вайкофф у перепроверки — подпись «на момент совета HH:MM, N мин назад, цена тогда P» и строка расстояний до
+    краёв бокса от ТЕКУЩЕЙ цены; (2) свежая новость по тикеру — один раз; (3) возраст совета — от приказа."""
+    s1 = pb.BY_ID["range_mid_wait"]["args"]
+    assert s1["wyckoff_at"] == "на момент совета 09:22, 118 мин назад, цена тогда 299.8"
+    assert s1["wyckoff"].startswith("СЕЙЧАС от цены 300 (края бокса — расчёт совета): D1 бокс 288.4 … 309.6")
+    assert "цена 299.8 на 54% высоты бокса" in s1["wyckoff"], "слой совета — как был, под своей подписью"
+    _, u1 = pb.build(pb.BY_ID["range_mid_wait"])
+    assert "ВАЙКОФФ (на момент разбора)" not in u1 and "═══ ВАЙКОФФ (на момент совета 09:22" in u1
+    sc = pb.SCENES["range_mid_wait"]()
+    assert sc.m.wy_at["ts"] == pb.ts("09:22") and sc.m.wy_at["price"] == 299.8 and set(sc.m.wy_at["box"]) == {"D1", "H1"}
+    # (2) ЦБ 10:40 — и в «свежих», и по тикеру: в промпте один раз
+    _, un = pb.build(pb.BY_ID["news_shock"])
+    assert un.count("[7c21e0]") == 1 and "— по инструменту (кроме свежих выше):" in un
+    _, ul = pb.build(pb.BY_ID["long_pressure"])
+    assert ul.count("[a4c9f2]") == 1 and "— по инструменту: только свежие выше" in ul
+    # (3) door_now: совет 10:30–11:08, сейчас 11:20 — приказ 12 мин назад (раньше «50 мин назад»)
+    sd = pb.BY_ID["door_now"]["args"]["situation"]
+    assert "Последний полный совет: приказ пришёл 12 мин назад (совет шёл 38 мин, начат 10:30)" in sd
+    assert "Последний полный совет: 50 мин назад" not in sd
 
 
 def test_verdict_prev_and_news_from_combat_builders():
