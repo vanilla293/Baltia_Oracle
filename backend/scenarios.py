@@ -1651,7 +1651,7 @@ async def s23_puncture_plan(sc: Scene) -> None:
     ur = fake_ai.last_user["mission_review"]
     assert ur.index("ПРОКОЛ СКАНЕРА: сторона ВВЕРХ, стойкость 78 %") < ur.index("Цена сейчас") and "возможный момент входа" in ur
     assert "ПОВОД ПЕРЕПРОВЕРКИ (внеплановая): прокол сканера вверх 78 % (вход" in ur, ur[-600:]
-    assert sc.p.puncture["state"].startswith("PRO решил: КУПИТЬ_СЕЙЧАС")
+    assert sc.p.puncture["state"].startswith("PRO решил: КУПИТЬ")   # метка модели (ревью 5.4.3)
     await sc.tick(101.0)
     await sc.tick(101.0)
     assert sc.p.position and sc.p.position["side"] == "long", sc.p.last_action
@@ -1697,7 +1697,7 @@ async def s24_puncture_against_position(sc: Scene) -> None:
     assert await sc.settle(lambda: fake_ai.count("mission_review") == 1 and not sc.p._review_busy)
     ur = fake_ai.last_user["mission_review"]
     assert ur.index("ПРОКОЛ СКАНЕРА") < ur.index("Цена сейчас") and "прокол сканера вниз 78 % (угроза" in ur
-    assert not sc.p.puncture["pending"] and sc.p.puncture["state"].startswith("PRO решил: ЖДЁМ")
+    assert not sc.p.puncture["pending"] and sc.p.puncture["state"].startswith("PRO решил: ДЕРЖАТЬ")   # в позиции — метка модели
     # 4) другая полоса (после пейсинга) → триаж САМ подтянуть трос — без PRO, состояние прокола «подтянут»
     StubScan.puncture = _punc("вниз", 98.4, 98.8, 0.66)
     sc.p._last_puncture_ts = 0.0
@@ -2627,6 +2627,73 @@ async def s42_wait_alarm(sc: Scene) -> None:
     sc.note = "ЖДЁМ с уровнем 101 → будильник; цена 101.3 → PRO по поводу «прошла уровень» → КУПИТЬ → вход; будильник снят"
 
 
+async def s43_wait_alarm_kept(sc: Scene) -> None:
+    """Ревью 5.4.3 (D1/D2): будильник ЖДЁМ снимается только явным решением. ЖДЁМ с уровнем 101 → плановая перепроверка
+    отвечает ЖДЁМ без entry («будильник стоит — ждём его») — будильник остаётся; цена прошла 101, пока PRO думал над
+    плановой, — повод сразу после его ответа (а не молча); PRO по поводу снова ЖДЁМ у 101 («вынос без объёма») — цена
+    пилит уровень ±0.05 %, тот же уровень в окне PYTHIA_EVENT_COOL_SEC не будит (в ситуации «будильник на 101 уже
+    срабатывал»); ответ КУПИТЬ снимает будильник."""
+    sc.p.plan = None
+    wait, err = mission._validate_exec({"do": "WAIT", "wait_for": "нужен объём покупателя", "why": "стенд: вне рынка",
+                                        "plan": "ждём"}, "auto", 100.0)
+    assert wait and not err and wait["levels"] == [], (wait, err)
+    assert sc.p.adopt_forecast({"exec": wait}) and sc.p.plan is None
+    sc.m.exec, sc.m.exec_ts = wait, time.time()
+    await sc.tick(100.0, n=2)                     # стакан появился, рынок жив
+
+    def wakes() -> list:
+        return [h for h in sc.m.handoffs if h.get("kind") == "wait_level"]
+
+    # 1) ЖДЁМ с уровнем 101 → будильник
+    sc.p.review_ts = 0.0
+    fake_ai.queue("mission_review", {"choice": "ЖДЁМ", "why": "пробоя 101 нет — жду", "entry": 101.0})
+    await sc.tick(100.0)
+    assert await sc.settle(lambda: fake_ai.count("mission_review") == 1 and not sc.p._review_busy)
+    wk = sc.p._wake
+    assert wk and wk["level"] == 101.0 and wk["dir"] == "up" and not wk["fired"], wk
+    # 2) плановая перепроверка: ЖДЁМ без entry, а цена прошла 101, пока PRO думал → будильник цел и будит после ответа
+    orig = fake_ai.pro_json
+
+    async def thinking(system, user, *, route="pro", max_tokens=None):
+        if route == "mission_review":             # пока PRO думает, рынок идёт за уровень
+            FakeTinkoff.price = 101.3
+            sc.p.prices.append(101.3)
+        return await orig(system, user, route=route, max_tokens=max_tokens)
+    sc.patch(fake_ai, "pro_json", thinking)
+    sc.p.review_ts = 0.0
+    fake_ai.queue("mission_review", {"choice": "ЖДЁМ", "why": "будильник на 101 стоит — ждём его"})
+    await sc.tick(100.4)
+    assert await sc.settle(lambda: fake_ai.count("mission_review") == 2 and not sc.p._review_busy)
+    fake_ai.pro_json = orig
+    ur = fake_ai.last_user["mission_review"]
+    assert "БУДИЛЬНИК: уровень 101 из твоего ЖДЁМ" in ur and "при проходе цены код разбудит" in ur, ur[:1500]
+    assert sc.m.reviews[-1]["wake_kept"] and len(wakes()) == 1, (sc.m.reviews[-1], sc.m.handoffs)
+    assert "(пока ты думал над прошлым ответом)" in wakes()[0]["reason"] and sc.p._wake["fired"], wakes()
+    # 3) PRO по поводу: снова ЖДЁМ у 101 → пила у уровня в окне PYTHIA_EVENT_COOL_SEC PRO не будит
+    sc.p._last_review_ts -= mission.EVENT_MIN_GAP_SEC + 60
+    sc.p.review_ts = 0.0
+    fake_ai.queue("mission_review", {"choice": "ЖДЁМ", "why": "у 101 без объёма — вынос", "entry": 101.0})
+    await sc.tick(101.3)
+    assert await sc.settle(lambda: fake_ai.count("mission_review") == 3 and not sc.p._review_busy)
+    ur = fake_ai.last_user["mission_review"]
+    assert "ПОВОД ПЕРЕПРОВЕРКИ (внеплановая): цена 101.3 прошла уровень 101" in ur and "сработал в" in ur, ur[:1500]
+    wk = sc.p._wake
+    assert wk and wk["level"] == 101.0 and wk["dir"] == "down" and not wk["fired"], wk
+    assert "будильник на 101 уже срабатывал в" in sc.p._situation_text(101.3)
+    sc.p._last_review_ts -= mission.EVENT_MIN_GAP_SEC + 60
+    for px in (100.95, 101.05, 100.94, 101.06):
+        await sc.tick(px)
+    assert len(wakes()) == 1 and fake_ai.count("mission_review") == 3, "пинг-понга у уровня нет"
+    # 4) ответ КУПИТЬ снимает будильник
+    sc.p.review_ts = 0.0
+    fake_ai.queue("mission_review", {"choice": "КУПИТЬ", "why": "поглощение у 101", "invalidation": 100.3, "take": 104.0})
+    await sc.tick(100.95)
+    assert await sc.settle(lambda: fake_ai.count("mission_review") == 4 and not sc.p._review_busy)
+    assert sc.p._wake is None and (sc.p.plan or sc.p.position or sc.p.pending), sc.p.last_action
+    sc.note = ("ЖДЁМ у 101 → плановая без entry будильник не сняла; проход за раздумья → повод сразу; пила у 101 — "
+               "PRO один раз; КУПИТЬ снял будильник")
+
+
 SCENARIOS: list[tuple[str, Callable[[Scene], Awaitable[None]]]] = [
     ("гэп_за_трос", s01_gap_hard), ("гэп_за_триггер", s02_gap_trigger), ("мёртвый_рынок", s03_dead_market),
     ("рынок_закрыт", s04_market_closed), ("частичка_30042", s05_partial_then_30042),
@@ -2650,6 +2717,8 @@ SCENARIOS: list[tuple[str, Callable[[Scene], Awaitable[None]]]] = [
     ("совет_держать", s41_council_hold),
     # v5.4.3 «решительный пилот»: уровень из ЖДЁМ — будильник, а не молча выброшенное число
     ("ждём_будильник", s42_wait_alarm),
+    # ревью 5.4.3: будильник снимается только явным решением, проход за раздумья — повод, без пинг-понга у уровня
+    ("будильник_держит", s43_wait_alarm_kept),
 ]
 
 
@@ -2725,4 +2794,5 @@ if __name__ == "__main__":
           "паника всё равно, GetStopOrders недоступен → force, продажа владельца во время выхода, паника не липнет к тикеру; "
           "v5.4.1: PRO у двери ЖДАТЬ/ОТМЕНИТЬ/молчит, мысль о прибыли ВЫЙТИ/ПЕРЕЗАЙТИ/СОВЕТ, рывок в плюсе, приказ WAIT, "
           "стопы только в программе; ревью 5.4.2: совет «держать» — HOLD без добора, молчание у троса/тейка — запись кода; "
-          "v5.4.3: ЖДЁМ с уровнем — будильник, проход цены → PRO решает заново)")
+          "v5.4.3: ЖДЁМ с уровнем — будильник, проход цены → PRO решает заново; ревью 5.4.3: ЖДЁМ без entry будильник "
+          "не снимает, проход за раздумья — повод, пила у уровня не будит повторно)")

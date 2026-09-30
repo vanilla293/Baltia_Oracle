@@ -47,8 +47,10 @@ HEAD_RESERVE = 6_000          # запас под шапку промпта пр
 _STATE: dict[str, Any] = {"task": None, "run_id": None, "model": None, "cleared_ts": 0.0}
 _STUBS: dict[str, Any] = {}   # self-тест: подмены модулей по имени
 
-_PHASE_RU = {"council": "совет думает", "armed": "засада", "entering": "вхожу", "in_position": "в позиции",
-             "stopped": "пилот остановлен", "panic": "паника", "idle": "вне рынка / жду план", "error": "ошибка"}
+# ревью 5.4.3: фазы нейтрально, как в промптах миссии 5.4.3 — «вне рынка, плана нет» (не «жду план»), засада — вход взведён
+_PHASE_RU = {"council": "совет думает", "armed": "вход взведён (засада)", "entering": "вхожу", "in_position": "в позиции",
+             "stopped": "пилот остановлен", "panic": "паника", "idle": "вне рынка, плана нет", "error": "ошибка"}
+_LABEL_ENTRY = {"КУПИТЬ_СЕЙЧАС": "КУПИТЬ", "ПРОДАТЬ_СЕЙЧАС": "ПРОДАТЬ"}
 _SILENT = ("НЕТ_ОТВЕТА", "НЕ_РАЗОБРАН")   # v5.4.2: сбой ИИ — «решения не было», не ЖДАТЬ
 
 
@@ -116,15 +118,56 @@ def _dialog_text(h: list[dict]) -> str:
 
 
 # ── контекст ──────────────────────────────────────────────────────────────────
-def _said(rec: dict, key: str) -> str:
+def _label(rec: dict) -> str:
+    """Ревью 5.4.3: решение перепроверки так, как модель его выбирала (mission._choice_label): КУПИТЬ_СЕЙЧАС —
+    «КУПИТЬ», ЖДЁМ в позиции — «ДЕРЖАТЬ». Канон в записи прежний."""
+    c = str(rec.get("choice") or "")
+    return _LABEL_ENTRY.get(c) or ("ДЕРЖАТЬ" if c == "ЖДЁМ" and rec.get("in_pos") else c)
+
+
+def _move(p0, p1) -> str:
+    """Ход цены «(+1.20 %)»; нет цены — ''."""
+    a, b = _f(p0), _f(p1)
+    return f"({(b / a - 1) * 100:+.2f} %)" if a and b and a > 0 and b > 0 else ""
+
+
+def _said(rec: dict, key: str, cur=None) -> str:
     """Решение узла строкой «ЖДЁМ — почему». Сбой ИИ (silent, НЕТ_ОТВЕТА, НЕ_РАЗОБРАН) — «ответа не было —
-    решения не было», а не его ЖДАТЬ (v5.4.2)."""
+    решения не было», а не его ЖДАТЬ (v5.4.2). Ревью 5.4.3: перепроверка — меткой модели (_label) и с ценой решения и
+    ходом с тех пор, если цены есть («ЖДЁМ @100 → сейчас 101 (+1.00 %) — почему»)."""
     d = str(rec.get(key) or "")
     why = str(rec.get("why") or "")[:200]
     if rec.get("silent") or d.upper() in _SILENT:
         what = "ответ не разобран" if d.upper() == "НЕ_РАЗОБРАН" else "ответа не было"
         return f"{what} — решения не было" + (f" ({why})" if why else "")
-    return f"{d} — {why}"
+    lab = _label(rec) if key == "choice" else d
+    p0 = _f(rec.get("price"))
+    at = (f" @{p0:g}" + (f" → сейчас {_f(cur):g} {_move(p0, cur)}" if _f(cur) else "")) if p0 and key == "choice" else ""
+    return f"{lab}{at} — {why}"
+
+
+def _pilot_state(p: dict) -> str:
+    """Ревью 5.4.3: состояние пилота нейтрально (как mission._pilot_state_text у совета), без эха last_action
+    («вне рынка — ждал: …», «жду пробития …»): позиция / заявка / взведённый вход / вне рынка, плана нет."""
+    pos, plan = p.get("position"), p.get("plan") or {}
+    if pos:
+        s = f"в позиции {pos.get('side')} {pos.get('lots')} лот @{pos.get('entry')}"
+        if plan and plan.get("side") == pos.get("side"):
+            s += "; добор взведён"
+    elif p.get("pending"):
+        s = "заявка входа в полёте"
+    elif plan:
+        e = plan.get("entry")
+        s = (f"вход взведён: {plan.get('side')} " + (f"{plan.get('kind') or 'откат'} @{e}" if e is not None else "сейчас")
+             + f", стоп {plan.get('invalidation')}, тейк {plan.get('take')}")
+    else:
+        s = "вне рынка, плана нет"
+    st = str(p.get("state") or "")
+    if st == "РЫНОК_ЗАКРЫТ":
+        s += "; биржа закрыта"
+    elif st == "СТОП":
+        s += "; пилот остановлен"
+    return s
 
 
 def _mission_text() -> tuple[str, dict]:
@@ -157,11 +200,26 @@ def _mission_text() -> tuple[str, dict]:
     ex = st.get("exec") or {}
     if ex:
         do = str(ex.get("do") or "").upper()
-        if do == "WAIT":                         # v5.4.2: WAIT — чего ждал совет и уровни, без «вход сейчас … стоп None»
-            lv = ", ".join(f"{x:g}" if isinstance(x, (int, float)) else str(x) for x in (ex.get("levels") or [])) or "—"
-            L.append(f"Приказ совета ({ai_v5.fmt_ts(st.get('exec_ts'))}): WAIT — совет ждал: "
-                     f"{str(ex.get('wait_for') or '').strip()[:300] or '—'}; уровни: {lv}"
-                     + (f"; почему: {str(ex['why'])[:300]}" if ex.get("why") else ""))
+        if do == "WAIT":
+            # v5.4.2: WAIT — без «вход сейчас … стоп None». Ревью 5.4.3: подача как в миссии 5.4.3 (mission._exec_text) —
+            # ориентир совета (не условие), возраст приказа, цена тогда → сейчас; уровни — будильник кода, не вход
+            now = time.time()
+            ets = _f(st.get("exec_ts"))
+            n = int((now - ets) // 60) if ets else None
+            p0, p1 = _f(ex.get("price")), _f(st.get("price"))
+            age = (f" ({n} мин назад" + (f", цена тогда {p0:g}" if p0 else "") + ")") if n is not None else ""
+            row = (f"Приказ совета {ai_v5.fmt_ts(ets)}{age}: WAIT — вне рынка. Ориентир совета (не условие): "
+                   f"{str(ex.get('wait_for') or ex.get('why') or '').strip()[:300] or '—'}.")
+            if p0 and p1:
+                row += f" С тех пор цена {p0:g} → {p1:g} {_move(p0, p1)}."
+            lv = [x for x in (_f(v) for v in (ex.get("levels") or [])) if x]
+            if lv:
+                row += (f" Будильник кода у уровней {', '.join(f'{x:g}' for x in lv)}"
+                        + (" (числа из ориентира совета)" if ex.get("levels_src") == "wait_for" else "")
+                        + " — проход цены будит дежурного PRO, это не вход.")
+            if ex.get("why"):
+                row += f" Почему: {str(ex['why'])[:300]}"
+            L.append(row)
         elif do == "CLOSE":
             L.append(f"Приказ совета ({ai_v5.fmt_ts(st.get('exec_ts'))}): CLOSE — закрыть позицию"
                      + (f" — {str(ex['why'])[:300]}" if ex.get("why") else ""))
@@ -175,7 +233,8 @@ def _mission_text() -> tuple[str, dict]:
                      f" ({ex.get('entry_kind') or '—'}) тейк {ex.get('take')} стоп {ex.get('invalidation')}"
                      f" — {str(ex.get('why') or '')[:300]}")
         if ex.get("plan"):
-            L.append("План ведения: " + str(ex["plan"])[:600])
+            L.append(("Как совет видел ведение (прошлое мнение): " if do == "WAIT" else "План ведения: ")
+                     + str(ex["plan"])[:600])
     if st.get("account_pos"):
         L.append(str(st["account_pos"])[:300])
     p = st.get("pilot") or {}
@@ -192,7 +251,7 @@ def _mission_text() -> tuple[str, dict]:
             L.append("Позиции у пилота нет" + (f"; план: {pl.get('side')} вход "
                                                 f"{pl.get('entry') if pl.get('entry') is not None else 'сейчас'} "
                                                 f"стоп {pl.get('invalidation')} тейк {pl.get('take')}" if pl else ""))
-        L.append(f"Пилот: {p.get('state')} — {str(p.get('last_action') or '')[:300]}; брокер {p.get('mode')}, "
+        L.append(f"Пилот: {_pilot_state(p)}; брокер {p.get('mode')}, "
                  f"весь счёт: {'да' if p.get('adopt_account') else 'нет'}, размер даёт биржа: "
                  f"{'да' if p.get('sized_by_broker') else 'нет'}, мягкий стоп: {'да' if p.get('soft_stop') else 'нет'}")
         acc = p.get("account") or {}
@@ -212,7 +271,7 @@ def _mission_text() -> tuple[str, dict]:
             L.append(f"Ответ у {'тейка' if g.get('side') == 'take' else 'троса'} {ai_v5.fmt_ts(g.get('ts'))}: "
                      f"{_said(g, 'decision')}")
     for r in (st.get("reviews") or [])[-5:]:
-        L.append(f"Перепроверка {ai_v5.fmt_ts(r.get('ts'))}: {_said(r, 'choice')}")
+        L.append(f"Перепроверка {ai_v5.fmt_ts(r.get('ts'))}: {_said(r, 'choice', st.get('price'))}")
     for h in (st.get("handoffs") or [])[-3:]:
         L.append(f"Передача {ai_v5.fmt_ts(h.get('ts'))} ({h.get('kind')}): {str(h.get('reason') or '')[:200]}")
     tr = st.get("trades") or {}
@@ -221,9 +280,12 @@ def _mission_text() -> tuple[str, dict]:
     mem = st.get("memory") if isinstance(st.get("memory"), dict) else None      # v5.3: память миссии одним абзацем
     if mem and str(mem.get("text") or "").strip():
         L.append(f"ПАМЯТЬ МИССИИ (прошлые этапы, сведено {ai_v5.fmt_ts(mem.get('ts'))}): {str(mem['text']).strip()[:2000]}")
-    for x in (st.get("explain") or [])[-3:]:                                   # v5.3: последние объяснения толмача
-        if isinstance(x, dict) and x.get("text"):
-            L.append(f"Толмач {ai_v5.fmt_ts(x.get('ts'))} ({x.get('title')}): {str(x['text'])[:600]}")
+    # v5.3: последние объяснения толмача; ревью 5.4.3 — только заголовки, как в памяти миссии: тексты толмача —
+    # пересказ («пилот ждёт пробоя…»), а не факт; факты — в приказе, перепроверках, ответах у троса и сделках
+    heads = [f"{ai_v5.fmt_ts(x.get('ts'))} {x.get('title')}" for x in (st.get("explain") or [])[-3:]
+             if isinstance(x, dict) and x.get("title")]
+    if heads:
+        L.append("Толмач писал владельцу (только заголовки, пересказ не факт): " + "; ".join(heads))
     sc = st.get("scout") or {}
     if isinstance(sc, dict) and sc.get("text"):
         L.append("Разведка миссии (последняя):\n" + str(sc["text"])[:2000])
@@ -659,7 +721,9 @@ if __name__ == "__main__":
                       "; у троса держал 1 раз", "биржа даёт купить лотов 3", "Приказ совета: BUY вход сейчас",
                       "План ведения: держим до 310", "Ответ у троса ", "ЖДАТЬ — ложный прокол",
                       "Перепроверка", "Передача", "(stop)", "Сделок по миссии: 2", "Разведка миссии (последняя)",
-                      "ПАМЯТЬ МИССИИ (прошлые этапы", "трос держал", "Толмач", "Вход исполнен): Пилот вошёл в лонг",
+                      "ПАМЯТЬ МИССИИ (прошлые этапы", "трос держал",
+                      "Толмач писал владельцу (только заголовки, пересказ не факт): ", " Вход исполнен",
+                      "Пилот: в позиции long 8 лот @299.0; брокер real",
                       "═══ ИТОГ СОВЕТА ═══", "Совет daily от ", "МСК (0 мин назад) — общий по рынку", "Режим: risk-on",
                       "Входов совет не назвал",
                       "═══ ЖИВОЙ РЫНОК ПО ИНСТРУМЕНТУ МИССИИ ═══", "SBER: цена 300.5",
@@ -671,6 +735,7 @@ if __name__ == "__main__":
                       "ВОПРОС ВЛАДЕЛЬЦА: что по SBER, держим?"):
             assert piece in u, (piece, u[:2500])
         assert "FLASH у троса" not in u and "Совет (daily" not in u, "метки 5.4.2: «у троса», шапка совета — одна"
+        assert "Пилот вошёл в лонг" not in u and "в позиции long 8 лот —" not in u, "ревью 5.4.3: толмач — заголовки, без эха last_action"
         assert StubCorrelate.calls == [("SBER", "share")] and "связанные бумаги" in s, "чат видит связанные бумаги миссии"
         assert "память миссии" in s and "толмача" in s, "system упоминает память и толмача (v5.3)"
         assert "═══ ДИАЛОГ" not in u, "первый вопрос — диалога ещё нет"
@@ -735,26 +800,43 @@ if __name__ == "__main__":
         clear_history()
         assert history() == []
 
-        # ── v5.4.2: приказ WAIT — чего ждал совет и уровни; фаза idle — «вне рынка / жду план»;
-        #    молчание ИИ — «ответа не было — решения не было», а не ЖДАТЬ ──
+        # ── v5.4.2: приказ WAIT без «вход сейчас … стоп None»; молчание ИИ — «ответа не было — решения не было», а не
+        #    ЖДАТЬ. Ревью 5.4.3: WAIT — как в миссии 5.4.3 (ориентир совета не условие, возраст, цена тогда → сейчас,
+        #    уровни — будильник кода); фаза idle — «вне рынка, плана нет»; состояние пилота без эха last_action;
+        #    перепроверки — меткой модели (ДЕРЖАТЬ/КУПИТЬ) с ценой решения и ходом ──
         snap_w = {"active": "SBER", "missions": {"SBER": {
             "ticker": "SBER", "name": "Сбербанк", "asset_class": "share", "play": "auto", "phase": "idle",
-            "price": 300.5, "started_ts": time.time(), "exec_ts": time.time(),
+            "price": 303.0, "started_ts": time.time(), "exec_ts": time.time() - 20 * 60 - 5,
             "exec": {"do": "WAIT", "entry": None, "entry_kind": "сейчас", "take": None, "invalidation": None,
-                     "wait_for": "закрепление выше 305 на объёме", "levels": [300.0, 305.5], "why": "коридор"},
-            "pilot": {"state": "ОЖИДАНИЕ", "last_action": "вне рынка", "position": None,
+                     "wait_for": "закрепление выше 305 на объёме", "levels": [300.0, 305.5], "why": "коридор",
+                     "price": 300.0, "plan": "ждём пробоя"},
+            "pilot": {"state": "ЖДУ_ПЛАН", "last_action": "совет: вне рынка — ждал: закрепление выше 305", "position": None,
+                      "plan": None, "pending": False,
                       "guards": [{"ts": time.time(), "decision": "НЕТ_ОТВЕТА", "why": "таймаут", "silent": True}]},
             "reviews": [{"ts": time.time(), "choice": "НЕТ_ОТВЕТА", "why": "таймаут 1200 с"},
                         {"ts": time.time(), "choice": "НЕ_РАЗОБРАН", "why": "«может быть»"},
-                        {"ts": time.time(), "choice": "ЖДЁМ", "why": "коридор 300–305"}]}}}
+                        {"ts": time.time(), "choice": "КУПИТЬ_СЕЙЧАС", "why": "пробой", "price": 301.0, "in_pos": False},
+                        {"ts": time.time(), "choice": "ЖДЁМ", "why": "держим", "price": 302.0, "in_pos": True},
+                        {"ts": time.time(), "choice": "ЖДЁМ", "why": "коридор 300–305", "price": 300.0, "in_pos": False}]}}}
         StubMission.snap = snap_w
         txt, _ = _mission_text()
-        for piece in ("фаза: вне рынка / жду план", "): WAIT — совет ждал: закрепление выше 305 на объёме; уровни: 300, 305.5",
-                      "почему: коридор", "Ответ у троса", "ответа не было — решения не было (таймаут)",
+        for piece in ("фаза: вне рынка, плана нет", "(20 мин назад, цена тогда 300): WAIT — вне рынка. Ориентир совета "
+                      "(не условие): закрепление выше 305 на объёме. С тех пор цена 300 → 303 (+1.00 %). Будильник кода "
+                      "у уровней 300, 305.5 — проход цены будит дежурного PRO, это не вход. Почему: коридор",
+                      "Как совет видел ведение (прошлое мнение): ждём пробоя",
+                      "Пилот: вне рынка, плана нет; брокер", "Ответ у троса", "ответа не было — решения не было (таймаут)",
                       "Перепроверка", "ответа не было — решения не было (таймаут 1200 с)",
-                      "ответ не разобран — решения не было", "ЖДЁМ — коридор 300–305"):
+                      "ответ не разобран — решения не было", ": КУПИТЬ @301 → сейчас 303 (+0.66 %) — пробой",
+                      ": ДЕРЖАТЬ @302 → сейчас 303 (+0.33 %) — держим",
+                      ": ЖДЁМ @300 → сейчас 303 (+1.00 %) — коридор 300–305"):
             assert piece in txt, (piece, txt)
         assert "вход сейчас" not in txt and "стоп None" not in txt and "НЕТ_ОТВЕТА —" not in txt, txt
+        assert "совет ждал" not in txt and "ждал: закрепление" not in txt and "жду план" not in txt, txt
+        assert "КУПИТЬ_СЕЙЧАС" not in txt and "План ведения" not in txt, txt
+        snap_w["missions"]["SBER"]["pilot"]["plan"] = {"side": "long", "entry": 305.5, "kind": "прорыв",
+                                                       "invalidation": 301.0, "take": 312.0}
+        assert "Пилот: вход взведён: long прорыв @305.5, стоп 301.0, тейк 312.0;" in _mission_text()[0]
+        snap_w["missions"]["SBER"]["pilot"]["plan"] = None
         snap_w["missions"]["SBER"]["exec"] = {"do": "CLOSE", "why": "слом", "invalidation": 1.0}
         txt, _ = _mission_text()
         assert "): CLOSE — закрыть позицию — слом" in txt and "вход сейчас" not in txt, txt

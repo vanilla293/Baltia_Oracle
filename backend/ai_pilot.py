@@ -395,7 +395,9 @@ class AIPilot:
                                       # W4: сверка остатка со счётом перед повторной заявкой / новым тросом
                                       "exit_check", "exit_check_strict", "verify_lots",
                                       # v5.4.1: мысль о прибыли — пейсинг, запертая прибыль (трос не ниже входа)
-                                      "profit_next", "profit_last", "profit_lock")} if self.position else None)}
+                                      "profit_next", "profit_last", "profit_lock",
+                                      # ревью 5.4.3: триггер до запирания прибыли (повтор старого стопа её не отдаёт)
+                                      "lock_from")} if self.position else None)}
                 if self.position or self.pending:
                     # ПАНИКА — свойство ПОЗИЦИИ/ЗАЯВКИ, которые она закрывает, а не инструмента: без них флаг в файл
                     # не пишется (иначе секция pilot держит файл часами, и следующая миссия по тикеру рождалась бы в СТОП)
@@ -498,6 +500,8 @@ class AIPilot:
             self.position["profit_next"] = _f(p.get("profit_next"))
         if _f(p.get("profit_last")) > 0:
             self.position["profit_last"] = _f(p.get("profit_last"))
+        if _f(p.get("lock_from")) > 0:                  # ревью 5.4.3: триггер до запирания прибыли
+            self.position["lock_from"] = _f(p.get("lock_from"))
         if p.get("profit_lock"):                         # прибыль заперта PRO: трос не ниже входа
             self.position["profit_lock"] = True
         # v5.2: аварийный трос считается заново от триггера (старый state-файл его не знал);
@@ -3111,6 +3115,14 @@ class AIPilot:
         return what
 
     async def _apply_guard(self, r: dict, price: float, pos: dict) -> None:
+        """Ответ у троса (мягкий стоп). СЛИТЬ / нет решения ИИ → закрыть (второе — по правилу, запись кода).
+        ЖДАТЬ (ревью 5.4.3, D5 — поведение однозначно): hold_until_price принимается, только если лежит строго между
+        аварийным тросом и ценой (лонг: трос < X < цена; шорт: цена < X < трос) — это новый триггер (трос не
+        двигается), и когда цена его пройдёт, дежурного спросят снова сразу, без срока; не принят (нет числа, не в
+        коридоре) — триггер прежний, запись и last_action пишут «не принят», и пока цена за триггером, вопрос повторится
+        через hold_minutes (1–60 мин; нет — PYTHIA_SOFT_STOP_GRACE_SEC). Каждое ЖДАТЬ — +1 к holds; holds ≥
+        PYTHIA_SOFT_STOP_MAX_HOLDS → за триггером слив по правилу без вопроса; за аварийным тросом — слив без вопроса
+        всегда. Цена вернулась за триггер дольше PYTHIA_SOFT_STOP_GRACE_SEC — holds заново (AIPilot.tick)."""
         if self.position is not pos or not self.position:
             return                             # позиция уже закрыта/сменилась
         raw = str(r.get("decision") or "").upper().replace("Ё", "Е")
@@ -3122,7 +3134,8 @@ class AIPilot:
         rec = {"ts": time.time(), "side": "stop", "decision": "ЖДАТЬ" if hold else "СЛИТЬ", "why": why,
                "note": str(r.get("note") or "")[:300], "price": cur,
                "trigger": pos.get("invalidation"), "hold_until": _f(r.get("hold_until_price")) or None,
-               "hold_minutes": _f(r.get("hold_minutes")) or None, "model": mm, "silent": False, "source": "ИИ"}
+               "hold_minutes": _f(r.get("hold_minutes")) or None, "model": mm, "silent": False, "source": "ИИ",
+               "pos_side": pos.get("side")}                # ревью 5.4.3: сторона позиции — память «за лонг/шорт»
         what = self._rule_rec(rec, r, "СЛИТЬ") if rule else ""
         if rule:
             rec["hold_until"] = rec["hold_minutes"] = None
@@ -3140,18 +3153,34 @@ class AIPilot:
         hard = _f(pos.get("hard_stop"))
         new_trig = _f(r.get("hold_until_price"))
         moved = ""
-        if new_trig > 0 and ((is_long and new_trig < cur) or (not is_long and new_trig > cur)) \
-                and (hard <= 0 or (is_long and new_trig > hard) or (not is_long and new_trig < hard)):
-            self._set_levels(pos, None, new_trig, inv0=False)
-            moved = f", новый триггер {new_trig:g}"
+        ok_trig = new_trig > 0 and ((is_long and new_trig < cur) or (not is_long and new_trig > cur)) \
+            and (hard <= 0 or (is_long and new_trig > hard) or (not is_long and new_trig < hard))
         grace = float(_setting("PYTHIA_SOFT_STOP_GRACE_SEC", 180))
         hm = _f(r.get("hold_minutes"))
         if hm > 0:
             grace = max(60.0, min(hm * 60.0, 3600.0))
-        pos["guard_next"] = time.time() + grace
+        if ok_trig:
+            # ревью 5.4.3 (D5): новый триггер — у него вопрос сразу, как цена его пройдёт (срок hold_minutes — только
+            # при прежнем триггере: цена и так за ним)
+            self._set_levels(pos, None, new_trig, inv0=False)
+            moved = f", новый триггер {new_trig:g} — у него спрошу снова"
+            rec["hold_minutes"] = None
+            pos["guard_next"] = 0.0
+            nxt = "следующий вопрос — когда цена пройдёт новый триггер"
+        else:
+            if new_trig > 0:                   # ревью 5.4.3: не в коридоре «трос < X < цена» — не принят, не молча
+                where = (f"не {'ниже' if is_long else 'выше'} цены {cur:g}"
+                         if not ((is_long and new_trig < cur) or (not is_long and new_trig > cur))
+                         else f"за аварийным тросом {hard:g}")
+                rec["hold_until"] = None
+                rec["hold_until_ai"] = new_trig
+                rec["hold_note"] = f"hold_until_price {new_trig:g} не принят: {where}; триггер прежний {_f(pos.get('invalidation')):g}"
+                moved = f"; {rec['hold_note']}"
+            pos["guard_next"] = time.time() + grace
+            nxt = f"следующий вопрос через {int(grace // 60)} мин, если цена за триггером"
         self._save_state()
         self.last_action = (f"мягкий стоп: {mm} решил ЖДАТЬ ({why or 'без объяснений'}){moved}, "
-                            f"следующий вопрос через {int(grace // 60)} мин — передаю задачу Совету")
+                            f"{nxt} — передаю задачу Совету")
         log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
         try:
             self._guard_handoff(why)
@@ -3214,7 +3243,8 @@ class AIPilot:
         rec = {"ts": time.time(), "side": "take", "decision": "ПОДЕРЖАТЬ" if hold else "ЗАФИКСИРОВАТЬ", "why": why,
                "note": str(r.get("note") or "")[:300], "price": cur, "take": take or None,
                "lock_price": lock_ai or None, "tp_next": tp_next or None,
-               "hold_minutes": _f(r.get("hold_minutes")) or None, "model": mm, "silent": False, "source": "ИИ"}
+               "hold_minutes": _f(r.get("hold_minutes")) or None, "model": mm, "silent": False, "source": "ИИ",
+               "pos_side": pos.get("side")}                # ревью 5.4.3: сторона позиции — память «за лонг/шорт»
         what = self._rule_rec(rec, r, "ЗАФИКСИРОВАТЬ") if rule else ""
         if rule:
             rec["lock_price"] = rec["tp_next"] = rec["hold_minutes"] = None
@@ -3240,6 +3270,8 @@ class AIPilot:
                                        f"({why or 'без объяснений'}) — фиксирую")
             return
         rec["lock_price"] = lock
+        if not (int(pos.get("take_holds") or 0) > 0 or pos.get("profit_lock")):
+            pos["lock_from"] = _f(pos.get("invalidation")) or None   # ревью 5.4.3: триггер до запирания прибыли
         pos["take_holds"] = int(pos.get("take_holds") or 0) + 1
         self._set_levels(pos, None, lock, inv0=True)      # триггер = запертая прибыль; трос считается от него
         pos["restop"] = True                               # трос биржи — за новым триггером, ближайшим тиком
@@ -4120,16 +4152,21 @@ if __name__ == "__main__":
         assert pos["holds"] == 1 and pos["invalidation"] == 88400.0 and pos["inv0"] == 89000.0, pos
         assert abs(pos["hard_stop"] - hard) < 1.0, "аварийный трос не двигается за FLASH"
         assert SoftPilot.handoffs and "лента за нас" in SoftPilot.handoffs[-1] and ps.guards[-1]["decision"] == "ЖДАТЬ"
-        assert pos["guard_next"] - time.time() > 250 and "ЖДАТЬ" in ps.last_action
+        # ревью 5.4.3 (D5): принятый hold_until_price — новый триггер, вопрос у него сразу (срок hold_minutes не ждём)
+        assert pos["guard_next"] == 0.0 and "у него спрошу снова" in ps.last_action and "ЖДАТЬ" in ps.last_action
+        assert ps.guards[-1]["hold_until"] == 88400.0 and ps.guards[-1]["hold_minutes"] is None
+        assert ps.guards[-1]["pos_side"] == "long", "сторона позиции — в записи ответа (память «за лонг»)"
         await ps.tick(88950.0, BOOK)                # выше нового триггера — тихо, без вопросов
         assert len(SoftPilot.asked) == 1 and ps.position is pos
-        await ps.tick(88390.0, BOOK)                # ниже нового триггера, но grace не вышел — тихо
-        assert len(SoftPilot.asked) == 1 and ps.position is pos
-        pos["guard_next"] = 0.0
-        SoftPilot.answers[:] = [{"decision": "ЖДАТЬ", "why": "ещё терпим"}]
-        await ps.tick(88390.0, BOOK)
+        SoftPilot.answers[:] = [{"decision": "ЖДАТЬ", "why": "ещё терпим", "hold_until_price": 99999.0, "hold_minutes": 4}]
+        await ps.tick(88390.0, BOOK)                # ниже нового триггера — вопрос сразу
         await settle_guard(ps)
         assert len(SoftPilot.asked) == 2 and pos["holds"] == 2 and ps.position is pos
+        g2 = ps.guards[-1]                          # 99999 выше цены — не принят, не молча; триггер прежний, срок 4 мин
+        assert g2["hold_until"] is None and g2["hold_until_ai"] == 99999.0 and "не принят" in g2["hold_note"], g2
+        assert pos["invalidation"] == 88400.0 and "не принят" in ps.last_action and 230 < pos["guard_next"] - time.time() <= 240
+        await ps.tick(88390.0, BOOK)                # за прежним триггером, срок не вышел — тихо
+        assert len(SoftPilot.asked) == 2 and ps.position is pos
         await ps.tick(hard - 5.0, BOOK)             # за аварийным тросом — закрыть без вопросов
         assert ps.position is None and "аварийный трос" in ps.last_action and len(SoftPilot.asked) == 2
         def fresh(pl):   # новая сцена: killswitch и P/L сессии заново (иначе −18% дня всё запрёт)
