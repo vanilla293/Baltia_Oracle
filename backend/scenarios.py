@@ -99,6 +99,7 @@ class FakeBroker:
         self.flat_kwargs: list[dict] = []     # с чем звали flat_all (force / гейты)
         self.close_delay = 0.0                # тянуть закрытие (гонка двух задач)
         self.pf_positions: list | None = None # None → зеркало своих исполнений
+        self.pf_error: str | None = None      # v5.4.4: портфель брокера не читается (сверка откладывается)
         self.pf_cash: float | None = None
         self.mx: dict | None = None           # ответ GetMaxLots {"buy","sell"} (None → локальный расчёт)
         self.mx_calls = 0
@@ -215,6 +216,8 @@ class FakeBroker:
                 if not o.get("done") and not o.get("cancelled") and oid not in self._applied and oid not in self.cancelled]
 
     async def portfolio(self):
+        if self.pf_error:
+            return {"cash": None, "positions": [], "error": self.pf_error}
         if self.pf_positions is not None:
             poss = list(self.pf_positions)
         else:
@@ -235,11 +238,19 @@ class FakeBroker:
 
 
 class FakeTinkoff:
-    """Лента и счёт без сети: цена (None — нет котировок), стакан (fail — не отдаётся)."""
+    """Лента и счёт без сети: цена (None — нет котировок), стакан (fail — не отдаётся).
+    v5.4.4: почему цены нет (price_err → price_error), проверка токена (access → check_access; None — полный доступ),
+    эпоха токена (epoch — новый токен в «Ключах»), счёт/портфель не читаются (accs_fail / pf_fail), ГО фьючерса."""
     price: float | None = PRICE0
     on = True
     book_fail = False
     positions: list = []
+    price_err: dict | None = None
+    access: dict | None = None
+    epoch = 0
+    checks = 0
+    accs_fail = False
+    pf_fail = False
 
     @classmethod
     def enabled(cls):
@@ -247,11 +258,29 @@ class FakeTinkoff:
 
     @classmethod
     async def accounts(cls):
-        return [{"id": "acc-1"}]
+        return None if cls.accs_fail else [{"id": "acc-1"}]
 
     @classmethod
     async def portfolio(cls, acc):
-        return {"positions": list(cls.positions), "total": DEPOSIT}
+        return None if cls.pf_fail else {"positions": list(cls.positions), "total": DEPOSIT}
+
+    @classmethod
+    def price_error(cls, figi):
+        return dict(cls.price_err) if (cls.price is None and cls.price_err) else None
+
+    @classmethod
+    async def check_access(cls, timeout=15.0):
+        cls.checks += 1
+        return dict(cls.access) if cls.access else {"ok": True, "trade": True, "kind": "ok", "access": "FULL_ACCESS",
+                                                     "reason": "токен принят: полный доступ"}
+
+    @classmethod
+    def token_epoch(cls):
+        return cls.epoch
+
+    @classmethod
+    async def futures_margin(cls, figi):
+        return {"margin_buy": GO, "margin_sell": GO, "min_price_increment": 0.01, "min_price_increment_amount": 0.01}
 
     @classmethod
     async def resolve(cls, ticker, ac):
@@ -626,6 +655,9 @@ class Scene:
         config.pin_free_pilot_defaults(lambda k, v: self.patch(config, k, v))
         fake_ai.reset()
         FakeTinkoff.price, FakeTinkoff.book_fail, FakeTinkoff.positions = PRICE0, False, []
+        FakeTinkoff.price_err = FakeTinkoff.access = None       # v5.4.4: связь и токен — в порядке
+        FakeTinkoff.epoch = FakeTinkoff.checks = 0
+        FakeTinkoff.accs_fail = FakeTinkoff.pf_fail = False
         FakeClock.open, FakeClock.session, FakeClock.calls = True, "основная", 0
         FakeWatch.notes = []
         StubScan.puncture = None
@@ -2779,6 +2811,167 @@ async def s45_drift_once(sc: Scene) -> None:
                "близкий тейк → «ход отыгран», план снят, повод к плановой")
 
 
+# ── v5.4.4 «связь с брокером»: жалоба владельца 30.09.2026 — токен отозван, пилот «работал без перерыву, как минимум так
+#    показывал», вход и закрытие «написаны, но не исполнены» ─────────────────────────────────────────────────────────
+_AUTH_REASON = "токен Т-Банка не принят (40003) — выпусти новый с полным доступом и вставь в «Ключи»"
+
+
+def _health_now(market_open: bool = True) -> list[dict]:
+    """Панель проблем по живому снимку миссии (api_v5.health_block; ключи — «есть»)."""
+    from . import api_v5
+    hb = api_v5.health_block(keys={"deepseek": True, "tinkoff": True, "dry": False}, mission_snap=mission.snapshot(),
+                             market={"open": market_open, "enabled": True})
+    return [p for p in hb["problems"] if p.get("kind") in ("pilot", "data")]
+
+
+async def s44_token_revoked(sc: Scene) -> None:
+    """Токен Т-Банка отозван (401/40003 на всё) — пилот не тикает и говорит это честно: НЕТ_ДОСТУПА, фаза no_access
+    (не «В позиции»), позиция названа без защиты, PRO не зовётся ни по перепроверке, ни у троса; панель проблем — err
+    с причиной, без «рынок мёртв»; новый токен — связь вернулась сама, сверка со счётом, пилот снова ведёт."""
+    pos = await sc.open_position("long", inv=98.0)
+    p = sc.p
+    p.loop_alive = True                            # петля «жива»: шаги — руками (_loop_step), как в run()
+    seen: list[tuple[bool, dict]] = []
+    p._on_feed_change = lambda ok, info: seen.append((ok, info))
+    FakeTinkoff.price = None                       # цены нет: GetLastPrices → 401
+    FakeTinkoff.price_err = {"ts": time.time(), "path": "GetLastPrices", "status": 401, "code": "40003", "kind": "auth",
+                             "reason": _AUTH_REASON, "text": "Tinkoff 401 · 40003: Authentication token is missing or invalid"}
+    FakeTinkoff.access = {"ok": False, "trade": False, "kind": "auth", "reason": _AUTH_REASON}
+    n_orders, ai0 = len(sc.broker.placed), dict(fake_ai.summary()["routes"])
+    slow = await p._loop_step()
+    assert slow and p.feed["ok"] is False and p.feed["kind"] == "auth" and p.state == "НЕТ_ДОСТУПА", (p.feed, p.state)
+    assert FakeTinkoff.checks == 1, "проверка брокера (GetAccounts) уточнила причину сразу"
+    la = p.last_action
+    assert "НЕТ ДОСТУПА" in la and "40003" in la and "без защиты" in la and "long 8 лот" in la, la
+    assert seen and seen[0][0] is False and seen[0][1]["kind"] == "auth", seen
+    st = mission.status(TICKER)
+    assert st["phase"] == "no_access" and st["pilot"]["ticking"] is False and st["pilot"]["feed"]["kind"] == "auth", st["phase"]
+    assert p.broker_ok() is False
+    # плановая перепроверка «пора», цена улетела бы за триггер — но без связи ни тика, ни PRO, ни заявок
+    p.review_ts = 0.0
+    for _ in range(5):
+        await p._loop_step()
+    assert FakeTinkoff.checks == 1, "проверка брокера — не чаще раза в FEED_PROBE_SEC"
+    assert p.last_action == la, "причина записана один раз — не переписывается каждый шаг"
+    assert dict(fake_ai.summary()["routes"]) == ai0 and len(sc.broker.placed) == n_orders, fake_ai.summary()
+    probs = _health_now()
+    txt = " | ".join(x["text"] for x in probs)
+    assert any(x["level"] == "err" and x["key"] == "pilot:feed" for x in probs), probs
+    assert "нет доступа" in txt and "БЕЗ ЗАЩИТЫ" in txt and "мёртв" not in txt and "старой цене" not in txt, txt
+    r = await mission.resume(TICKER)               # «ПРОДОЛЖИТЬ» у зомби — честно, а не «пилот уже работает»
+    assert not r["ok"] and "не работает" in r["note"] and "40003" in r["note"], r
+    # новый токен в «Ключах»: эпоха растёт → проверка сразу; цена пошла — связь восстановлена, сверка со счётом
+    FakeTinkoff.epoch += 1
+    FakeTinkoff.access, FakeTinkoff.price_err = None, None
+    FakeTinkoff.price = 100.4
+    await p._loop_step()
+    assert p.feed["ok"] is True and seen[-1][0] is True and seen[-1][1]["was"] == "auth", (p.feed, seen)
+    assert p.position is pos and p.state == "В_ПОЗИЦИИ" and p.ticking(), (p.state, p.last_action)
+    assert mission.status(TICKER)["phase"] == "in_position"
+    sc.note = ("401 на всё → НЕТ_ДОСТУПА (no_access), «без защиты» в last_action один раз, 0 вызовов PRO и 0 заявок, "
+               "панель err без «рынок мёртв»; новый токен → связь вернулась, пилот ведёт")
+
+
+async def s45_orders_rights(sc: Scene) -> None:
+    """Чтение работает, заявки отбиваются 403/40002 (токен только для чтения): одна попытка входа, сразу НЕТ_ДОСТУПА —
+    без лесенки попыток, без петли PRO у двери и перепроверки; новый токен с полным доступом — вход исполнен; закрытие,
+    отбитое 30042, повторяется с паузой, а не каждый тик, и доходит до конца."""
+    b, p = sc.broker, sc.p
+    p.loop_alive = True
+    b.place_error = "Tinkoff 403 · 40002: Insufficient privileges [PostOrder]"
+    FakeTinkoff.access = {"ok": True, "trade": False, "kind": "rights", "access": "READ_ONLY",
+                          "reason": "токен принят, но только для чтения — пилот не сможет торговать"}
+    assert p.adopt_forecast(sc.ex("BUY"))
+    await sc.tick(100.0)                           # дверь (PRO: ВОЙТИ) → заявка → 403
+    assert b._n == 1 and p.feed["ok"] is False and p.feed["kind"] == "rights" and p.state == "НЕТ_ДОСТУПА", (p.feed, p.state)
+    br = p.status()["broker_refusal"]
+    assert br["what"] == "entry" and br["code"] == "40002" and br["kind"] == "rights" and p._entry_fail == 0, br
+    n_entry = fake_ai.count("mission_entry")
+    p.review_ts = 0.0
+    p._feed_probe_ts -= ai_pilot.FEED_PROBE_SEC    # прошло FEED_PROBE_SEC: следующий шаг спросит брокера (GetAccounts)
+    for _ in range(8):                             # цена идёт, а торговать нечем: ни тика решений, ни PRO, ни заявок
+        await p._loop_step()
+    assert FakeTinkoff.checks == 1, "проверка брокера — один раз за FEED_PROBE_SEC"
+    assert b._n == 1 and fake_ai.count("mission_entry") == n_entry and fake_ai.count("mission_review") == 0, fake_ai.summary()
+    assert not any("серия отказов" in str(h.get("reason")) for h in sc.m.handoffs), sc.m.handoffs
+    assert p.plan is not None, "приказ ждёт доступа, а не сброшен лесенкой отказов"
+    assert "только для чтения" in p.feed["reason"] and mission.status(TICKER)["phase"] == "no_access", p.feed
+    # владелец вставил токен с полным доступом: проверка сразу (новая эпоха), доступ есть — вход исполнен
+    b.place_error = None
+    FakeTinkoff.access = None
+    FakeTinkoff.epoch += 1
+    await p._loop_step()
+    await sc.wait_gate()
+    await sc.tick(100.0)
+    assert p.feed["ok"] and p.position and p.position["lots"] == 8 and p.broker_refusal is None, (p.feed, p.last_action)
+    # закрытие отбито 30042: пауза 2→4→… с, а не заявка каждый тик; причина видна; после паузы — закрыто
+    b.place_error = "30042: недостаточно средств/обеспечения для сделки"
+    assert p.adopt_forecast(sc.ex("CLOSE"))
+    await sc.tick(100.0)
+    n = b._n
+    assert p.position and p.position.get("close_refusals") == 1 and p.status()["broker_refusal"]["what"] == "close"
+    for _ in range(6):
+        await sc.tick(100.0)
+    assert b._n == n and "повтор через" in p.last_action and "30042" in p.last_action, p.last_action
+    b.place_error = None
+    p.position["close_retry_at"] = time.time() - 1      # пауза вышла
+    await sc.tick(100.0)
+    assert p.position is None and p.broker_refusal is None, p.last_action
+    sc.note = ("403/40002: 1 заявка, 1 вопрос у двери, 0 перепроверок — НЕТ_ДОСТУПА до нового токена; полный доступ → "
+               "вход; 30042 на закрытии — пауза, не каждый тик")
+
+
+async def s46_prepare_unread_portfolio(sc: Scene) -> None:
+    """prepare() без портфеля (GetPortfolio не ответил) не стирает state-файл: позиция из файла поднимается «сверить со
+    счётом», входов и доборов нет до сверки; первая удачная сверка подтверждает. Счёт не прочитан (токен) — пилот не
+    стартует, причина — в ошибке миссии, файл цел."""
+    path = Path(tempfile.mkdtemp(prefix="pythia_scen_")) / "aipilot_state.json"
+    rec = {"figi": FIGI, "base": TICKER, "ts": time.time(), "account_id": "acc-1", "mode": "real", "pending": None,
+           "foreign_lots": 0, "close_pending": None,
+           "position": {"side": "long", "entry": 100.0, "lots": 3, "take": 110.0, "invalidation": 98.0, "inv0": 98.0,
+                        "hard_stop": 96.53, "opened_ts": time.time() - 3600, "stop_id": None, "holds": 0}}
+    path.write_text(json.dumps(rec), encoding="utf-8")
+
+    def fresh_pilot() -> mission.MissionPilot:
+        q = mission.MissionPilot(TICKER, deposit=DEPOSIT, broker=sc.broker, mission=sc.m)
+        mission._bind_pilot(sc.m, q)
+        q._state_path = path
+        return q
+
+    FakeTinkoff.pf_fail = True                     # счёт есть, портфель не прочитан
+    p2 = fresh_pilot()
+    assert await ai_pilot.AIPilot.prepare(p2) is True and path.exists(), p2.last_action
+    q = p2.position
+    assert q and q["lots"] == 3 and q.get("unverified") and p2._acct_unverified, q
+    assert "СВЕРИТЬ СО СЧЁТОМ" in p2.last_action and "портфель при старте не прочитан" in p2.last_action, p2.last_action
+    assert p2.status()["account_unverified"] is True
+    sc.m.pilot, sc.p = p2, p2
+    p2.adopt_forecast(sc.ex("BUY", entry=99.9))     # добор той же стороны у уровня — ждёт сверки
+    sc.broker.pf_error = "GetPortfolio: 500 (тест)"   # портфель брокера всё ещё не читается — сверка откладывается
+    FakeTinkoff.pf_fail = False
+    p2._tick_n = 1
+    await sc.tick(99.95)
+    assert not sc.broker.placed and "ждёт сверки со счётом" in p2.last_action, p2.last_action
+    assert p2._acct_unverified and p2.position.get("unverified") and path.exists()
+    sc.broker.pf_error = None
+    sc.broker.pf_positions = [{"figi": FIGI, "qty": 3, "avg": 100.0}]    # сверка: на счёте те же 3 лота
+    p2._tick_n = 7
+    await sc.tick(99.95)
+    assert not p2._acct_unverified and not p2.position.get("unverified"), p2.last_action
+    assert path.exists() and p2.position["lots"] == 3
+    # счёт не прочитан вовсе (токен): пилот не стартует, причина наружу, state-файл цел
+    FakeTinkoff.accs_fail = True
+    p3 = fresh_pilot()
+    sc.m.pilot = p3
+    assert await ai_pilot.AIPilot.prepare(p3) is False and path.exists()
+    assert "счёт Т-Банка не прочитан" in (p3.prepare_error or ""), p3.prepare_error
+    mission._pilot_prepared(sc.m, p3, False, p3.prepare_error)
+    assert sc.m.error.startswith("пилот не стартовал") and sc.m.phase == "error", (sc.m.error, sc.m.phase)
+    sc.m.pilot, sc.m.error, sc.m.phase = p2, None, "in_position"
+    sc.p = p2
+    sc.note = "портфель не прочитан → позиция из файла «сверить со счётом», входов нет до сверки, сверка подтвердила; счёт не прочитан → не стартовал с причиной, файл цел"
+
+
 SCENARIOS: list[tuple[str, Callable[[Scene], Awaitable[None]]]] = [
     ("гэп_за_трос", s01_gap_hard), ("гэп_за_триггер", s02_gap_trigger), ("мёртвый_рынок", s03_dead_market),
     ("рынок_закрыт", s04_market_closed), ("частичка_30042", s05_partial_then_30042),
@@ -2806,6 +2999,9 @@ SCENARIOS: list[tuple[str, Callable[[Scene], Awaitable[None]]]] = [
     ("будильник_держит", s43_wait_alarm_kept),
     # 5.4.4 (X2): условный ВОЙТИ у двери — засада у уровня; дрейф — не больше одного переспроса, второй ВОЙТИ исполняется
     ("вход_условный", s44_conditional_enter), ("дрейф_один_переспрос", s45_drift_once),
+    # v5.4.4 «связь с брокером»: токен отозван — честно и без ИИ; заявки 40002 — без петли PRO; портфель не прочитан ≠ 0 лотов
+    ("токен_отозван", s44_token_revoked), ("заявки_40002", s45_orders_rights),
+    ("портфель_не_прочитан", s46_prepare_unread_portfolio),
 ]
 
 
@@ -2883,4 +3079,7 @@ if __name__ == "__main__":
           "стопы только в программе; ревью 5.4.2: совет «держать» — HOLD без добора, молчание у троса/тейка — запись кода; "
           "v5.4.3: ЖДЁМ с уровнем — будильник, проход цены → PRO решает заново; ревью 5.4.3: ЖДЁМ без entry будильник "
           "не снимает, проход за раздумья — повод, пила у уровня не будит повторно; 5.4.4: условный ВОЙТИ у двери — "
-          "засада у уровня, дрейф — один переспрос, второй ВОЙТИ по отношению исполнен или «ход отыгран»)")
+          "засада у уровня, дрейф — один переспрос, второй ВОЙТИ по отношению исполнен или «ход отыгран»; "
+          "v5.4.4: токен отозван — НЕТ_ДОСТУПА без "
+          "ИИ и заявок, новый токен — связь сама; заявки 40002 — одна попытка, без петли PRO; закрытие 30042 — с паузой; "
+          "портфель не прочитан ≠ 0 лотов — state-файл цел)")

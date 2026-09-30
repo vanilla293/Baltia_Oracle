@@ -501,8 +501,28 @@ def problem(kind: str, text: str, silent: bool = False) -> bool:
 
 
 # ── события шины ──────────────────────────────────────────────────────────────
-_PILOT_WORDS = ("ВОШЁЛ", "ДОБРАЛ", "ПРИНЯЛ", "РЕСТАРТ", "закрыт", "отбит", "CLOSE", "заявк", "трос", "стоп")
-_SCOPE_RU = {"mission": "миссия", "daily": "совет", "update": "совет (новости)", "human": "взгляд человека",
+_PILOT_WORDS = ("ВОШЁЛ", "ДОБРАЛ", "ПРИНЯЛ", "РЕСТАРТ", "закрыт", "отбит", "CLOSE", "заявк", "трос", "стоп",
+                # v5.4.4: приказ протух / идея мертва до входа, связь с брокером (НЕТ СВЯЗИ / НЕТ ДОСТУПА / восстановлена),
+                # токен, killswitch — владелец узнаёт сразу, а не из панели
+                "протух", "мертва", "связ", "СВЯЗ", "ДОСТУП", "токен", "killswitch", "KILLSWITCH")
+_PILOT_REFUSED = ("приказ не принят", "не стартовал", "не запущено", "killswitch", "KILLSWITCH")
+
+
+def _pilot_stopped(ticker: str) -> bool:
+    """v5.4.4: пилот миссии правда остановлен (фаза stopped/error/panic и петля не жива)? pilot/done в шине — итог стадии
+    «пилот» совета (приказ передан), а не остановка: «⏹ пилот остановился» после каждого совета было ложью."""
+    try:
+        snap = _snapshot() or {}
+        ms = ((snap.get("missions") or {}).get(ticker) or {}) if ticker else _active(snap)[1]
+    except Exception:                                      # noqa: BLE001
+        return False
+    if not isinstance(ms, dict) or not ms:
+        return False
+    pst = ms.get("pilot") if isinstance(ms.get("pilot"), dict) else {}
+    return str(ms.get("phase") or "") in ("stopped", "error", "panic") and not pst.get("loop_alive")
+
+
+_SCOPE_RU ={"mission": "миссия", "daily": "совет", "update": "совет (новости)", "human": "взгляд человека",
              "watch": "дозор", "ledger": "журнал"}
 
 
@@ -542,8 +562,17 @@ async def on_event(ev: dict) -> None:
                 notify(node, f"🗣 <b>{esc(data.get('title') or 'Толмач')}</b>\n{esc(data['text'])}")
             elif stage == "summary" and st == "done":
                 notify(node, f"🏛 <b>Совет по {esc(t)}</b>: {esc(detail)}")
+            elif stage == "entry" and st == "done" and detail:       # v5.4.4: итог проверки входа у двери
+                notify(node, f"🚪 <b>Дверь {esc(t)}</b>: {esc(detail[:300])}")
+            elif stage == "profit" and st == "done" and detail:      # v5.4.4: итог мысли о прибыли
+                notify(node, f"📈 <b>{esc(t)}</b>: {esc(detail[:300])}")
             elif stage == "pilot" and st == "done" and detail:
-                notify(node, f"⏹ <b>{esc(t)}</b>: пилот остановился — {esc(detail)}")
+                # v5.4.4: pilot/done — итог стадии «пилот» в совете: приказ передан пилоту (молчим — приказ уже ушёл
+                # «📜»), не принят / не стартовал — сразу; «остановился» — только если пилот правда остановлен
+                if any(w in detail for w in _PILOT_REFUSED):
+                    notify(node, f"⛔ <b>{esc(t)}</b>: {esc(detail)}")
+                elif _pilot_stopped(t):
+                    notify(node, f"⏹ <b>{esc(t)}</b>: пилот остановился — {esc(detail)}")
         elif scope in ("daily", "update", "human") and stage == "summary" and st == "done":
             notify(node, f"📰 <b>{esc(_SCOPE_RU.get(scope, scope)).capitalize()}</b>: {esc(detail)}")
         elif scope == "ledger" and stage == "reconcile" and st == "done" and data.get("trade"):
@@ -1051,12 +1080,14 @@ async def market_tick(open_now: bool | None, snap: dict | None = None) -> bool:
 
 
 def health_tick(problems: list[dict] | None) -> int:
-    """Проблемы уровня err из панели — по виду не чаще раза в 10 мин."""
+    """Проблемы уровня err из панели — по виду не чаще раза в 10 мин. v5.4.4: вид — key проблемы (у пилота их несколько:
+    связь, не тикает, отказ биржи, killswitch — один не глушит другой), нет key — kind; токен/права Т-Банка, «пилот не
+    тикает», killswitch приходят уровнем err и уходят владельцу."""
     n = 0
     for p in problems or []:
         if not isinstance(p, dict) or p.get("level") != "err":
             continue
-        if problem(f"health:{p.get('kind')}", esc(p.get("text") or "")):
+        if problem(f"health:{p.get('key') or p.get('kind')}", esc(p.get("text") or "")):
             n += 1
     return n
 
@@ -1335,6 +1366,48 @@ if __name__ == "__main__":
         assert "💰 <b>Сверено с брокером</b>: SBER лонг 2 лот, вход 300,6 → выход 304,4, <b>+69,95 ₽</b> (комиссия 6,05) — по операциям брокера" in joined
         pilot_msgs = [x for x in texts if "ВОШЁЛ" in x]
         assert len(pilot_msgs) == 1 and "Сделка закрыта" in pilot_msgs[0]   # два события узла pilot — одно сообщение
+        # 6б) v5.4.4: pilot/done совета — не «остановился» (пилот жив: фаза in_position); не принят / не стартовал — ⛔;
+        #     правда остановлен (фаза stopped, петля не жива) — ⏹; итоги двери и мысли о прибыли — короткими строками;
+        #     «приказ протух» / «НЕТ ДОСТУПА» / KILLSWITCH пилота — сразу
+        SENT.clear(); _recent.clear()
+        for e in (
+            {"type": "v5", "scope": "mission", "stage": "pilot", "status": "done", "ticker": "SBER",
+             "detail": "пилот принял свежий приказ: план принят: long вход сразу"},
+            {"type": "v5", "scope": "mission", "stage": "entry", "status": "done", "ticker": "SBER",
+             "detail": "PRO у двери: ЖДАТЬ — откат к 299.5 · новый уровень 299.5 (откат)", "data": {"decision": "ЖДАТЬ"}},
+            {"type": "v5", "scope": "mission", "stage": "profit", "status": "done", "ticker": "SBER",
+             "detail": "мысль о прибыли: ДЕРЖАТЬ — тренд цел", "data": {"decision": "ДЕРЖАТЬ"}},
+            {"type": "v5", "scope": "mission", "stage": "pilot", "status": "progress", "ticker": "SBER",
+             "detail": "приказ протух (95 мин, предел 90) — прошу свежий разбор"},
+        ):
+            await on_event(e)
+        await asyncio.sleep(WINDOW_SEC * 3)
+        await flush()
+        j6 = "\n".join(x["text"] for x in SENT)
+        assert "пилот остановился" not in j6 and "⏹" not in j6, j6
+        assert "🚪 <b>Дверь SBER</b>: PRO у двери: ЖДАТЬ — откат к 299.5" in j6 and "📈 <b>SBER</b>: мысль о прибыли: ДЕРЖАТЬ" in j6, j6
+        assert "приказ протух" in j6, j6
+        SENT.clear(); _recent.clear()
+        await on_event({"type": "v5", "scope": "mission", "stage": "pilot", "status": "done", "ticker": "SBER",
+                        "detail": "приказ не принят пилотом: killswitch заблокирован (серия убытков 3 подряд)"})
+        SNAP["missions"]["SBER"]["phase"] = "stopped"
+        await asyncio.sleep(WINDOW_SEC * 3)
+        await on_event({"type": "v5", "scope": "mission", "stage": "pilot", "status": "done", "ticker": "SBER",
+                        "detail": "пилот остановлен; позиция long 2 лот ОСТАЁТСЯ"})
+        await asyncio.sleep(WINDOW_SEC * 3)
+        await flush()
+        SNAP["missions"]["SBER"]["phase"] = "in_position"
+        j6 = "\n".join(x["text"] for x in SENT)
+        assert "⛔ <b>SBER</b>: приказ не принят пилотом: killswitch" in j6 and "⏹ <b>SBER</b>: пилот остановился" in j6, j6
+        # 6в) health: у пилота несколько проблем разного вида (key) — одна не глушит другую
+        _notified.clear(); SENT.clear(); _recent.clear()
+        probs = [{"kind": "pilot", "key": "pilot:feed", "level": "err", "text": "Пилот SBER: нет доступа к брокеру"},
+                 {"kind": "pilot", "key": "pilot:killswitch", "level": "err", "text": "Killswitch SBER"},
+                 {"kind": "pilot", "key": "pilot:feed", "level": "err", "text": "Пилот SBER: нет доступа (повтор)"}]
+        assert health_tick(probs) == 2 and health_tick(probs) == 0
+        await flush()
+        assert len(SENT) == 2 and "нет доступа к брокеру" in SENT[0]["text"] and "Killswitch" in SENT[1]["text"], SENT
+        _notified.clear(); _recent.clear()
         # 7) health: err — раз в 10 мин на вид, info — никогда
         SENT.clear()
         assert health_tick(_health()) == 1 and health_tick(_health()) == 0

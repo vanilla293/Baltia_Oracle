@@ -878,11 +878,19 @@ async def _account_position_text(m: Mission) -> str:
         return ""
     if not tinkoff.enabled():
         return ""
+    unknown = ("ПОЗИЦИЯ НА СЧЁТЕ НЕИЗВЕСТНА: {why} — позиция по инструменту может быть открыта; не считай, что её нет: "
+               "вердикт на случай, если она есть, — держать (стоп и тейк), закрыть или перевернуть")
     try:
-        accs = await asyncio.wait_for(tinkoff.accounts(), 15) or []
+        accs = await asyncio.wait_for(tinkoff.accounts(), 15)
+        if accs is None:                             # v5.4.4: счёт не прочитан ≠ «позиции нет»
+            return unknown.format(why="счёт не прочитан (" + (tinkoff.failure_text("Т-Банк не ответил")
+                                                              if hasattr(tinkoff, "failure_text") else "Т-Банк не ответил") + ")")
         if not accs:
             return ""
-        pf = await asyncio.wait_for(tinkoff.portfolio(accs[0]["id"]), 15) or {}
+        pf = await asyncio.wait_for(tinkoff.portfolio(accs[0]["id"]), 15)
+        if pf is None:
+            return unknown.format(why="портфель не прочитан (" + (tinkoff.failure_text("Т-Банк не ответил")
+                                                                  if hasattr(tinkoff, "failure_text") else "Т-Банк не ответил") + ")")
         inst = await asyncio.wait_for(tinkoff.resolve(m.ticker, m.asset_class), 15) or {}
         figi = inst.get("figi") or inst.get("uid")
         if not figi:
@@ -903,6 +911,7 @@ async def _account_position_text(m: Mission) -> str:
                       "держать (стоп и тейк), закрыть или перевернуть")
     except Exception as e:                           # noqa: BLE001
         log.info("позиция на счёте %s: %s", m.ticker, str(e)[:100])
+        return unknown.format(why=f"счёт не прочитан ({type(e).__name__}: {str(e)[:80]})")
     return ""
 
 
@@ -1306,12 +1315,14 @@ async def _council(m: Mission, reason: str, first: bool) -> dict | None:
                 _bind_pilot(m, pilot)
                 m.pilot = pilot
                 pilot.adopt_forecast({"exec": ex})
-                m.task = asyncio.create_task(pilot.run())
-                m.task.add_done_callback(lambda t: _pilot_done(m, t))
-                m.note = f"пилот запущен ({pilot.broker.mode}): {pilot.last_action}"
+                # v5.4.4: «пилот запущен» — только после успешной подготовки (счёт, портфель, контракт): не поднялся —
+                # причина в m.error, фаза error (_pilot_prepared / _pilot_done), а не тихая смерть под «запущен»
+                _launch_pilot(m, pilot)
+                m.note = f"пилот запускается ({pilot.broker.mode}): готовлю счёт и контракт; {pilot.last_action}"
             else:
-                m.pilot.adopt_forecast({"exec": ex})
-                m.note = f"пилот принял свежий приказ: {m.pilot.last_action}"
+                took = m.pilot.adopt_forecast({"exec": ex})
+                m.note = (f"пилот принял свежий приказ: {m.pilot.last_action}" if took else
+                          f"приказ не принят пилотом: {getattr(m.pilot, 'adopt_refused', None) or m.pilot.last_action}")
             # v5.4.1: WAIT — пилот без плана (фаза idle), дежурный PRO вернётся к вопросу на перепроверке
             m.phase = ("in_position" if ex["do"] in ("CLOSE", "HOLD") else "idle" if ex["do"] == "WAIT" else
                        "armed" if ex["entry"] is not None else "entering")
@@ -1412,14 +1423,42 @@ def _pilot_without_plan(m: Mission, err: str) -> None:
     pilot._review_reason, pilot._review_kind = rr, "pilot"
     pilot.last_action = (f"совет не собрал приказ — пилот поднят без плана, дежурный PRO решит через "
                          f"{int(REVIEW_RETRY_SEC // 60)} мин")
-    m.task = asyncio.create_task(pilot.run())
-    m.task.add_done_callback(lambda t: _pilot_done(m, t))
+    _launch_pilot(m, pilot)
     m.phase = "idle"
-    m.note = f"пилот запущен без плана ({pilot.broker.mode}): {pilot.last_action}"
+    m.note = f"пилот запускается без плана ({pilot.broker.mode}): {pilot.last_action}"
     log.warning("миссия %s: %s (%s)", m.ticker, m.note, err)
     _tolmach(m, "council", "Совет не собрал приказ — пилот без плана",
              f"{err}. Дежурный PRO решит по живой картине через {int(REVIEW_RETRY_SEC // 60)} мин.",
              refs={"error": err[:200]})
+
+
+def _launch_pilot(m: Mission, pilot: MissionPilot) -> None:
+    """v5.4.4: задача пилота + колбэк подготовки (_pilot_prepared) + итог задачи (_pilot_done)."""
+    pilot.on_prepared = lambda ok, why: _pilot_prepared(m, pilot, ok, why)
+    m.task = asyncio.create_task(pilot.run())
+    m.task.add_done_callback(lambda t: _pilot_done(m, t))
+
+
+def _pilot_prepared(m: Mission, pilot: MissionPilot, ok: bool, why: str) -> None:
+    """v5.4.4: подготовка пилота (счёт, портфель, контракт) закончилась. Поднялся — «пилот запущен»; нет — причина
+    владельцу (m.error, m.note, фаза error, шина pilot/error → панель проблем и Telegram), а не тихая смерть."""
+    if m.pilot is not pilot or _M.get(m.ticker) is not m:
+        return
+    if ok:
+        if str(m.error or "").startswith("пилот не стартовал"):
+            m.error = None
+        note = str(m.note or "")                     # «запускается / поднимается» → «запущен / поднят» (текст запуска цел)
+        if note.startswith("пилот запускается"):
+            m.note = note.replace("пилот запускается", "пилот запущен", 1).replace(" готовлю счёт и контракт;", "", 1)
+        elif note.startswith("пилот поднимается"):
+            m.note = note.replace("пилот поднимается", "пилот поднят", 1)
+    else:
+        m.error = f"пилот не стартовал: {why or 'подготовка не удалась'}"
+        m.phase = "error"
+        m.note = m.error + " — «продолжить» попробует снова, когда причина устранена"
+        log.error("миссия %s: %s", m.ticker, m.error)
+        _bg(bus.stage("mission", m.run_id, "pilot", "error", ticker=m.ticker, detail=m.error))
+    _persist(m)
 
 
 def _pilot_done(m: Mission, t: asyncio.Task) -> None:
@@ -1433,6 +1472,12 @@ def _pilot_done(m: Mission, t: asyncio.Task) -> None:
             m.error = f"пилот упал: {str(e)[:200]}"
             m.phase = "error"
             log.error("миссия %s: %s", m.ticker, m.error)
+        elif getattr(m.pilot, "prepare_error", None) and not getattr(m.pilot, "_prepared", False):
+            # v5.4.4: prepare() отказался стартовать — это не «остановлен», а ошибка с причиной
+            m.error = f"пилот не стартовал: {m.pilot.prepare_error}"
+            m.phase = "error"
+            if not str(m.note or "").startswith("пилот не стартовал"):
+                m.note = m.error + " — «продолжить» попробует снова, когда причина устранена"
         elif m.phase not in ("stopped", "panic", "error"):
             m.phase = "stopped"
     except Exception:                                # noqa: BLE001
@@ -5410,6 +5455,28 @@ async def stop(ticker: str) -> dict:
     return {"ok": True, "note": m.note}
 
 
+def _alive_note(p: MissionPilot) -> dict:
+    """v5.4.4: «ПРОДОЛЖИТЬ» при живой задаче пилота — честно: работает ли петля, есть ли связь с брокером
+    (раньше зомби без цены отвечал «пилот уже работает»)."""
+    feed = getattr(p, "feed", None) or {}
+    if not getattr(p, "loop_alive", True):
+        return {"ok": False, "note": "пилот готовится (счёт, портфель, контракт) и ещё не тикает — подожди; не поднимется — "
+                                     "причина будет в ошибке миссии"}
+    if feed and not feed.get("ok", True):
+        since = feed.get("since")
+        mins = int((time.time() - float(since)) // 60) if since else 0
+        return {"ok": False, "note": (f"пилот запущен, но не работает: {feed.get('reason') or 'нет связи с брокером'} "
+                                      f"(уже {mins} мин) — «продолжить» не поможет; пилот сам вернётся, как только брокер "
+                                      "ответит")}
+    ticking = getattr(p, "ticking", None)
+    if callable(ticking) and not ticking():
+        last = getattr(p, "last_tick_ts", None)
+        age = int(time.time() - float(last)) if last else None
+        return {"ok": False, "note": ("пилот запущен, но не тикает" + (f" {age} с" if age is not None else "")
+                                      + " — смотри журнал сервера; «стоп» и снова «продолжить» перезапустят его")}
+    return {"ok": True, "note": "пилот уже работает: " + str(p.last_action)}
+
+
 def _state_file_position() -> dict | None:
     try:
         p = config.DATA_DIR / "aipilot_state.json"
@@ -5442,7 +5509,7 @@ async def resume(ticker: str, *, settle_only: bool = False, panic_mode: bool = F
     if m.pilot_alive():
         if m.pilot.stopping or m.pilot.panic_flag:
             return {"ok": False, "note": "пилот ещё останавливается — дождись завершения"}
-        return {"ok": True, "note": "пилот уже работает: " + str(m.pilot.last_action)}
+        return _alive_note(m.pilot)
     if m.council_running():
         return {"ok": False, "note": "совет ещё идёт — дождись завершения"}
     if not tinkoff.enabled():
@@ -5483,10 +5550,9 @@ async def resume(ticker: str, *, settle_only: bool = False, panic_mode: bool = F
         pilot._review_reason = f"{prev}; {rr}" if prev and rr not in prev else (prev or rr)
         if not getattr(pilot, "_review_kind", None):
             pilot._review_kind = "pilot"
-    m.task = asyncio.create_task(pilot.run())
-    m.task.add_done_callback(lambda t: _pilot_done(m, t))
+    _launch_pilot(m, pilot)                          # v5.4.4: не поднялся — причина в m.error (_pilot_prepared)
     m.phase = ("armed" if (m.exec or {}).get("entry") is not None else "entering") if adopted else "idle"
-    m.note = ("пилот поднят заново: " + ("приказ принят — " + pilot.last_action if adopted else
+    m.note = ("пилот поднимается заново: " + ("приказ принят — " + pilot.last_action if adopted else
                                          "приказ совета WAIT — вне рынка, дежурный PRO решит на перепроверке"
                                          if (m.exec or {}).get("do") == "WAIT" and not settle_only else
                                          "свежего приказа нет, позицию подхватит из state-файла; "
@@ -5498,7 +5564,8 @@ async def resume(ticker: str, *, settle_only: bool = False, panic_mode: bool = F
     else:
         await _scan_start(m)                         # сканер поднимается вместе с пилотом
     _persist(m)
-    return {"ok": True, "note": m.note}
+    # v5.4.4: подготовка уже отказала (токен/счёт) — не «ок»: причина в note и m.error
+    return {"ok": not str(m.error or "").startswith("пилот не стартовал"), "note": m.note}
 
 
 def _set_panic_orders(m: Mission, orders: list[dict]) -> None:
@@ -5574,9 +5641,14 @@ async def _flat_account(m: Mission) -> dict:
                                  "; ".join(errors) if errors else f"закрытие подтверждено: {closed}")
                                 + (f" · ⚠ заявки {', '.join(vanished)} до биржи не дошли, сброшены" if vanished else "")}
             dropped_note = f"заявки {', '.join(vanished)} до биржи не дошли — сброшены, закрываю по портфелю"
-        accs = await asyncio.wait_for(tinkoff.accounts(), 15) or []
+        accs = await asyncio.wait_for(tinkoff.accounts(), 15)
+        if accs is None:                             # v5.4.4: счёт не прочитан ≠ «счёта нет»: причина (токен, права, сеть)
+            why = tinkoff.failure_text("Т-Банк не ответил на GetAccounts") if hasattr(tinkoff, "failure_text") else \
+                "Т-Банк не ответил на GetAccounts"
+            return {"ok": False, "note": f"паника по счёту не отправлена: {why} — закрой позицию в приложении брокера"}
         if not accs:
-            return {"ok": False, "note": "счёт Tinkoff не найден"}
+            return {"ok": False, "note": "у токена Т-Банка нет счетов — паника по счёту невозможна; закрой позицию в "
+                                         "приложении брокера"}
         broker.account_id = accs[0]["id"]
         inst = await asyncio.wait_for(tinkoff.resolve(m.ticker, m.asset_class), 15) or {}
         figi = inst.get("figi") or inst.get("uid")
@@ -5773,7 +5845,9 @@ async def panic(ticker: str | None = None, *, force: bool = False) -> dict:
 
 
 _STATE_PHASE = {"ЗАСАДА": "armed", "ВХОЖУ": "entering", "У_ДВЕРИ": "entering", "В_ПОЗИЦИИ": "in_position",
-                "ПЕРЕАНАЛИЗ": "council", "ЖДУ_ПЛАН": "idle", "РЫНОК_ЗАКРЫТ": "closed"}
+                "ПЕРЕАНАЛИЗ": "council", "ЖДУ_ПЛАН": "idle", "РЫНОК_ЗАКРЫТ": "closed",
+                # v5.4.4: связи с брокером нет — не «Вхожу/В позиции», а честно: нет связи / нет доступа (токен, права)
+                "НЕТ_СВЯЗИ": "no_link", "НЕТ_ДОСТУПА": "no_access"}
 
 
 def _phase(m: Mission) -> str:
@@ -5785,6 +5859,8 @@ def _phase(m: Mission) -> str:
         p = m.pilot
         if p.state == "СТОП":
             return "panic" if p.panic_flag else "stopped"
+        if p.state in ("НЕТ_СВЯЗИ", "НЕТ_ДОСТУПА"):    # v5.4.4: заявка в полёте без связи — тоже не «Вхожу»
+            return _STATE_PHASE[p.state]
         if p.pending:
             return "entering"
         return _STATE_PHASE.get(p.state, m.phase)

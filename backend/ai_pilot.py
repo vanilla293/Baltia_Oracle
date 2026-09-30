@@ -84,6 +84,8 @@ except ImportError:
         market_clock = None
 
 log = logging.getLogger("pythia.ai_pilot")
+_TK = tinkoff                  # v5.4.4: настоящий модуль — чистые функции (classify, подсказки кодов), даже если стенд
+                               # подменил ai_pilot.tinkoff фейком без них
 
 TICK_SEC = 1.5                 # шаг петли
 REVIEW_SEC = float(os.getenv("PYTHIA_AIP_REVIEW_SEC", "1800"))   # 30 мин
@@ -150,6 +152,16 @@ OPEN_REVIEW_GRACE_SEC = 90.0   # перепроверка не раньше че
 CLOSED_LONG_SEC = 1800.0       # закрыт дольше N с (ночь, выходной) → на открытии сразу перепроверка
                                # «накопились новости/события»; короткий клиринг — просто продолжаем
 CLOSED_RECONCILE_EVERY = 4     # тиков закрытого рынка между сверками со счётом (шаг PYTHIA_CLOSED_TICK_SEC)
+# ── v5.4.4 «СВЯЗЬ С БРОКЕРОМ» (жалоба владельца 30.09.2026: токен отозван — цены нет, петля молча не тикала, панель
+#    мигала «Вхожу/В позиции», CLOSE и вход «написаны, но не исполнены»; отказы биржи штурмовались каждый тик) ──
+FEED_PROBE_SEC = 30.0          # связи нет → раз в N с проверка брокера (GetAccounts + уровень доступа): уточнить причину
+FEED_DOWN_POLL_SEC = 5.0       # связи нет → цену спрашиваем раз в N с (не штурмуем API и лог)
+FEED_URGENT_SEC = 12.0         # связи нет → срочное (ПАНИКА, CLOSE, заявка в полёте) не чаще раза в N с, по последней цене
+PANIC_RETRY_SEC = 12.0         # ПАНИКА: биржа отбила закрытие → повтор не чаще раза в N с
+CLOSE_RETRY_MAX_SEC = 60.0     # закрытие/ужатие отбито → пауза 2→4→8→…→60 с между попытками, а не каждый тик
+POLL_RETRY_MAX_SEC = 30.0      # судьба заявки неизвестна (ответ потерян) → опрос с паузой 2→4→…→30 с
+LIMITS_EVERY_SEC = 60.0        # лимиты счёта (GetMaxLots) для ситуации PRO — не чаще раза в N с при открытом рынке
+RIGHTS_HOLD_MAX_SEC = 600.0    # отказ по правам на заявке: проверка брокера снимает его не раньше 30→60→…→600 с
 
 
 def _setting(name: str, default):
@@ -210,6 +222,34 @@ def wait_review_sec() -> float:
     except (TypeError, ValueError):
         sec = 1800.0
     return max(1.0, min(sec, REVIEW_SEC))
+
+
+def feed_grace_sec() -> float:
+    """v5.4.4: цены нет дольше N с при открытом рынке → связь потеряна (PYTHIA_FEED_GRACE_SEC, живьём)."""
+    try:
+        return max(0.0, float(_setting("PYTHIA_FEED_GRACE_SEC", 20)))
+    except (TypeError, ValueError):
+        return 20.0
+
+
+def tick_stale_sec() -> float:
+    """v5.4.4: пилот «тикает», если последний тик не старше N с (PYTHIA_TICK_STALE_SEC, живьём)."""
+    try:
+        return max(1.0, float(_setting("PYTHIA_TICK_STALE_SEC", 20)))
+    except (TypeError, ValueError):
+        return 20.0
+
+
+def _classify(err) -> tuple[str, str]:
+    """(вид, причина) ошибки брокера через tinkoff.classify: auth|rights|cert|network|other; модуля нет — other."""
+    fn = getattr(tinkoff, "classify", None) or getattr(_TK, "classify", None)
+    if callable(fn):
+        try:
+            kind, reason = fn(err)
+            return str(kind), str(reason)
+        except Exception:                                    # noqa: BLE001
+            pass
+    return "other", str((err or {}).get("error") if isinstance(err, dict) else err or "")[:200]
 
 FRAME = ("⚫ ИИ-пилот: реальные деньги на максимум по решению ИИ — личный тест "
          "владельца. Тормоза: killswitch, маржевой дозор, биржевой трос, "
@@ -332,6 +372,26 @@ class AIPilot:
         self._stray_warned = False
         self.started_ts = time.time()
         self._last_tick_ts = 0.0               # v5.3 фаза 3: когда петля последний раз тикала (панель: state_age_s)
+        # ── v5.4.4 «связь с брокером»: петля честно знает, есть ли у неё цена и доступ, и говорит об этом ──
+        self.loop_alive = False                # петля после успешного prepare() жива (False — не поднялась / вышла)
+        self.feed: dict = {"ok": True, "kind": "ok", "reason": "", "since": None, "checked_ts": None}
+        self._px_fail: dict | None = None      # цены нет: {kind, reason, since, code}
+        self._trade_refusal: dict | None = None   # заявку отбили по токену/правам: {kind, reason, since, what, code, hold_until}
+        self._rights_n = 0                     # отказов по правам подряд (растёт пауза до снятия; сброс — исполнение)
+        self._feed_probe_ts = 0.0              # когда последний раз спрашивали брокера (GetAccounts), пока связи нет
+        self._feed_epoch = None                # эпоха токена (tinkoff.token_epoch) при потере связи: новый токен → проверка сразу
+        self._urgent_at = 0.0                  # связи нет: следующая срочная попытка (ПАНИКА/CLOSE/заявка) не раньше
+        self._urgent_only = False              # идёт срочный тик без свежей цены: только закрытие/заявка, ни решений, ни ИИ
+        self._reconcile_asap = False           # связь вернулась → сверка со счётом первым же тиком
+        self.prepare_error: str | None = None  # почему prepare() отказался стартовать (миссии — в m.error)
+        self.on_prepared = None                # колбэк миссии (ok: bool, why: str) — пилот поднялся или нет
+        self.broker_refusal: dict | None = None    # последний отказ биржи {what, code, text, count, ts, kind}; сброс — исполнение
+        self.account_limits: dict | None = None    # {buy_lots, sell_lots, ts, note} — сколько даёт биржа (GetMaxLots)
+        self._limits_ts = 0.0
+        self.adopt_refused: str | None = None  # почему последний приказ не принят (killswitch, мусор, …); принят → None
+        self._acct_unverified = False          # портфель при старте не прочитан: входов нет до первой удачной сверки
+        self._acct_unverified_why = ""
+        self._ks_seen = False                  # срабатывание killswitch объявлено (одна запись, хук _on_killswitch)
         self._state_path = None                # файл выживания позиции
         try:
             try:
@@ -415,10 +475,13 @@ class AIPilot:
             log.warning("state-файл не записался: %s", str(e)[:80])
             return False
 
-    def _restore_state(self, portfolio_qty: int) -> None:
+    def _restore_state(self, portfolio_qty: int | None) -> None:
         """Рестарт сервера с открытой позицией: подхватить СВОЮ позицию из
         state-файла (иначе она навсегда попала бы в «ручные» и осталась без
-        ведения). Подхват только при совпадении figi и знака на счёте."""
+        ведения). Подхват только при совпадении figi и знака на счёте.
+        v5.4.4: portfolio_qty None — портфель НЕ ПРОЧИТАН (сбой GetPortfolio / токен), это не «0 лотов»: файл не
+        стирается, позиция из него поднимается с пометкой «сверить со счётом» (unverified: ни добора, ни ужатия, закрытие
+        только по остатку со счёта — exit_check strict), первая удачная сверка (_reconcile) решает по счёту."""
         if not (self._state_path and self._state_path.exists()):
             return
         try:
@@ -464,7 +527,8 @@ class AIPilot:
             return
         owned_order = bool(self.pending or p.get("exit_order") or p.get("stop_request"))
         want = int(p["lots"]) * (1 if p.get("side") == "long" else -1)
-        if portfolio_qty * want <= 0 and not owned_order:
+        unverified = portfolio_qty is None
+        if not unverified and portfolio_qty * want <= 0 and not owned_order:
             try:
                 self._state_path.unlink()
             except Exception:                                # noqa: BLE001
@@ -473,7 +537,7 @@ class AIPilot:
         # While our order is unresolved the portfolio may already contain a
         # partial fill or still lag behind it. Its cumulative status owns the
         # delta; adopting the snapshot here would account the fill twice.
-        own = int(p["lots"]) if owned_order else min(abs(portfolio_qty), int(p["lots"]))
+        own = int(p["lots"]) if (owned_order or unverified) else min(abs(portfolio_qty), int(p["lots"]))
         self.position = {"side": p["side"], "entry": _f(p.get("entry")),
                          "lots": own, "take": p.get("take"),
                          "invalidation": p.get("invalidation"),
@@ -514,11 +578,17 @@ class AIPilot:
             self.position["restop"] = True  # a known rejected stop must still be retried after restart
         if self.position.get("stop_id") and not self._exchange_stop_on():
             self.position["restop"] = True  # v5.4.1: стопы только в программе — старый стоп биржи снять один раз
-        self.foreign_lots = (int(rec.get("foreign_lots") or 0) if owned_order else
+        self.foreign_lots = (int(rec.get("foreign_lots") or 0) if (owned_order or unverified) else
                              portfolio_qty - (own if p["side"] == "long" else -own))
+        if unverified:
+            self.position["unverified"] = True       # сверить со счётом: заявок по ней нет до первой удачной сверки
+            self.position["exit_check"] = True       # закрытие — только по остатку со счёта (без счёта не закрываем)
+            self.position["exit_check_strict"] = True
         self.state = "В_ПОЗИЦИИ"
         self.last_action = (f"РЕСТАРТ: подхватил свою позицию {p['side']} "
-                            f"{own} лот @{p.get('entry')} (трос {p.get('stop_id') or 'в программе'})")
+                            f"{own} лот @{p.get('entry')} (трос {p.get('stop_id') or 'в программе'})"
+                            + (" — СВЕРИТЬ СО СЧЁТОМ: портфель не прочитан, доборов и ужатий нет, закрытие только по "
+                               "остатку со счёта" if unverified else ""))
         log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
 
     def _defer_state_file(self, rec: dict, account) -> None:
@@ -541,10 +611,45 @@ class AIPilot:
         log.error("ИИ-пилот %s: %s", self.base, self._state_note)
 
     # ── подготовка: контракт, депозит, изоляция, восстановление ─────────────
+    def _tk_reason(self, default: str) -> str:
+        """Причина свежего сбоя Т-Банка владельцу (tinkoff.failure_text); нет — default."""
+        fn = getattr(tinkoff, "failure_text", None)
+        try:
+            return str(fn(default)) if callable(fn) else default
+        except Exception:                                    # noqa: BLE001
+            return default
+
+    def _prepare_fail(self, why: str) -> bool:
+        """v5.4.4: prepare() отказался стартовать — причина наружу (prepare_error → m.error / m.note, фаза error),
+        а не тихая смерть «пилот запущен…» при остановленной петле."""
+        self.prepare_error = why
+        self.last_action = f"пилот не стартовал: {why}"
+        log.error("ИИ-пилот %s: %s", self.base, self.last_action)
+        return False
+
     async def prepare(self) -> bool:
-        accs = await tinkoff.accounts() or []
+        # v5.4.4: непрочитанный счёт ≠ «0 лотов». Счёт (GetAccounts) не прочитан → отказ стартовать с причиной (токен,
+        # права, сеть): без счёта заявки не уходят, а state-файл не трогаем. Портфель не прочитан при известном счёте →
+        # позиция из state-файла поднимается «сверить со счётом» (unverified), входов нет до первой удачной сверки;
+        # денег не узнать (ни депозита, ни ликвидного портфеля) → отказ стартовать (сайзинг без денег невозможен).
+        self.prepare_error = None
+        live = getattr(self.broker, "mode", "dry") != "dry"
+        accs = await tinkoff.accounts()
+        if accs is None and live:
+            return self._prepare_fail("счёт Т-Банка не прочитан: " + self._tk_reason("GetAccounts не ответил")
+                                      + " — позицию на счёте программа не видит и не ведёт; state-файл не тронут")
+        accs = accs or []
+        if not accs and live:
+            return self._prepare_fail("у токена Т-Банка нет счетов — выпусти токен с доступом к счёту и вставь в «Ключи»")
         acc = accs[0]["id"] if accs else None
-        pf = await tinkoff.portfolio(acc) if acc else None
+        pf, pf_err = None, ""
+        if acc:
+            try:
+                pf = await tinkoff.portfolio(acc)
+            except Exception as e:                           # noqa: BLE001
+                pf, pf_err = None, str(e)[:120]
+            if pf is None:
+                pf_err = pf_err or self._tk_reason("GetPortfolio не ответил")
         if acc:
             self.broker.account_id = acc
         mg = None
@@ -570,12 +675,14 @@ class AIPilot:
         self.account = {"free": _f((pf or {}).get("free_rub")) if pf else None,
                         "total": _f((pf or {}).get("total_rub")) if pf else None,
                         "liquid": (mg or {}).get("liquid"), "sufficiency": (mg or {}).get("sufficiency"),
-                        "missing": (mg or {}).get("missing"), "ts": time.time()}
-        if self.deposit <= 0 and getattr(self.broker, "mode", "dry") != "dry":
-            log.error("ИИ-пилот %s: депозит не определён (%.2f) — не стартую "
-                      "(сайзинг «на максимум» без денег невозможен)",
-                      self.base, self.deposit)
-            return False
+                        "missing": (mg or {}).get("missing"), "starting": (mg or {}).get("starting_margin"),
+                        "ts": time.time()}
+        if self.deposit <= 0 and live:
+            if acc and pf is None:
+                return self._prepare_fail(f"портфель счёта не прочитан ({pf_err}) — без него не знаю ни денег, ни позиции; "
+                                          "state-файл не тронут, позиция на счёте (если есть) без присмотра программы")
+            return self._prepare_fail(f"депозит не определён ({self.deposit:.2f} ₽) — сайзинг «на максимум» без денег "
+                                      "невозможен")
         try:
             try:
                 from . import instruments as _ins
@@ -588,9 +695,8 @@ class AIPilot:
             pass
         inst = await tinkoff.resolve(self.base, self.asset_class)
         if not inst:
-            log.error("ИИ-пилот: инструмент %s (%s) не найден",
-                      self.base, self.asset_class)
-            return False
+            return self._prepare_fail(f"инструмент {self.base} ({self.asset_class}) не найден у брокера"
+                                      + (f": {self._tk_reason('')}" if self._tk_reason("") else ""))
         self.figi = inst.get("figi") or inst.get("uid")
         if self.asset_class == "futures":
             mg_f = await tinkoff.futures_margin(self.figi) or {}
@@ -601,9 +707,8 @@ class AIPilot:
             self.point_value = (amt / inc) if inc else 1.0
             self.tick_size = float(inc or 0.0)
             if not self.go_per_lot or self.go_per_lot <= 0:
-                log.error("ИИ-пилот %s: ГО фьючерса не получено — сайзинг "
-                          "«на максимум» невозможен, не стартую", self.base)
-                return False
+                return self._prepare_fail("ГО фьючерса не получено — сайзинг «на максимум» невозможен"
+                                          + (f" ({self._tk_reason('')})" if self._tk_reason("") else ""))
         else:
             lot = int(inst.get("lot") or 1)
             self.point_value = float(lot)
@@ -617,6 +722,7 @@ class AIPilot:
             self.dshort = _q(inst.get("dshort"))
         # что уже лежит на счёте по этому figi
         qty0, avg0 = 0, 0.0
+        unverified = bool(acc) and pf is None       # v5.4.4: портфель не прочитан — это НЕ «0 лотов»
         for p_ in (pf or {}).get("positions", []):
             if (p_.get("figi") == self.figi or (p_.get("uid") and p_.get("uid") == self.figi)) \
                     and abs(p_.get("qty") or 0) >= 1:
@@ -628,8 +734,17 @@ class AIPilot:
                 avg0 = _f(p_.get("avg"))
                 break
         # …своя позиция из прошлой жизни (state-файл, рестарт) подхватывается первой
-        self._restore_state(qty0)
-        if self.adopt_account and not self.pending and not any((self.position or {}).get(key) for key in ("exit_order", "stop_request")):
+        self._restore_state(None if unverified else qty0)
+        if unverified:
+            # сверка со счётом — первым удачным чтением портфеля (_reconcile → _verify_account); до неё входов нет
+            self._acct_unverified = True
+            self._acct_unverified_why = pf_err
+            self._reconcile_asap = True
+            note = (f"портфель при старте не прочитан ({pf_err}) — сверю со счётом первым удачным чтением; "
+                    "входов и доборов до сверки нет")
+            self.last_action = (f"{self.last_action} · {note}" if self.position else note)
+            log.warning("ИИ-пилот %s: %s", self.base, note)
+        elif self.adopt_account and not self.pending and not any((self.position or {}).get(key) for key in ("exit_order", "stop_request")):
             # ВЕСЬ СЧЁТ ПО ИНСТРУМЕНТУ (v5.2): что лежит на счёте — позиция бота, владелец
             # докупил или открыл руками — веду и это; ИИ не думает «сколько куплено»
             self._absorb_account(qty0, avg0, None, "на счёте при старте")
@@ -643,6 +758,8 @@ class AIPilot:
         if hold and self.position:
             # позиция не принята со счёта, а подхвачена из state-файла (рестарт): HOLD к ней — как обычно
             self._adopt_hold({"invalidation": hold.get("inv"), "take": hold.get("take")})
+        elif hold and unverified:
+            self._pending_hold = hold          # счёт не прочитан: позицию со счёта примет первая сверка — с уровнями HOLD
         elif hold:
             # держать нечего (счёт пуст): дежурный PRO решит скоро, а не через плановые полчаса
             self.review_ts = min(self.review_ts, time.time() + 300)
@@ -653,8 +770,8 @@ class AIPilot:
         self.session_risk = trader_risk.SessionRisk(max(1.0, self.deposit))
         self._sr_day = self._msk_day()
         self._prepared = True
-        if self._close_pending and not self.position and not self.pending:
-            self._close_pending = None         # CLOSE до подготовки, а закрывать нечего
+        if self._close_pending and not self.position and not self.pending and not unverified:
+            self._close_pending = None         # CLOSE до подготовки, а закрывать нечего (счёт прочитан)
         log.info("ИИ-пилот готов: %s figi=%s ГО=%s/%s dlong=%.2f депозит=%.0f "
                  "режим=%s весь_счёт=%s", self.base, self.figi, self.go_per_lot,
                  self.go_sell, self.dlong, self.deposit, self.broker.mode, self.adopt_account)
@@ -946,8 +1063,56 @@ class AIPilot:
                         "ts": time.time(), "price": price, "buy_money": r.get("buy_money")}
             self.account.update({"max_buy": self._mx["buy"], "max_sell": self._mx["sell"],
                                  "mx_ts": self._mx["ts"]})
-        elif self._mx and time.time() - self._mx["ts"] > MX_TTL_SEC * 3:
-            self._mx = None
+            self._set_limits(self._mx["buy"], self._mx["sell"], self._mx["ts"])
+        else:
+            if self._mx and time.time() - self._mx["ts"] > MX_TTL_SEC * 3:
+                self._mx = None
+            self._limits_unknown()
+
+    def _set_limits(self, buy: int, sell: int, ts: float) -> None:
+        """v5.4.4: лимиты счёта для ситуации PRO и панели: сколько лотов биржа даёт купить/продать (GetMaxLots, с
+        плечом) и что это значит словами (0 — покупка/продажа недоступна)."""
+        notes = []
+        if int(buy) <= 0:
+            notes.append("покупка недоступна: маржа исчерпана (GetMaxLots 0 лотов)")
+        if int(sell) <= 0:
+            notes.append("продажа недоступна (GetMaxLots 0 лотов)")
+        note = "; ".join(notes) + ("; " if notes else "") + f"биржа даёт купить {int(buy)} / продать {int(sell)} лот (GetMaxLots, с плечом)"
+        self.account_limits = {"buy_lots": int(buy), "sell_lots": int(sell), "ts": float(ts), "note": note}
+
+    def _limits_unknown(self) -> None:
+        """GetMaxLots не ответил (или режим без биржи) — лимиты неизвестны, честно: None и причина."""
+        mode = getattr(self.broker, "mode", "dry")
+        if mode != "real":
+            note = f"режим {mode}: лимиты биржа не сообщает — размер считает пилот"
+        else:
+            le = None
+            fn = getattr(tinkoff, "last_error", None)
+            try:
+                le = fn() if callable(fn) else None
+            except Exception:                                # noqa: BLE001
+                le = None
+            fresh = isinstance(le, dict) and le.get("path") == "GetMaxLots" and time.time() - _f(le.get("ts")) < 120
+            note = "лимиты не получены: " + (str(le.get("reason") or le.get("text")) if fresh else "брокер не ответил на GetMaxLots")
+        prev = self.account_limits or {}
+        self.account_limits = {"buy_lots": None, "sell_lots": None, "ts": time.time(), "note": note[:240],
+                               "last_buy_lots": prev.get("buy_lots", prev.get("last_buy_lots")),
+                               "last_sell_lots": prev.get("sell_lots", prev.get("last_sell_lots"))}
+
+    async def _refresh_limits(self, price: float, force: bool = False) -> None:
+        """v5.4.4: лимиты счёта (GetMaxLots) — не чаще раза в LIMITS_EVERY_SEC при открытом рынке; свежий кэш _mx
+        (вход, сверка) переиспользуется."""
+        now = time.time()
+        if not self.figi or (not force and now - self._limits_ts < LIMITS_EVERY_SEC):
+            return
+        self._limits_ts = now
+        mx = self._mx
+        if mx and now - _f(mx.get("ts")) <= MX_TTL_SEC:
+            self._set_limits(mx["buy"], mx["sell"], mx["ts"])
+            return
+        if getattr(self.broker, "max_lots", None) is None:
+            return
+        await self._refresh_max(price, force=True)
 
     async def _refresh_account(self, price: float) -> None:
         """Маржинальные атрибуты счёта (ликвидный портфель, недостающие средства) и «сколько
@@ -1016,11 +1181,25 @@ class AIPilot:
 
     # ── приказ шифровщика (после огромного анализа) ─────────────────────────
     def adopt_forecast(self, forecast: dict | None) -> bool:
-        """Свежий прогноз конвейера → боевой план. Возврат: план принят?"""
+        """Свежий прогноз конвейера → боевой план. Возврат: план принят?
+        v5.4.4: не принят → причина в self.adopt_refused (killswitch, мусорный приказ, …) — миссия объявляет «приказ не
+        принят пилотом: …», а не «пилот принял свежий приказ»; принят → adopt_refused None."""
+        ok = self._adopt_forecast(forecast)
+        self.adopt_refused = None if ok else (str(self.last_action or "").strip() or "приказ не принят пилотом")
+        return ok
+
+    def killswitch_reason(self) -> str | None:
+        """v5.4.4: killswitch заперт → его причина (серия убытков / дневной лимит), иначе None."""
+        sr = self.session_risk
+        if sr is not None and getattr(sr, "locked", False):
+            return str(getattr(sr, "reason", None) or (sr.state() or {}).get("reason") or "дневной лимит убытка")
+        return None
+
+    def _adopt_forecast(self, forecast: dict | None) -> bool:
         self._reanalyzing = False
         self._pending_hold = None              # ревью 5.4.2: HOLD до подготовки — только пока не пришёл новый приказ
         if self.session_risk and self.session_risk.locked:
-            self.last_action = ("killswitch заблокирован — свежий приказ НЕ "
+            self.last_action = (f"killswitch заблокирован ({self.killswitch_reason()}) — свежий приказ НЕ "
                                 "принят; сброс — новым торговым днём")
             log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
             return False
@@ -1116,6 +1295,15 @@ class AIPilot:
             self.last_action = (f"свежий вердикт той же стороны: обновил "
                                 f"стоп {self.position['invalidation']} / "
                                 f"тейк {self.position['take']}")
+            if ex.get("entry") is not None:
+                # v5.4.4 (D5): «добрать на откате к 99» / «на пробитии 101» — это план ДОБОРА у уровня (§3 тика: добор по
+                # приказу через проверку у двери), а не только новые стоп/тейк. add_to — план к позиции этой стороны:
+                # позиция закрыта или перевёрнута — план снимается (_drop_topup_plan), в новый вход он не превращается
+                self.plan = {"side": side, "entry": ex.get("entry"), "take": ex.get("take"),
+                             "invalidation": _f(ex.get("invalidation")), "why": str(ex.get("why") or "")[:300],
+                             "ts": time.time(), "add_to": side}
+                self._entry_fail = 0
+                self.last_action += f"; добор взведён: засада @{ex.get('entry')}"
             log.info("ИИ-пилот %s: %s", self.base, self.last_action)
             # добор до максимума по свежему приказу «сейчас»: биржа даёт ещё — берём
             if ex.get("entry") is None and self._sized_by_broker:
@@ -1350,7 +1538,7 @@ class AIPilot:
 
     # ── петля ───────────────────────────────────────────────────────────────
     async def tick(self, price: float, book: dict | None = None) -> None:
-        if price and price > 0:
+        if price and price > 0 and not self._urgent_only:     # v5.4.4: срочный тик по старой цене историю не пишет
             self.prices.append(float(price))
             if len(self.prices) > 2400:
                 del self.prices[:1200]
@@ -1374,6 +1562,7 @@ class AIPilot:
             if self.state == "СТОП" and not self.panic_flag:
                 self.state = "ЖДУ_ПЛАН"
                 self.review_ts = min(self.review_ts, time.time() + 300)
+            self._ks_seen = False
             log.info("ИИ-пилот %s: новый торговый день — killswitch заново "
                      "(база %.0f)", self.base, eq)
 
@@ -1382,6 +1571,8 @@ class AIPilot:
             why = ("ПАНИКА владельца" if self.panic_flag else
                    "killswitch: " + str((self.session_risk.state() or {})
                                         .get("reason")))
+            if not self.panic_flag and not self._ks_seen:
+                self._announce_killswitch()        # v5.4.4: одна запись с причиной + событие (хук _on_killswitch)
             part, po = await self._cancel_pending()
             if part > 0 and po:                # частичка — под учёт и закрытие
                 await self._absorb_fill(part, po, place_stop=False)
@@ -1413,19 +1604,22 @@ class AIPilot:
             else:
                 self._panic_pending_fails = 0
             if self.position:
+                if self._close_paused(self.position):   # v5.4.4: биржа отбила закрытие — повтор с паузой, не каждый тик
+                    self.last_action = f"{why} — {self.last_action}"
+                    return
                 ok = await self._close_all(price, why, reanalyze=False)
                 if not ok:
                     # причину назвал _close_all (отмена троса не подтверждена / выход ждёт исполнения /
                     # биржа отбила) — не подменяем её «закрытие отбито биржей» (W4, п. 3)
                     detail = str(self.last_action or "").strip()
                     if not detail or detail.startswith(why):
-                        detail = "закрытие не завершено, повторяю каждый тик"
+                        detail = "закрытие не завершено, повторяю"
                     self.last_action = f"{why} — {detail}"
                     return                     # позиция в учёте, добьём дальше
             self.state = "СТОП"
-            head = self.last_action if str(self.last_action or "").startswith("ЗАКРЫЛ ВСЁ") else why
+            head = self.last_action if str(self.last_action or "").startswith(("ЗАКРЫЛ ВСЁ", "KILLSWITCH")) else why
             tail = " · торговля остановлена"    # причина и P/L закрытия остаются первыми; хвост один раз
-            self.last_action = head if head.endswith(tail) else head + tail
+            self.last_action = head if (head.endswith(tail) or "торговля остановлена" in head) else head + tail
             return
 
         # An accepted market exit can remain NEW or partially filled. Settle
@@ -1437,6 +1631,8 @@ class AIPilot:
         if (self.position or {}).get("stop_request") and not self.position.get("exit_order"):
             pos = self.position
             if self._close_pending or pos.get("close_fail"):
+                if self._close_paused(pos):
+                    return
                 why = self._close_pending or pos["close_fail"]
                 self._close_pending = None
                 await self._close_all(price, why, reanalyze=pos.get("close_reanalyze", False))
@@ -1449,12 +1645,23 @@ class AIPilot:
         exit_order = (self.position or {}).get("exit_order")
         if exit_order:
             pos = self.position
+            wait = _f(exit_order.get("poll_at")) - now
+            if wait > 0:                   # v5.4.4: ответ по заявке выхода потерян — опрос с паузой (до 30 с), не каждый тик
+                self.last_action = (f"выход: судьба заявки неизвестна ({exit_order.get('poll_err') or 'брокер не ответил'}) "
+                                    f"— следующий опрос через {int(wait) + 1} с, повторную заявку не отправляю")
+                return
             if self._close_pending or pos.get("close_fail") or exit_order.get("kind") == "close":
                 why = self._close_pending or pos.get("close_fail") or exit_order.get("why") or "закрытие"
                 self._close_pending = None
                 await self._close_all(price, why, reanalyze=pos.get("close_reanalyze", False))
             else:
                 await self._reduce(pos, exit_order["lots"], price, exit_order.get("why") or "ужатие")
+            return
+
+        # v5.4.4: срочный тик без свежей цены (связи нет): только приказ CLOSE / недобитое закрытие / заявка в полёте —
+        # ни триггера по старой цене, ни решений, ни вопросов ИИ
+        if self._urgent_only:
+            await self._urgent_rest(price, book)
             return
 
         # 0в. РЫНОЧНЫЕ ЧАСЫ: биржа закрыта → стопор (входов, доборов, перевзводов, вопросов ИИ нет;
@@ -1468,6 +1675,10 @@ class AIPilot:
             return
         if was_open is False:
             await self._on_market_open(price)
+        try:                                   # v5.4.4: лимиты счёта (GetMaxLots) для ситуации PRO — раз в минуту
+            await self._refresh_limits(price)
+        except Exception as e:                               # noqa: BLE001
+            log.info("ИИ-пилот %s: лимиты счёта: %s", self.base, str(e)[:80])
 
         # 1. заявка входа в полёте
         if self.pending:
@@ -1479,11 +1690,15 @@ class AIPilot:
         if self.position:
             pos = self.position
             if self._close_pending:            # приказ CLOSE: закрыть и стоять вне рынка
+                if self._close_paused(pos):    # v5.4.4: пауза после отказа биржи — приказ ждёт, не теряется
+                    return
                 why, self._close_pending = self._close_pending, None
                 self.plan = None
                 await self._close_all(price, why, reanalyze=False)
                 return
-            if pos.get("close_fail"):          # биржа отбила закрытие — добить
+            if pos.get("close_fail"):          # биржа отбила закрытие — добить (v5.4.4: с паузой 2→…→60 с)
+                if self._close_paused(pos):
+                    return
                 await self._close_all(price, pos["close_fail"],
                                       reanalyze=pos.get("close_reanalyze", True))
                 return
@@ -1517,7 +1732,11 @@ class AIPilot:
             # v5.2: размер считала биржа → судья только её маржинальные атрибуты
             # (недостающие средства), а не наша прикидка по деньгам
             per = self.per_lot(price, pos["side"])
-            if self._sized_by_broker or self.account.get("liquid") is not None:
+            if pos.get("unverified") or now < _f(pos.get("reduce_retry_at")):
+                # v5.4.4: позиция не сверена со счётом — ужимать вслепую нельзя (голый разворот); ужатие только что отбито
+                # биржей — пауза до reduce_retry_at (причина — в broker_refusal); трос/тейк ниже работают как обычно
+                pass
+            elif self._sized_by_broker or self.account.get("liquid") is not None:
                 miss = _f(self.account.get("missing"))
                 if miss > 0 and per > 0:
                     cut = int(miss // per) + 1
@@ -1554,7 +1773,7 @@ class AIPilot:
                 if max_holds and int(pos.get("holds") or 0) >= max_holds:
                     await self._close_all(price, f"мягкий стоп: {self._money_name()} ждал {pos.get('holds')} раз — предел, закрываю")
                     return
-                if not pos.get("guard_busy") and now >= _f(pos.get("guard_next")):
+                if not pos.get("guard_busy") and now >= _f(pos.get("guard_next")) and (self.feed or {}).get("ok", True):
                     pos["guard_busy"] = True
                     pos["guard_price"] = price
                     self.last_action = (f"цена {price:g} за триггером {inv:g} — спрашиваю {self._money_name()}: "
@@ -1577,7 +1796,7 @@ class AIPilot:
                     await self._close_all(price, f"ПОБЕДА: тейк @{take:g} — {self._money_name()} держал {pos.get('take_holds')} раз, "
                                                  "предел — фиксирую")
                     return
-                if not pos.get("guard_busy") and now >= _f(pos.get("take_next")):
+                if not pos.get("guard_busy") and now >= _f(pos.get("take_next")) and (self.feed or {}).get("ok", True):
                     pos["guard_busy"] = True
                     pos["guard_side"] = "take"
                     pos["guard_price"] = price
@@ -1588,7 +1807,7 @@ class AIPilot:
             # флип: свежий план в другую сторону → сначала закрыть. Ревью 5.4.2: план ДОБОРА (src topup) к позиции
             # другой стороны (владелец перевернул руками, пока план ждал) — не вердикт переворота: снимается
             if self.plan and self.plan["side"] != pos["side"]:
-                if self.plan.get("src") == "topup":
+                if self.plan.get("src") == "topup" or self.plan.get("add_to"):
                     log.info("ИИ-пилот %s: план добора %s к позиции %s — не переворот, снят",
                              self.base, self.plan["side"], pos["side"])
                     self.plan = None
@@ -1606,7 +1825,7 @@ class AIPilot:
             # v5.4.1 «мысль о прибыли»: в плюсе ИИ у денег думает сам, не дожидаясь тейка (наследник);
             # не при пересечении троса/тейка, не пока идёт вопрос у троса/тейка, не при заявке/неурегулированном стопе
             if (not crossed and not take_hit and not pos.get("guard_busy") and not unsettled
-                    and not self.pending and self._market_alive()):
+                    and not self.pending and self._market_alive() and (self.feed or {}).get("ok", True)):
                 try:
                     self._profit_watch(price, pos)
                 except Exception as e:                   # noqa: BLE001
@@ -1617,7 +1836,8 @@ class AIPilot:
             # маржа) — берём, пока даёт, не больше PYTHIA_TOPUP_MAX раз
             if (self._sized_by_broker and not self.plan and int(pos.get("topup_left") or 0) > 0
                     and now - _f(pos.get("last_fill_ts")) >= TOPUP_GAP_SEC and self._tick_n % 6 == 0
-                    and self._market_alive() and not pos.get("guard_busy") and not crossed and not unsettled):
+                    and self._market_alive() and not pos.get("guard_busy") and not crossed and not unsettled
+                    and not pos.get("unverified") and not self._acct_unverified):
                 await self._topup(price, book)
                 if self.pending:
                     return
@@ -1626,8 +1846,18 @@ class AIPilot:
         #    это добор по приказу (сейчас / у уровня / на пробитии)
         if self.plan and self.state != "ПЕРЕАНАЛИЗ" and not self._reanalyzing and not unsettled \
                 and (not self.position or self.plan["side"] == self.position["side"]):
-            if time.time() < self.no_entry_until:
-                self.last_action = "бэкофф после отказов биржи — жду"
+            if not (self.feed or {}).get("ok", True):
+                # v5.4.4: нет доступа/связи (токен, права) — ни двери, ни заявки: ИИ не зовём, биржу не штурмуем
+                self.state = self._feed_state() if self.state != "СТОП" else self.state
+            elif self._acct_unverified or (self.position or {}).get("unverified"):
+                # v5.4.4: портфель при старте не прочитан — входа/добора нет до первой удачной сверки со счётом
+                self.last_action = (f"вход ждёт сверки со счётом (портфель не прочитан: "
+                                    f"{self._acct_unverified_why or 'брокер не ответил'}) — заявок нет до сверки")
+            elif time.time() < self.no_entry_until:
+                br = self.broker_refusal or {}
+                self.last_action = (f"бэкофф после отказа биржи ({br.get('text') or 'отказ без описания'}"
+                                    + (f", {br.get('count')} подряд" if int(br.get("count") or 0) > 1 else "")
+                                    + f") — повтор входа через {int(self.no_entry_until - time.time()) + 1} с")
             elif not self._market_alive():
                 self.state = "ЗАСАДА" if (self.plan.get("entry") is not None and not self.position) \
                     else self.state
@@ -1697,13 +1927,16 @@ class AIPilot:
             self._fire_reanalyze(self._reanalyze_pending)
 
         # 4. сверка с биржей: всегда (не только при позиции — иначе слепые
-        #    окна изоляции; находка веера) + свежие деньги/ГО
-        if self._tick_n % RECONCILE_EVERY == 0:
+        #    окна изоляции; находка веера) + свежие деньги/ГО. v5.4.4: счёт при старте не прочитан / связь вернулась —
+        #    сверка чаще (каждые 8 тиков, ≈12 с) до первой удачной
+        if (self._tick_n % RECONCILE_EVERY == 0 or self._reconcile_asap
+                or ((self._acct_unverified or (self.position or {}).get("unverified")) and self._tick_n % 8 == 0)):
+            self._reconcile_asap = False
             await self._reconcile(price)
 
         # 5. 30-минутная перепроверка — только на живом рынке и не во время
         #    переанализа (решение по замороженной цене — деньги на ветер)
-        if (time.time() >= self.review_ts and not self._review_busy
+        if (time.time() >= self.review_ts and not self._review_busy and (self.feed or {}).get("ok", True)
                 and self.state != "СТОП" and not self._reanalyzing and not unsettled):
             if not self._market_alive():
                 self.review_ts = time.time() + 600     # рынок мёртв — отложили
@@ -1802,6 +2035,8 @@ class AIPilot:
         result = await self.broker.place(self.figi, direction, order["lots"], price=price, tag=tag, **kwargs)
         if unpersisted:
             result["persist_note"] = "закрытие по ПАНИКЕ отправлено без сохранения состояния (state-файл не пишется)"
+        if result.get("ok"):
+            self._trade_ok()                  # v5.4.4: биржа приняла заявку — права есть, отказ по токену/правам снят
         if result.get("ok") or result.get("uncertain"):
             order["order_id"] = result.get("order_id") or request_id
             order["id_type"] = result.get("id_type") or ("request" if result.get("uncertain") else "exchange")
@@ -1855,14 +2090,21 @@ class AIPilot:
         lots = self.max_lots(price, side)
         topup = bool(self.position and self.position.get("side") == side)
         if lots <= 0:
+            # v5.4.4: биржа (GetMaxLots) не даёт ни лота — понятная причина в отказах (для панели и ситуации PRO),
+            # без бесконечных попыток: план снят, решает ИИ по лимитам счёта (account_limits)
+            zero = ""
+            if self._sized_by_broker:
+                zero = ("покупка недоступна: маржа исчерпана, GetMaxLots 0 лотов" if side == "long" else
+                        "продажа недоступна: GetMaxLots 0 лотов (маржа исчерпана или шорт по бумаге недоступен)")
+                self._refusal("topup" if topup else "entry", None, text=zero, code="GetMaxLots=0", kind="other")
             if topup:
                 self.plan = None
                 self.last_action = ("добор невозможен: биржа больше не даёт лотов — "
-                                    "позиция уже на максимуме")
+                                    "позиция уже на максимуме" + (f" ({zero})" if zero else ""))
                 log.info("ИИ-пилот %s: %s", self.base, self.last_action)
                 return
-            self.last_action = ("депозит не тянет ни лота — входа нет "
-                                "(честно, без пыли)")
+            self.last_action = (f"депозит не тянет ни лота: {zero} — входа нет" if zero else
+                                "депозит не тянет ни лота — входа нет (честно, без пыли)")
             self.plan = None
             self.state = "ЖДУ_ПЛАН"
             log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
@@ -1876,9 +2118,13 @@ class AIPilot:
         if not r.get("ok") and not r.get("uncertain"):
             self.pending = None
             self._save_state()
+            self._mx = None                    # биржа не приняла — пересчитать «сколько даёт»
+            kind, reason = self._refusal("topup" if topup else "entry", r)
+            if kind in ("auth", "rights"):
+                # токен/права: не лесенка попыток — «нет доступа» (feed), план ждёт, пока проверка брокера не скажет «можно»
+                return
             self._entry_fail += 1
             self.no_entry_until = time.time() + min(120.0, 2.0 * 2 ** self._entry_fail)
-            self._mx = None                    # биржа не приняла — пересчитать «сколько даёт»
             self.last_action = (f"{'добор' if topup else 'вход'} {'BUY' if side == 'long' else 'SELL'} {lots} лот "
                                 f"отбит: {r.get('error') or r.get('note')} — бэкофф, попытка {self._entry_fail}")
             if self._entry_fail >= ENTRY_FAIL_MAX:
@@ -1892,9 +2138,14 @@ class AIPilot:
         # заявки больше не приклеивает чужие тейк/стоп (находка веера)
         if not topup:
             self.state = "ВХОЖУ"
-        self.last_action = (f"{'добор: ' if topup else ''}бью агрессивной лимиткой: {side} {lots} лот @{px:g}"
-                            + (" (размер дала биржа)" if self._sized_by_broker else "")
-                            + (f" (перевзвод №{attempts})" if attempts else ""))
+        if r.get("ok"):
+            self.last_action = (f"{'добор: ' if topup else ''}бью агрессивной лимиткой: {side} {lots} лот @{px:g}"
+                                + (" (размер дала биржа)" if self._sized_by_broker else "")
+                                + (f" (перевзвод №{attempts})" if attempts else ""))
+        else:                                  # v5.4.4: ответ потерян — заявка могла уйти, а могла и нет: не «бью»
+            self.last_action = (f"{'добор' if topup else 'вход'}: заявка {side} {lots} лот @{px:g} отправлена, ответ "
+                                f"биржи потерян ({str(r.get('error') or r.get('note') or 'нет ответа')[:80]}) — выясняю "
+                                "её судьбу по UUID, повторно не шлю")
         log.info("ИИ-пилот %s: %s", self.base, self.last_action)
 
     async def _topup(self, price: float, book: dict | None) -> None:
@@ -1919,10 +2170,13 @@ class AIPilot:
             self._save_state()
             pos["topup_left"] = 0
             self._mx = None
-            self.last_action = f"добор {n} лот отбит: {r.get('error') or r.get('note')}"
+            kind, _reason = self._refusal("topup", r)
+            if kind not in ("auth", "rights"):
+                self.last_action = f"добор {n} лот отбит: {r.get('error') or r.get('note')}"
             log.info("ИИ-пилот %s: %s", self.base, self.last_action)
             return
-        self.last_action = f"добор до максимума: ещё {n} лот @{px:g} (биржа даёт)"
+        self.last_action = (f"добор до максимума: ещё {n} лот @{px:g} (биржа даёт)" if r.get("ok") else
+                            f"добор: заявка {n} лот @{px:g} отправлена, ответ биржи потерян — выясняю её судьбу по UUID")
         log.info("ИИ-пилот %s: %s", self.base, self.last_action)
 
     async def _order_part(self, po: dict) -> tuple[int, bool]:
@@ -1976,6 +2230,8 @@ class AIPilot:
         fresh_not_found = bool((st.get("not_found") or cancel.get("not_found")) and not vanished)
         if not full2 and not terminal and (not cancel.get("ok") or not st.get("ok") or fresh_not_found):
             self._cancel_entry = True
+            if not st.get("ok") or not cancel.get("ok"):
+                self._poll_backoff(po, st if not st.get("ok") else cancel)   # v5.4.4: опрос с паузой, не 3 запроса в тик
             self.last_action = (f"биржа не находит заявку по UUID — жду: снимаю из учёта, только если «не найдена» держится "
                                 f"{int(ORDER_REQUEST_MAX_AGE_SEC)} с подряд у запроса старше того же срока (репликация у брокера?)"
                                 if fresh_not_found
@@ -1992,8 +2248,31 @@ class AIPilot:
             if self.pending:
                 await self._pending_tick_once(price, book)
 
+    def _poll_backoff(self, order: dict, st: dict | None) -> None:
+        """v5.4.4: ответ по заявке потерян / брокер не отвечает — следующий опрос через 2→4→…→30 с (а не каждый тик
+        по три запроса); отказ по токену/правам — сразу «нет доступа» (feed)."""
+        k = order["poll_fails"] = int(order.get("poll_fails") or 0) + 1
+        # первый повтор — следующим тиком (разовый сбой), дальше пауза 2→4→8→…→30 с
+        order["poll_at"] = time.time() + (0.0 if k == 1 else min(POLL_RETRY_MAX_SEC, 2.0 * 2 ** (k - 2)))
+        err = str((st or {}).get("error") or (st or {}).get("note") or "брокер не ответил")
+        if (st or {}).get("err_kind") in ("auth", "rights", "cert", "network"):
+            err = _classify({"status": (st or {}).get("err_status"), "code": (st or {}).get("err_code"), "text": err})[1]
+        order["poll_err"] = err if len(err) <= 140 else err[:139] + "…"
+        if (st or {}).get("err_kind") in ("auth", "rights"):
+            self._refusal("close" if order.get("kind") in ("close", "reduce") else "entry", st)
+
+    @staticmethod
+    def _poll_ok(order: dict) -> None:
+        for k in ("poll_fails", "poll_at", "poll_err"):
+            order.pop(k, None)
+
     async def _pending_tick_once(self, price: float, book: dict | None) -> None:
         po = self.pending
+        wait = _f(po.get("poll_at")) - time.time()
+        if wait > 0:                           # v5.4.4: судьба заявки неизвестна — опрос с паузой
+            self.last_action = (f"судьба заявки входа неизвестна ({po.get('poll_err') or 'брокер не ответил'}) — "
+                                f"следующий опрос через {int(wait) + 1} с, повторно не шлю")
+            return
         # новый план/паника потребовали снять заявку — частичку в работу
         if self._cancel_entry:
             part, po2 = await self._cancel_pending_once()
@@ -2008,6 +2287,19 @@ class AIPilot:
             self.pending = None
             await self._absorb_fill(po["lots"], po)
             return
+        if not st.get("ok"):
+            seen = int(po.get("seen_exec_lots") or 0)
+            if seen >= int(po["lots"]):        # исполнение уже подтверждено ответом на заявку — не теряем его
+                self.pending = None
+                await self._absorb_fill(seen, po)
+                return
+            # v5.4.4: брокер не ответил о заявке — не штурмуем (опрос/отмена/опрос каждый тик): пауза 2→…→30 с
+            self._poll_backoff(po, st)
+            self._save_state()
+            self.last_action = (f"судьба заявки входа неизвестна ({po.get('poll_err')}) — следующий опрос через "
+                                f"{int(_f(po.get('poll_at')) - time.time()) + 1} с, повторно не шлю")
+            return
+        self._poll_ok(po)
         vanished = self._request_vanished(po, st)            # фантом: до биржи не дошла — как отказ, без исполнений;
         if vanished:                                         # свежий «не найдена» — ещё неизвестность (репликация), ждём
             log.error("ИИ-пилот %s: заявка %s не найдена биржей дольше %d с — считаю не дошедшей (сверь по UUID)",
@@ -2033,6 +2325,10 @@ class AIPilot:
                 await self._absorb_fill(part, po)
                 return
             self._save_state()
+            self._refusal("topup" if po.get("topup") else "entry",
+                          {"error": (f"заявка не дошла до биржи (по UUID не найдена {int(ORDER_REQUEST_MAX_AGE_SEC)} с)"
+                                     if vanished else f"биржа завершила заявку без исполнения ({s})"),
+                           "err_kind": "other", "err_code": "NOT_FOUND" if vanished else (s.rsplit("_", 1)[-1] or s)})
             # отказ биржи: бэкофф и счётчик (штурм каждые 1.5с убит)
             self._entry_fail += 1
             self.no_entry_until = time.time() + min(120.0, 2.0 * 2 ** self._entry_fail)
@@ -2056,6 +2352,10 @@ class AIPilot:
             if part > 0:                       # частичку берём в работу
                 await self._absorb_fill(part, po)
                 return
+            if self._urgent_only:              # v5.4.4: без свежей цены не перевзводим — вход снят, ждём связь
+                self.state = "ЗАСАДА" if (self.plan or {}).get("entry") is not None else self.state
+                self.last_action = "заявка входа снята по сроку, перевзвода нет — связи с брокером нет (нет свежей цены)"
+                return
             att = po["attempts"] + 1
             if att <= MAX_REPRICINGS:
                 await self._enter(price, book, attempts=att)
@@ -2078,11 +2378,15 @@ class AIPilot:
                     r = await self._post_owned_order(
                         self.pending, BUY if po["side"] == "long" else SELL, cross, "aip-cross")
                     if r.get("ok") or r.get("uncertain"):
-                        self.last_action = (f"эскалация: лимит по best "
-                                            f"{cross:g} — точно заходим")
+                        self.last_action = (f"эскалация: лимит по best {cross:g} — точно заходим" if r.get("ok") else
+                                            f"эскалация: лимит по best {cross:g} отправлен, ответ биржи потерян — выясняю "
+                                            "судьбу по UUID")
                         return
                     self.pending = None
                     self._save_state()
+                    kind, _reason = self._refusal("topup" if po.get("topup") else "entry", r)
+                    if kind in ("auth", "rights"):
+                        return
             self.state = "ЗАСАДА" if (self.plan or {}).get("entry") is not None \
                 else "ЖДУ_ПЛАН"
             self.last_action = ("ликвидности нет даже по best — отступил, "
@@ -2116,6 +2420,8 @@ class AIPilot:
         if self.plan and self.plan["side"] == side:
             self.plan = None
         self._entry_fail = 0
+        self.broker_refusal = None             # v5.4.4: исполнение — отказы в прошлом
+        self._trade_ok()
         if not self.position:
             return
         pos = self.position
@@ -2458,6 +2764,7 @@ class AIPilot:
                     backoff=STOP_RETRY_SEC)
             if not rs.get("uncertain"):
                 pos.pop("stop_request", None)
+                self._refusal("stop", rs)      # v5.4.4: отказ стопа — в отказы биржи (токен/права — «нет доступа»)
             pos["stop_err"] = str(rs.get("error") or rs.get("note") or "биржа отбила")[:100]
             pos["restop"] = True
             pos["restop_after"] = time.time() + STOP_RETRY_SEC
@@ -2540,11 +2847,25 @@ class AIPilot:
         if not pos:
             return True
         if pos.get("closing"):
+            if pos.get("closing") == "reduce":
+                # v5.4.4 (D7): флаг держит УЖАТИЕ (маржевой дозор), а не закрытие — решение «закрыть» не теряется: встаёт
+                # в очередь приказа CLOSE, ближайший тик после ужатия закроет остаток
+                self._close_pending = self._close_pending or why
+                self.last_action = f"идёт ужатие позиции — закрытие ({why}) в очереди, исполню следующим тиком"
+                self._save_state()
+                return False
             # закрытие уже идёт в другой задаче (FLASH у троса / перепроверка), а петля тикнула
             # за трос: второй рыночный ордер = голый разворот (проверяющий v5.2)
             self.last_action = f"закрытие уже идёт — второй ордер не шлю ({why})"
             return False
-        pos["closing"] = True
+        if not pos.get("exit_order") and time.time() < _f(pos.get("close_retry_at")):
+            # v5.4.4: биржа только что отбила закрытие — повтор после паузы (решение не теряется: close_fail помнит его)
+            if not pos.get("close_fail"):
+                pos["close_fail"], pos["close_reanalyze"] = why, reanalyze
+            self.last_action = (f"закрытие отбито биржей ({(self.broker_refusal or {}).get('text') or 'отказ'}) — "
+                                "повторю после паузы, решение не потеряно")
+            return False
+        pos["closing"] = "close"
         try:
             return await self._close_all_once(pos, price, why, reanalyze)
         finally:
@@ -2583,6 +2904,8 @@ class AIPilot:
                     if verdict != "proceed":
                         return verdict == "closed"
             else:
+                if rc.get("err_kind") in ("auth", "rights"):
+                    self._refusal("stop", rc)       # v5.4.4: трос не снять из-за токена/прав — «нет доступа»
                 real = await self._real_own_lots(pos)
                 if real == 0 and not pos.get("stop_request"):
                     pnl = self._realize(pos, pos["lots"], self._stop_price(pos) or est_px, why, risk=False)
@@ -2634,9 +2957,19 @@ class AIPilot:
                                               None, "aip-close")
         if not result.get("ok") and not result.get("uncertain"):
             pos.pop("exit_order", None)
-            self.last_action = f"закрытие отбито биржей ({result.get('error') or result.get('note')}) — повторю тиком"
+            # v5.4.4: не «повторю тиком» (штурм каждые 1.5 с): пауза 2→4→8→…→60 с, ПАНИКА — не чаще PANIC_RETRY_SEC;
+            # токен/права — сразу «нет доступа» (feed), повтор — когда проверка брокера скажет «можно»
+            kind, reason = self._refusal("close", result)
+            n = pos["close_refusals"] = int(pos.get("close_refusals") or 0) + 1
+            wait = PANIC_RETRY_SEC if self.panic_flag else min(CLOSE_RETRY_MAX_SEC, 2.0 * 2 ** (n - 1))
+            pos["close_retry_at"] = time.time() + wait
+            if kind not in ("auth", "rights"):
+                self.last_action = (f"закрытие отбито биржей ({result.get('error') or result.get('note')}) — повторяю "
+                                    "с паузой, не каждый тик")
             self._save_state()
             return False
+        pos.pop("close_refusals", None)
+        pos.pop("close_retry_at", None)
         terminal = await self._poll_exit_order(pos, est_px)
         if pos["lots"] == 0 and terminal:
             self._finish_closed(pos, why, reanalyze)
@@ -2647,6 +2980,10 @@ class AIPilot:
         """Apply only the new cumulative fills; NEW/unknown retains order ownership."""
         order = pos["exit_order"]
         state = await self._owned_order_state(order)
+        if state.get("ok"):
+            self._poll_ok(order)
+        else:
+            self._poll_backoff(order, state)   # v5.4.4: ответ потерян — следующий опрос с паузой (до 30 с)
         vanished = self._request_vanished(order, state)
         if vanished:
             log.error("ИИ-пилот %s: заявка выхода %s не найдена биржей дольше %d с — до биржи не дошла; остаток сверю "
@@ -2658,6 +2995,7 @@ class AIPilot:
         order["seen_exec_lots"] = cumulative
         delta = min(int(pos["lots"]), max(0, cumulative - int(order.get("accounted") or 0)))
         if delta:
+            self.broker_refusal = None         # v5.4.4: исполнение — отказы в прошлом
             # v5.4.2: кусок исполнения — в журнал сразу, в killswitch итогом круга/ужатия (_risk_round), не куском
             pnl = self._realize(pos, delta, price, order.get("why") or "исполнение выхода", risk=False)
             pos["exit_pnl_total"] = _f(pos.get("exit_pnl_total")) + pnl
@@ -2678,8 +3016,9 @@ class AIPilot:
         return terminal
 
     def _drop_topup_plan(self) -> None:
-        """Ревью 5.4.2: позиция закрыта — план ДОБОРА к ней (src topup от наследника) не вход: снимается."""
-        if self.plan and self.plan.get("src") == "topup":
+        """Ревью 5.4.2: позиция закрыта — план ДОБОРА к ней (src topup от наследника; v5.4.4 — add_to от приказа совета
+        «добрать у уровня») не вход: снимается."""
+        if self.plan and (self.plan.get("src") == "topup" or self.plan.get("add_to")):
             log.info("ИИ-пилот %s: позиция закрыта — план добора снят", self.base)
             self.plan = None
 
@@ -2703,7 +3042,7 @@ class AIPilot:
         остаток. P/L срезанной части — в killswitch."""
         if pos.get("closing") or self.position is not pos:
             return
-        pos["closing"] = True
+        pos["closing"] = "reduce"              # v5.4.4: флаг ужатия — «закрыть» в это время встаёт в очередь, а не теряется
         try:
             order = pos.get("exit_order")
             if order and order.get("kind") != "reduce":
@@ -2724,9 +3063,16 @@ class AIPilot:
                 if not result.get("ok") and not result.get("uncertain"):
                     pos.pop("exit_order", None)
                     pos["restop"] = True
-                    self.last_action = f"ужатие отбито биржей — повторю тиком ({why})"
+                    kind, _reason = self._refusal("close", result)
+                    n = pos["reduce_refusals"] = int(pos.get("reduce_refusals") or 0) + 1
+                    pos["reduce_retry_at"] = time.time() + min(CLOSE_RETRY_MAX_SEC, 2.0 * 2 ** (n - 1))
+                    if kind not in ("auth", "rights"):
+                        self.last_action = (f"ужатие отбито биржей ({result.get('error') or result.get('note')}) — "
+                                            f"повторю с паузой ({why})")
                     self._save_state()
                     return
+                pos.pop("reduce_refusals", None)
+                pos.pop("reduce_retry_at", None)
             order = pos.get("exit_order")
             terminal = await self._poll_exit_order(pos, price)
             if terminal:
@@ -2745,7 +3091,11 @@ class AIPilot:
         if self.pending or any((self.position or {}).get(key) for key in ("exit_order", "stop_request")):
             return  # broker order status owns these deltas; portfolio snapshots may lag
         pf = await self.broker.portfolio()
-        if pf.get("mode") == "dry" or pf.get("error"):
+        if pf.get("mode") == "dry":
+            if self._acct_unverified or (self.position or {}).get("unverified"):
+                self._verify_account(None, 0.0, price)   # сухой прогон: счёта у биржи нет — учёт и есть счёт
+            return
+        if pf.get("error"):
             return
         cash = pf.get("cash")
         if cash is not None:
@@ -2773,6 +3123,8 @@ class AIPilot:
                         else int(qty / max(1.0, self.point_value)))
                 avg = _f(p_.get("avg"))
                 break
+        if (self._acct_unverified or (self.position or {}).get("unverified")) and self._verify_account(real, avg, price):
+            return                             # v5.4.4: первая удачная сверка после старта «вслепую» всё решила
         own = 0
         if self.position:
             own = (self.position["lots"] if self.position["side"] == "long"
@@ -2837,6 +3189,50 @@ class AIPilot:
             self._save_state()
             self.last_action = (f"сверка: моих лотов теперь {abs(new_own)} "
                                 f"(срез {cut}, P/L ≈{pnl:+.0f})")
+
+    def _verify_account(self, real: int | None, avg: float, price: float) -> bool:
+        """v5.4.4: первое удачное чтение портфеля после старта «вслепую» (prepare не прочитал портфель). Позиция из
+        state-файла (unverified) сверяется со счётом: подтверждена / на счёте другой объём (ведём по счёту, P/L не
+        выдумываем) / на счёте пусто (закрыта вне программы, P/L неизвестен — в журнал и killswitch не пишем) / другая
+        сторона (старую снимаем, новую принимаем как «весь счёт»). real None — сухой прогон: учёт и есть счёт.
+        True — сверка всё решила; False — дальше обычная сверка (весь счёт / изоляция)."""
+        self._acct_unverified = False
+        self._acct_unverified_why = ""
+        pos = self.position
+        if not pos or not pos.get("unverified"):
+            return False
+        for key in ("unverified", "exit_check", "exit_check_strict"):
+            pos.pop(key, None)
+        if real is None:
+            self.last_action = "сверка: сухой прогон — позиция из state-файла принята по учёту"
+            return True
+        own = pos["lots"] if pos["side"] == "long" else -pos["lots"]
+        real_own = real - self.foreign_lots if not self.adopt_account else real
+        if real_own == own:
+            self.last_action = f"сверка со счётом: позиция {pos['side']} {pos['lots']} лот из state-файла подтверждена"
+        elif real_own == 0:
+            self.position = None
+            self._drop_topup_plan()
+            self._mx = None
+            if not self.plan and not self.pending:
+                self.state = "ЖДУ_ПЛАН"
+            self.last_action = (f"сверка со счётом: позиции {pos['side']} {pos['lots']} лот из state-файла на счёте нет — "
+                                "закрыта вне программы, пока пилот не видел счёт (P/L неизвестен, в журнал не пишу)")
+        elif (real_own > 0) == (own > 0):
+            pos["lots"] = abs(real_own)
+            if _f(avg) > 0 and self.adopt_account:
+                pos["entry"] = _f(avg)
+            pos["restop"] = True
+            self.last_action = (f"сверка со счётом: на счёте {abs(real_own)} лот {pos['side']} вместо {abs(own)} из "
+                                "state-файла — веду по счёту")
+        else:
+            self.position = None               # на счёте другая сторона: старую (из файла) снимаем без выдуманного P/L
+            self._drop_topup_plan()
+            self._absorb_account(real_own, avg, price, "сверка со счётом после старта")
+            self.last_action = f"сверка со счётом: {self.last_action}"
+        self._save_state()
+        log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
+        return True
 
     # ── 30-минутная перепроверка ────────────────────────────────────────────
     async def _gather_news(self) -> str:
@@ -3295,6 +3691,410 @@ class AIPilot:
         except Exception as e:                               # noqa: BLE001
             log.warning("ИИ-пилот %s: передача Совету не удалась: %s", self.base, str(e)[:120])
 
+    # ══ v5.4.4 «СВЯЗЬ С БРОКЕРОМ»: feed, отказы биржи, срочное без цены, killswitch одной записью ══════════════
+    # Жалоба владельца 30.09.2026: токен отозван — цены нет, петля молча не тикала (ни CLOSE, ни входа), а панель мигала
+    # «Вхожу/В позиции»; отказы биржи штурмовались каждый тик, причина терялась. Теперь петля знает, есть ли у неё цена
+    # и доступ (self.feed), честно говорит об этом (state НЕТ_СВЯЗИ / НЕТ_ДОСТУПА, last_action один раз при переходе,
+    # хук _on_feed_change для миссии), пока связи нет — не решает и не зовёт ИИ, раз в FEED_PROBE_SEC спрашивает брокера
+    # (GetAccounts) и сама возвращается, когда связь есть.
+    @property
+    def last_tick_ts(self) -> float | None:
+        """Время последнего tick() (None — ещё не тикал)."""
+        return self._last_tick_ts or None
+
+    @last_tick_ts.setter
+    def last_tick_ts(self, value) -> None:
+        self._last_tick_ts = _f(value)
+
+    def broker_ok(self) -> bool:
+        """Брокер доступен пилоту: связь есть, или рынок закрыт, а брокер достижим (цены нет — ночь)."""
+        f = self.feed or {}
+        if f.get("ok"):
+            return True
+        return self._market_closed() and f.get("kind") in ("closed", "no_price")
+
+    def ticking(self, now: float | None = None) -> bool:
+        """Пилот реально работает (панель мигает только тогда): петля жива, связь есть и последний тик свежий —
+        не старше PYTHIA_TICK_STALE_SEC (закрытый рынок — 3 × PYTHIA_CLOSED_TICK_SEC)."""
+        now = now or time.time()
+        if not self.loop_alive or not self._last_tick_ts or not (self.feed or {}).get("ok", True):
+            return False
+        stale = tick_stale_sec()
+        if self._market_closed():
+            try:
+                stale = max(stale, 3.0 * float(_setting("PYTHIA_CLOSED_TICK_SEC", 30)))
+            except (TypeError, ValueError):
+                stale = max(stale, 90.0)
+        return now - self._last_tick_ts <= stale
+
+    def _on_feed_change(self, ok: bool, info: dict) -> None:
+        """Хук: связь с брокером пропала (ok False) или вернулась (ok True); info — feed + was (прежний вид), down_s
+        (сколько не было), reason_was. База — ничего; MissionPilot: толмач, шина, повод перепроверки при восстановлении."""
+        return None
+
+    def _on_killswitch(self, info: dict) -> None:
+        """Хук: killswitch сработал (один раз на блокировку); info — {reason, position, pnl, ts}. База — ничего."""
+        return None
+
+    def _feed_state(self) -> str:
+        return "НЕТ_ДОСТУПА" if (self.feed or {}).get("kind") in ("auth", "rights") else "НЕТ_СВЯЗИ"
+
+    @staticmethod
+    def _feed_fix(kind: str | None) -> str:
+        return {"auth": "обнови токен в «Ключах»", "rights": "обнови токен в «Ключах»",
+                "cert": "почини доверие TLS (CA Минцифры)", "network": "проверь интернет",
+                "no_price": "проверь бумагу у брокера"}.get(str(kind or ""), "проверь брокера")
+
+    def _unprotected_note(self, kind: str | None) -> str:
+        """Связи нет, а позиция есть: прямо — без защиты (стопов на бирже нет) и что делать; нет позиции — ''."""
+        pos = self.position
+        if not pos:
+            return ""
+        fix = self._feed_fix(kind)
+        if pos.get("stop_id") and self._exchange_stop_on():
+            return (f"позиция {pos['side']} {pos['lots']} лот: программа её не ведёт, на бирже лежит трос "
+                    f"@{self._stop_price(pos):g} — закрой в приложении брокера или {fix}")
+        return (f"позиция {pos['side']} {pos['lots']} лот без защиты (стопов на бирже нет, программа без связи "
+                f"не ведёт) — закрой в приложении брокера или {fix}")
+
+    def _feed_text(self) -> str:
+        """last_action при потере связи: причина и что с позицией (стопов на бирже нет — позиция без защиты)."""
+        f = self.feed or {}
+        kind = f.get("kind")
+        head = (("НЕТ ДОСТУПА к брокеру: " if kind in ("auth", "rights") else "НЕТ СВЯЗИ с брокером: ")
+                + str(f.get("cause") or f.get("reason") or ""))
+        fix = self._feed_fix(kind)
+        pos = self.position
+        if pos:
+            tail = " · " + self._unprotected_note(kind)
+        elif self.pending:
+            tail = f" · заявка входа в полёте — её судьбу выясню, как только связь вернётся; {fix}"
+        elif self.plan:
+            tail = f" · приказ ждёт: входов, заявок и вопросов ИИ нет, пока нет связи; {fix}"
+        else:
+            tail = f" · решений, заявок и вопросов ИИ нет, пока нет связи; {fix}"
+        return head + tail
+
+    def _feed_recompute(self, now: float | None = None) -> None:
+        """Связь = цена (с запасом PYTHIA_FEED_GRACE_SEC при открытом рынке) и нет отказа по токену/правам на заявке.
+        Переход ок → нет: last_action один раз с причиной, state НЕТ_СВЯЗИ/НЕТ_ДОСТУПА, хук; нет → ок: state по факту,
+        сверка со счётом первым тиком, хук. Без I/O."""
+        now = now or time.time()
+        closed = self._market_closed()
+        tr, pf = self._trade_refusal, self._px_fail
+        if tr:
+            new = {"ok": False, "kind": tr["kind"], "cause": tr["reason"], "since": tr["since"]}
+        elif pf and not (closed and pf.get("kind") == "no_price") and (
+                now - _f(pf.get("since")) >= feed_grace_sec()
+                or (pf.get("probed") and pf.get("kind") in ("auth", "rights", "cert"))):
+            # запас PYTHIA_FEED_GRACE_SEC — на разовые сбои; токен/права/TLS, подтверждённые проверкой брокера, — сразу
+            new = {"ok": False, "kind": pf["kind"], "cause": pf["reason"], "since": pf["since"]}
+        else:
+            new = {"ok": True, "kind": "closed" if closed else "ok",
+                   "reason": "рынок закрыт — брокер на связи" if closed else "", "since": None}
+        if not new["ok"]:                      # причина + прямо про позицию: без защиты и что делать (панель, Telegram)
+            note = self._unprotected_note(new["kind"])
+            new["reason"] = new["cause"] + (f" · {note}" if note else "")
+        prev = self.feed or {}
+        new["checked_ts"] = prev.get("checked_ts")
+        self.feed = new
+        if prev.get("ok", True) and not new["ok"]:
+            fn = getattr(tinkoff, "token_epoch", None)
+            try:
+                self._feed_epoch = fn() if callable(fn) else None
+            except Exception:                                # noqa: BLE001
+                self._feed_epoch = None
+            self._feed_probe_ts = now if self._trade_refusal else self._feed_probe_ts
+            if self.state != "СТОП":
+                self.state = self._feed_state()
+            self.last_action = self._feed_text()
+            log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
+            self._feed_hook(False, dict(new, was=prev.get("kind"), down_s=0.0, reason_was=prev.get("reason")))
+        elif not prev.get("ok", True) and new["ok"]:
+            down = max(0.0, now - _f(prev.get("since"), now))
+            if self.state in ("НЕТ_СВЯЗИ", "НЕТ_ДОСТУПА"):
+                self.state = "РЫНОК_ЗАКРЫТ" if closed else self._resting_state()
+            self._reconcile_asap = True
+            self.last_action = (f"связь с брокером восстановлена (не было {int(down // 60)} мин {int(down % 60)} с: "
+                                f"{prev.get('cause') or prev.get('reason')}) — сверка со счётом, пилот снова ведёт")
+            log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
+            self._feed_hook(True, dict(new, was=prev.get("kind"), down_s=round(down, 1),
+                                       reason_was=prev.get("cause") or prev.get("reason")))
+        elif not new["ok"]:
+            if self.state != "СТОП":
+                self.state = self._feed_state()
+            if prev.get("kind") != new["kind"]:     # вид сменился (проверка уточнила причину) — одна новая запись
+                self.last_action = self._feed_text()
+                log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
+
+    def _feed_hook(self, ok: bool, info: dict) -> None:
+        try:
+            self._on_feed_change(ok, info)
+        except Exception as e:                               # noqa: BLE001
+            log.warning("ИИ-пилот %s: хук связи споткнулся: %s", self.base, str(e)[:120])
+
+    def _price_bad(self, now: float, err) -> None:
+        """Цены нет: запомнить с какого момента и почему (токен, права, TLS, сеть или просто нет цены)."""
+        if isinstance(err, dict) and err.get("kind") == "no_price":
+            kind, reason = "no_price", str(err.get("reason") or "")
+        elif err:
+            kind, reason = _classify(err)
+            if kind == "other":
+                kind, reason = "no_price", f"Т-Банк не отдаёт цену {self.base}: {reason}"
+        else:
+            kind, reason = "no_price", ""
+        if kind == "no_price" and not reason:
+            reason = f"Т-Банк не отдаёт цену {self.base} (ошибки нет) — торги по бумаге могли приостановить"
+        pf = self._px_fail
+        if pf is None:
+            self._px_fail = {"kind": kind, "reason": reason, "since": now,
+                             "code": (err or {}).get("code") if isinstance(err, dict) else None}
+        elif not (pf.get("probed") and kind == "no_price"):   # уточнение проверкой брокера пустой ценой не затираем
+            pf.update(kind=kind, reason=reason)
+
+    async def _read_price(self) -> tuple[float, dict | None]:
+        """Цена брокера и, если её нет, почему (tinkoff.price_error по инструменту; без неё — свежая last_error)."""
+        t0 = time.time()
+        err = None
+        try:
+            lp = await tinkoff.last_price(self.figi)
+        except Exception as e:                               # noqa: BLE001
+            lp, err = None, e
+        px = _f((lp or {}).get("price"))
+        if px > 0:
+            return px, None
+        if err is None:
+            fn = getattr(tinkoff, "price_error", None)
+            try:
+                err = fn(self.figi) if callable(fn) else None
+            except Exception:                                # noqa: BLE001
+                err = None
+        if err is None:
+            fn = getattr(tinkoff, "last_error", None)
+            try:
+                le = fn() if callable(fn) else None
+            except Exception:                                # noqa: BLE001
+                le = None
+            if isinstance(le, dict) and _f(le.get("ts")) >= t0 - 1.0:
+                err = le
+        return 0.0, err
+
+    async def _feed_probe(self, now: float) -> None:
+        """Связи нет — раз в FEED_PROBE_SEC (новый токен в «Ключах» — сразу) спросить брокера (tinkoff.check_access:
+        GetAccounts + уровень доступа): уточнить причину и снять отказ по токену/правам, когда брокер скажет «можно»."""
+        fn_ep = getattr(tinkoff, "token_epoch", None)
+        try:
+            epoch = fn_ep() if callable(fn_ep) else None
+        except Exception:                                    # noqa: BLE001
+            epoch = None
+        fresh_token = epoch is not None and self._feed_epoch is not None and epoch != self._feed_epoch
+        if not fresh_token and now - self._feed_probe_ts < FEED_PROBE_SEC:
+            return
+        self._feed_probe_ts = now
+        if fresh_token:
+            self._feed_epoch = epoch
+            if self._trade_refusal:            # новый токен — прошлый отказ по правам не повод ждать паузу
+                self._trade_refusal["hold_until"] = 0.0
+        fn = getattr(tinkoff, "check_access", None)
+        if not callable(fn):
+            return
+        try:
+            r = await asyncio.wait_for(fn(), 20.0)
+        except Exception as e:                               # noqa: BLE001
+            kind, reason = _classify(e)
+            r = {"ok": False, "trade": False, "kind": kind if kind != "other" else "network", "reason": reason}
+        if not isinstance(r, dict):
+            return
+        self.feed["checked_ts"] = now
+        tr, pf = self._trade_refusal, self._px_fail
+        if tr:
+            if tr["kind"] == "auth" and r.get("ok"):
+                self._trade_refusal = None     # токен снова принят
+            elif (tr["kind"] == "rights" and r.get("ok") and r.get("trade") is not False
+                  and now >= _f(tr.get("hold_until"))):
+                self._trade_refusal = None     # полный доступ — пробуем снова (отказ повторится — пауза длиннее)
+            elif r.get("kind") in ("auth", "rights") and r.get("reason"):
+                tr["kind"], tr["reason"] = r["kind"], str(r["reason"])
+        if pf and not r.get("ok") and r.get("kind") in ("auth", "rights", "cert", "network") and r.get("reason"):
+            pf.update(kind=r["kind"], reason=str(r["reason"]), probed=True)
+
+    def _urgent(self) -> bool:
+        """Срочное, что обязано исполняться и без свежей цены: ПАНИКА, заявка в полёте, выход/стоп в полёте, killswitch,
+        приказ CLOSE и недобитое закрытие (рыночной заявке цена не нужна)."""
+        pos = self.position or {}
+        return bool(self.panic_flag or self.pending or pos.get("exit_order") or pos.get("stop_request")
+                    or (self.session_risk and self.session_risk.locked)
+                    or (self.position and (self._close_pending or pos.get("close_fail"))))
+
+    async def _urgent_tick(self, px: float = 0.0) -> None:
+        """Срочный тик без свежей цены: механика базового пилота (без наблюдателей наследника — ни резкого хода, ни
+        прокола по старой цене), только тормоза/выход/заявка; цена — последняя известная (оценка P/L)."""
+        price = px if px > 0 else (self.prices[-1] if self.prices else
+                                   _f((self.position or {}).get("entry")) or _f((self.pending or {}).get("price")))
+        if price <= 0:
+            return
+        self._urgent_only = True
+        try:
+            await AIPilot.tick(self, price, None)
+        finally:
+            self._urgent_only = False
+
+    async def _urgent_rest(self, price: float, book: dict | None) -> None:
+        """Остаток срочного тика (после тормозов и выхода в полёте): заявка входа — только выяснить судьбу / снять;
+        приказ CLOSE и недобитое закрытие — исполнить (с паузой после отказов)."""
+        if self.pending:
+            await self._pending_tick(price, book)
+            return
+        pos = self.position
+        if not pos or self._close_paused(pos):
+            return
+        if self._close_pending:
+            why, self._close_pending = self._close_pending, None
+            self.plan = None
+            await self._close_all(price, why, reanalyze=False)
+        elif pos.get("close_fail"):
+            await self._close_all(price, pos["close_fail"], reanalyze=pos.get("close_reanalyze", True))
+
+    def _close_paused(self, pos: dict | None) -> bool:
+        """Биржа отбила закрытие — пауза до close_retry_at: тик не шлёт заявку каждые 1.5 с, причина видна."""
+        if not pos or pos.get("exit_order"):
+            return False
+        at = _f(pos.get("close_retry_at"))
+        now = time.time()
+        if at <= now:
+            return False
+        br = self.broker_refusal or {}
+        self.last_action = (f"закрытие отбито биржей ({br.get('text') or 'отказ без описания'}) — повтор через "
+                            f"{int(at - now) + 1} с (попытка {int(pos.get('close_refusals') or 1)}); позиция {pos['side']} "
+                            f"{pos['lots']} лот в учёте, решение закрыть не потеряно")
+        return True
+
+    def _refusal(self, what: str, r: dict | None, *, text: str | None = None, code: str | None = None,
+                 kind: str | None = None) -> tuple[str, str]:
+        """Отказ биржи/брокера → self.broker_refusal {what entry|close|topup|stop, code, text по-русски, count подряд, ts,
+        kind}; отказ по токену/правам (401/403/40002/40003) — сразу «нет доступа» (feed), без лесенки попыток.
+        Возврат (вид, причина)."""
+        r = r or {}
+        raw = str(text or r.get("error") or r.get("note") or "отказ без описания")
+        k = kind or r.get("err_kind")
+        if k in ("auth", "rights", "cert", "network", "other"):
+            reason = _classify({"status": r.get("err_status"), "code": r.get("err_code"), "text": raw})[1] \
+                if k in ("auth", "rights") else raw
+        else:
+            k, reason = _classify(raw)
+        c = str(code or r.get("err_code") or "").strip()
+        if not c:                              # код Т-Банка из текста (результат брокера без полей err_*)
+            import re as _re
+            mc = _re.search(r"\b(400\d\d|300\d\d|800\d\d|700\d\d)\b", raw)
+            c = mc.group(1) if mc else ""
+        hints = getattr(tinkoff, "_ERR_HINTS", None) or getattr(_TK, "_ERR_HINTS", {}) or {}
+        human = (reason if k in ("auth", "rights") else
+                 f"{hints[c]} ({c})" if c in hints else raw)
+        prev = self.broker_refusal or {}
+        n = int(prev.get("count") or 0) + 1 if prev.get("what") == what else 1
+        self.broker_refusal = {"what": what, "code": c or k, "text": human[:240], "count": n, "ts": time.time(),
+                               "kind": k}
+        log.warning("ИИ-пилот %s: отказ (%s, %s): %s", self.base, what, c or k, human[:160])
+        if k in ("auth", "rights"):
+            self._trade_refused(k, reason, what, c)
+        return k, reason
+
+    def _trade_refused(self, kind: str, reason: str, what: str, code: str = "") -> None:
+        """Заявку отбили по токену/правам: «нет доступа» сразу (feed), пока проверка брокера не скажет «можно»; повторный
+        отказ по правам — пауза до снятия длиннее (30→60→…→600 с): не штурмуем брокера и не зовём ИИ."""
+        now = time.time()
+        if kind == "rights":
+            self._rights_n += 1
+        hold = min(RIGHTS_HOLD_MAX_SEC, FEED_PROBE_SEC * 2 ** max(0, self._rights_n - 1))
+        tr = self._trade_refusal
+        if tr is None:
+            self._trade_refusal = {"kind": kind, "reason": reason, "since": now, "what": what, "code": code or None,
+                                   "hold_until": now + hold}
+        else:
+            tr.update(kind=kind, reason=reason, what=what, code=code or tr.get("code"),
+                      hold_until=max(_f(tr.get("hold_until")), now + hold))
+        self._feed_probe_ts = now              # причину знаем из первых рук — следующая проверка через FEED_PROBE_SEC
+        self._feed_recompute(now)
+
+    def _trade_ok(self) -> None:
+        """Брокер принял заявку / исполнение: права есть — отказ по токену/правам снят, пауза отказов сброшена."""
+        self._rights_n = 0
+        if self._trade_refusal:
+            self._trade_refusal = None
+            self._feed_recompute(time.time())
+
+    def _announce_killswitch(self) -> None:
+        """Killswitch сработал: одна запись в last_action с причиной и событие (хук _on_killswitch) — владелец видит,
+        почему приказы не принимаются до нового торгового дня (МСК)."""
+        self._ks_seen = True
+        reason = self.killswitch_reason() or "дневной лимит убытка"
+        pos = self.position
+        ks = (f"KILLSWITCH: {reason} — торговля остановлена до нового торгового дня (МСК), приказы не "
+              "принимаются" + (f"; позицию {pos['side']} {pos['lots']} лот закрываю" if pos else ""))
+        prev = str(self.last_action or "")
+        # закрытие, которое заперло сессию (P/L), остаётся первым — владелец видит и итог сделки, и причину стопа
+        self.last_action = f"{prev} · {ks}" if prev.startswith("ЗАКРЫЛ ВСЁ") else ks
+        log.warning("ИИ-пилот %s: %s", self.base, self.last_action)
+        info = {"reason": reason, "ts": time.time(), "pnl": round(sum(self.pnls), 2), "trades": len(self.pnls),
+                "position": ({"side": pos["side"], "lots": pos["lots"]} if pos else None)}
+        try:
+            self._on_killswitch(info)
+        except Exception as e:                               # noqa: BLE001
+            log.warning("ИИ-пилот %s: хук killswitch споткнулся: %s", self.base, str(e)[:120])
+
+    def _feed_idle(self, px: float) -> None:
+        """Связи нет, срочного нет: только учёт (плавающий P/L по свежей цене, если она есть) — решений нет."""
+        pos = self.position
+        if pos and px > 0:
+            sgn = 1.0 if pos["side"] == "long" else -1.0
+            pos["floating"] = round((px - pos["entry"]) * sgn * pos["lots"] * self.point_value, 2)
+        if self.state not in ("СТОП",) and not (self.feed or {}).get("ok", True):
+            self.state = self._feed_state()
+
+    async def _loop_step(self) -> bool:
+        """Один шаг петли: цена → связь (feed) → тик или честное «нет связи». Возврат True — связи нет: следующий шаг
+        через FEED_DOWN_POLL_SEC."""
+        now = time.time()
+        px, err = await self._read_price()
+        if px > 0:
+            self._px_fail = None
+        else:
+            self._price_bad(now, err)
+            try:
+                await self._market_check()     # статус биржи без тика (кэш часов 60 с): закрыт ли рынок
+            except Exception:                                # noqa: BLE001
+                pass
+        self._feed_recompute(now)
+        if not self.feed.get("ok") or self._trade_refusal or self._px_fail:
+            await self._feed_probe(now)
+            self._feed_recompute(time.time())
+        if self.feed.get("ok"):
+            if px > 0:
+                if self._reconcile_asap:
+                    self._reconcile_asap = False
+                    try:
+                        await self._reconcile(px)
+                    except Exception as e:                   # noqa: BLE001
+                        log.info("ИИ-пилот %s: сверка после восстановления связи: %s", self.base, str(e)[:80])
+                book = None
+                if not self._market_closed():                # закрытый рынок: стакан мёртв, не дёргаем
+                    try:
+                        book = await tinkoff.orderbook(self.figi, depth=10)
+                    except Exception:                        # noqa: BLE001
+                        pass
+                await self.tick(px, book)
+            elif self._urgent():                             # цены нет, запас связи ещё идёт: только срочное
+                await self._urgent_tick()
+            return False
+        if self._urgent() and now >= self._urgent_at:
+            self._urgent_at = now + FEED_URGENT_SEC
+            await self._urgent_tick(px)
+            if not self.feed.get("ok") and self.state != "СТОП":
+                self.state = self._feed_state()
+        else:
+            self._feed_idle(px)
+        return True
+
     # ── статус/управление ───────────────────────────────────────────────────
     def status(self) -> dict:
         sr = self.session_risk.state() if self.session_risk else {}
@@ -3353,7 +4153,24 @@ class AIPilot:
                 "panic_blocked": self.panic_blocked or None,
                 "panic_force": self.panic_force or None,
                 "state_note": self._state_note,
-                "killswitch": sr, "frame": FRAME}
+                "killswitch": sr, "frame": FRAME,
+                # v5.4.4 «связь с брокером»: мигать панели — только при ticking; feed — есть ли цена и доступ и почему нет;
+                # отказы биржи с причиной и счётчиком; лимиты счёта (GetMaxLots); занят ли дежурный PRO
+                "loop_alive": bool(self.loop_alive),
+                "last_tick_ts": self._last_tick_ts or None,
+                "ticking": self.ticking(),
+                "started_ts": self.started_ts,
+                "feed": dict(self.feed or {}),
+                "broker_ok": self.broker_ok(),
+                "broker_refusal": dict(self.broker_refusal) if self.broker_refusal else None,
+                "account_limits": dict(self.account_limits) if self.account_limits else None,
+                "account_unverified": bool(self._acct_unverified or (self.position or {}).get("unverified")),
+                "prepare_error": self.prepare_error,
+                "adopt_refused": self.adopt_refused,
+                "close_retry_in_s": (max(0, int(_f((self.position or {}).get("close_retry_at")) - time.time())) or None)
+                if self.position else None,
+                "review_busy": bool(getattr(self, "_review_busy", False)),
+                "review_started_ts": (getattr(self, "_review_started_ts", None) or None)}
 
     def _plan_gates(self, plan: dict | None) -> list[dict]:
         """Проверки у двери по ЭТОМУ плану (plan_ts — план, о котором спросили). Ревью 5.4.2 (финал): ответ «не
@@ -3404,6 +4221,9 @@ class AIPilot:
         self.panic_flag = True
         if force:
             self.panic_force = True
+        if self.position:                      # v5.4.4: нажатие ПАНИКИ — попытка сразу, не после паузы прошлого отказа
+            self.position.pop("close_retry_at", None)
+        self._urgent_at = 0.0
         if self._prepared or self.position or self.pending:
             self._save_state()
 
@@ -3446,44 +4266,61 @@ class AIPilot:
             # Wait until children release clients and stop mutating this pilot.
             await self._cancel_background()
 
+    def _notify_prepared(self, ok: bool) -> None:
+        cb = self.on_prepared
+        if callable(cb):
+            try:
+                cb(bool(ok), self.prepare_error or "")
+            except Exception as e:                           # noqa: BLE001
+                log.warning("ИИ-пилот %s: колбэк подготовки споткнулся: %s", self.base, str(e)[:120])
+
     async def _run_loop(self) -> None:
-        ok = await self.prepare()
+        try:
+            ok = await self.prepare()
+        except Exception as e:                               # noqa: BLE001  (сеть/мусор в ответе — причина наружу)
+            self.prepare_error = self.prepare_error or f"подготовка упала: {str(e)[:160]}"
+            self._notify_prepared(False)
+            raise
+        if not ok and not self.prepare_error:
+            self.prepare_error = "подготовка не удалась (причина — в журнале сервера)"
+        self._notify_prepared(bool(ok))
         if not ok:
             return
+        self.loop_alive = True
+        try:
+            await self._loop_body()
+        finally:
+            self.loop_alive = False
+
+    async def _loop_sleep(self, slow: bool) -> None:
+        """Пауза между шагами петли — кусками по TICK_SEC (стоп и ПАНИКА ловятся сразу)."""
+        if self._market_closed() and not (self.stopping or self.panic_flag):
+            left = float(_setting("PYTHIA_CLOSED_TICK_SEC", 30))       # рынок закрыт → петля тикает реже
+        elif slow and not self.panic_flag:
+            left = FEED_DOWN_POLL_SEC                                    # связи нет → цену спрашиваем реже
+        else:
+            await asyncio.sleep(TICK_SEC)
+            return
+        # Settlement may outlive stop/panic while the exchange is closed: yield and pace instead of spinning.
+        while left > 0:
+            await asyncio.sleep(min(TICK_SEC, left))
+            left -= TICK_SEC
+            if self.stopping or self.panic_flag:
+                break
+
+    async def _loop_body(self) -> None:
         # v5.3 фаза 3 (проверяющий): ПАНИКА, а следом СТОП в тот же тик — стоп не отменяет панику: петля живёт,
-        # пока тормоза (0б) не закроют позицию/заявку, иначе «закрыть всё» молча терялось, позиция оставалась
+        # пока тормоза (0б) не закроют позицию/заявку, иначе «закрыть всё» молча терялось, позиция оставалась.
+        # v5.4.4: шаг — _loop_step: нет цены/доступа → честное «нет связи» (feed), срочное по паузе, без решений и ИИ
         while (not self.stopping or self.pending or any((self.position or {}).get(key) for key in ("exit_order", "stop_request")) or
                (self.panic_flag and self.position)):
+            slow = False
             try:
-                lp = await tinkoff.last_price(self.figi)
-                px = _f((lp or {}).get("price"))
-                book = None
-                if not self._market_closed():                # закрытый рынок: стакан мёртв, не дёргаем
-                    try:
-                        book = await tinkoff.orderbook(self.figi, depth=10)
-                    except Exception:                        # noqa: BLE001
-                        pass
-                # ПАНИКА/killswitch обязаны исполняться и БЕЗ свежей цены
-                if px <= 0 and (self.panic_flag or self.pending or any((self.position or {}).get(key) for key in ("exit_order", "stop_request")) or
-                                (self.session_risk and self.session_risk.locked)):
-                    px = (self.prices[-1] if self.prices
-                          else _f((self.position or {}).get("entry")) or _f((self.pending or {}).get("price")))
-                if px > 0:
-                    await self.tick(px, book)
+                slow = await self._loop_step()
             except Exception as e:                           # noqa: BLE001
                 log.warning("тик ИИ-пилота споткнулся: %s", str(e)[:120])
-            if self._market_closed():                        # рынок закрыт → петля тикает реже
-                if self.stopping or self.panic_flag:
-                    # Settlement may outlive stop/panic while the exchange is
-                    # closed. Still yield and pace requests instead of spinning.
-                    await asyncio.sleep(TICK_SEC)
-                else:
-                    left = float(_setting("PYTHIA_CLOSED_TICK_SEC", 30))   # (кусками: паника/стоп ловятся сразу)
-                    while left > 0 and not (self.stopping or self.panic_flag):
-                        await asyncio.sleep(min(TICK_SEC, left))
-                        left -= TICK_SEC
-            else:
-                await asyncio.sleep(TICK_SEC)
+            await self._loop_sleep(slow)
+        self.loop_alive = False
         # аккуратный выход: заявку снять (частичка — в учёт), позицию НЕ
         # закрываем сами (решение владельца), трос остаётся на бирже
         gt = self._guard_task
@@ -3730,9 +4567,14 @@ if __name__ == "__main__":
         p7.broker.place_ok = False                # биржа отбивает всё
         await p7.tick(91500.0, BOOK)              # тейк, но закрыть нельзя
         assert p7.position is not None and p7.position.get("close_fail")
+        assert p7.broker_refusal and p7.broker_refusal["what"] == "close" and p7.broker_refusal["count"] == 1
         p7.broker.place_ok = True
+        n7 = len(p7.broker.placed)
+        await p7.tick(91500.0, BOOK)              # v5.4.4: пауза после отказа — заявка не уходит каждый тик
+        assert p7.position is not None and len(p7.broker.placed) == n7 and "повтор через" in p7.last_action, p7.last_action
+        p7.position["close_retry_at"] = time.time() - 1   # пауза вышла
         await p7.tick(91500.0, BOOK)              # добили
-        assert p7.position is None and p7.pnls
+        assert p7.position is None and p7.pnls and p7.broker_refusal is None
 
         # 9) ПАНИКА при частично налитой заявке: частичка закрывается, не
         #    теряется (находка веера)
@@ -4769,6 +5611,102 @@ if __name__ == "__main__":
         assert pr3.status()["gates"][-1]["decision"] == "ЖДАТЬ" and pr3.status()["profits"][-1]["decision"] == "ДЕРЖАТЬ"
         _cfg0.PYTHIA_EXCHANGE_STOP = False
 
+        # 40) v5.4.4 «СВЯЗЬ С БРОКЕРОМ»: токен отозван → нет доступа (без тика и ИИ, причина один раз, хук), вернулся —
+        #     сама; заявки 40002 — без лесенки; закрытие отбито — пауза; ЗАКРЫТЬ за ужатием — в очередь; добор совета у
+        #     уровня; killswitch — одна запись и хук; статус для панели
+        class FakeTk:
+            price, err, checks, epoch = 100.0, None, 0, 0
+            access = {"ok": False, "trade": False, "kind": "auth", "reason": "токен Т-Банка не принят (40003)"}
+
+            @classmethod
+            async def last_price(cls, figi):
+                return {"price": cls.price} if cls.price else None
+
+            @classmethod
+            def price_error(cls, figi):
+                return dict(cls.err) if cls.price is None and cls.err else None
+
+            @classmethod
+            async def check_access(cls, timeout=15.0):
+                cls.checks += 1
+                return dict(cls.access)
+
+            @classmethod
+            def token_epoch(cls):
+                return cls.epoch
+
+            @staticmethod
+            async def orderbook(figi, depth=10):
+                return dict(BOOK)
+        _tk0 = globals()["tinkoff"]
+        globals()["tinkoff"] = FakeTk
+        try:
+            f1 = mk()
+            f1.adopt_forecast(ex("BUY", take=95000.0, inv=89000.0))
+            f1.loop_alive = True
+            hook: list = []
+            f1._on_feed_change = lambda ok, info: hook.append(ok)
+            FakeTk.price = None
+            FakeTk.err = {"kind": "auth", "reason": "токен Т-Банка не принят (40003)", "status": 401, "code": "40003"}
+            assert await f1._loop_step() is True and f1.feed["kind"] == "auth" and f1.state == "НЕТ_ДОСТУПА"
+            assert FakeTk.checks == 1 and hook == [False] and not f1.broker.placed and f1._tick_n == 0
+            la = f1.last_action
+            await f1._loop_step()
+            assert f1.last_action == la and f1.status()["ticking"] is False and not f1.broker_ok()
+            FakeTk.price, FakeTk.err = 90000.0, None
+            FakeTk.access = {"ok": True, "trade": True, "kind": "ok", "reason": "ок"}
+            FakeTk.epoch += 1
+            await f1._loop_step()
+            assert f1.feed["ok"] and hook == [False, True] and f1._tick_n == 1 and f1.broker.placed, f1.last_action
+            st = f1.status()
+            assert st["loop_alive"] and st["ticking"] and st["feed"]["kind"] == "ok" and "account_limits" in st
+            assert st["broker_refusal"] is None and st["review_busy"] is False and st["review_started_ts"] is None
+        finally:
+            globals()["tinkoff"] = _tk0
+        #     заявка 40002: одна попытка, «нет доступа», без лесенки отказов
+        f2 = mk()
+        f2.broker.place_ok = False
+
+        async def _deny(figi, direction, lots, price=None, tag=""):
+            return {"ok": False, "error": "Tinkoff 403 · 40002: Insufficient privileges [PostOrder]"}
+        f2.broker.place = _deny
+        f2.adopt_forecast(ex("BUY", take=95000.0, inv=89000.0))
+        await f2.tick(90000.0, BOOK)
+        assert f2.feed["kind"] == "rights" and f2._entry_fail == 0 and f2.plan and f2.broker_refusal["code"] == "40002"
+        #     закрытие отбито — пауза, а не заявка каждый тик
+        f3 = mk()
+        f3.adopt_forecast(ex("BUY", take=95000.0, inv=89000.0))
+        await f3.tick(90000.0, BOOK); await f3.tick(90000.0, BOOK)
+        f3.broker.place_ok = False
+        f3.adopt_forecast(ex("CLOSE"))
+        await f3.tick(90000.0, BOOK)
+        n3 = len(f3.broker.placed)
+        for _ in range(5):
+            await f3.tick(90000.0, BOOK)
+        assert len(f3.broker.placed) == n3 and "повтор через" in f3.last_action and f3.position["close_refusals"] == 1
+        #     ЗАКРЫТЬ, пока ужатие держит флаг, — в очередь, а не в никуда
+        f3.broker.place_ok = True
+        f3.position.pop("close_retry_at", None)
+        f3.position["closing"] = "reduce"
+        assert await f3._close_all(90000.0, "перепроверка: закрыть") is False and f3._close_pending
+        f3.position.pop("closing")
+        await f3.tick(90000.0, BOOK)
+        assert f3.position is None
+        #     добор совета у уровня при позиции той же стороны — план добора (add_to), а не только стоп/тейк
+        f4 = mk()
+        f4.adopt_forecast(ex("BUY", take=95000.0, inv=89000.0))
+        await f4.tick(90000.0, BOOK); await f4.tick(90000.0, BOOK)
+        assert f4.position and f4.adopt_forecast(ex("BUY", entry=89500.0, take=96000.0, inv=88000.0))
+        assert f4.plan and f4.plan["add_to"] == "long" and f4.position["take"] == 96000.0 and "добор взведён" in f4.last_action
+        #     killswitch: одна запись и хук, причина — в отказе приказа
+        f5 = mk()
+        ks: list = []
+        f5._on_killswitch = lambda info: ks.append(info["reason"])
+        f5.session_risk.locked, f5.session_risk.reason = True, "дневной стоп (тест)"
+        await f5.tick(90000.0, BOOK); await f5.tick(90000.0, BOOK)
+        assert ks == ["дневной стоп (тест)"] and "KILLSWITCH" in f5.last_action and f5.state == "СТОП"
+        assert f5.adopt_forecast(ex("BUY", take=95000.0, inv=89000.0)) is False and "дневной стоп" in f5.adopt_refused
+
     print("ai_pilot self-test OK (закалка веером): валидация приказа "
               "(стороны стоп/тейк), макс с плечом акций (dlong/dshort) и "
               "шорт-ГО, рыночный гейт, дозор ужимает (не убивает всё), "
@@ -4786,6 +5724,8 @@ if __name__ == "__main__":
               "один раз, переключение в бою), приказ WAIT, хуки проверки входа и мысли о прибыли, персист gates/profits; "
               "v5.4.2: разбор перепроверки без молчаливого ЖДЁМ (None — решения нет), WAIT → перепроверка через "
               "PYTHIA_WAIT_REVIEW_SEC, killswitch по кругу (не по куску исполнения), «прорыв» не мёртв до пробития, "
-              "сроки у денег и дрейф из конфига живьём")
+              "сроки у денег и дрейф из конфига живьём; v5.4.4: связь с брокером (токен отозван → НЕТ_ДОСТУПА без тика и ИИ, "
+              "причина один раз, новый токен → связь сама), заявки 40002 без лесенки, закрытие с паузой, ЗАКРЫТЬ за "
+              "ужатием в очереди, добор совета у уровня, killswitch одной записью")
 
     asyncio.run(main())

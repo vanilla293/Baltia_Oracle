@@ -74,12 +74,26 @@ def _astro_line() -> str:
         return ""
 
 
+def _token_check() -> dict | None:
+    """v5.4.4: что известно о токене Т-Банка (проверка GetAccounts при сохранении / отказы 401–403 после неё):
+    {ok, trade, kind, reason, access, ts} без секретов; ничего не известно — None. Токен «задан» ≠ «рабочий»."""
+    fn = getattr(tinkoff, "token_state", None)
+    try:
+        st = fn() if callable(fn) else None
+    except Exception:            # noqa: BLE001
+        st = None
+    if not isinstance(st, dict):
+        return None
+    return {k: st.get(k) for k in ("ok", "trade", "kind", "reason", "access", "ts")}
+
+
 def keys_status() -> dict:
     pool = config.deepseek_keys()
     inst = list((config.INSTRUMENT_KEYS or {}).values())
     return {"deepseek": bool(pool or inst), "deepseek_accounts": len(pool),
             "deepseek_mask": [_mask(k) for k in pool] or [_mask(k) for k in inst[:1]],
             "tinkoff": tinkoff.enabled(), "tinkoff_mask": _mask(config.TINKOFF_TOKEN),
+            "tinkoff_check": _token_check(),
             "dry": os.getenv("PYTHIA_DRY", "") == "1",
             # фаза 4 · W2: Telegram — только маски, ни токена, ни chat_id целиком
             "telegram": bool(telegram and telegram.token()), "telegram_mask": _mask(telegram.token()) if telegram else "",
@@ -148,11 +162,21 @@ async def _market_state(mission_snap: dict) -> dict:
 
 # ── v5.3 фаза 3 (W1): панель проблем — блок "health" в /api/v5/state ─────────────────────────
 PRICE_STALE_SEC = 60.0        # цена миссии старше при открытом рынке → «протухшие данные»
+TICK_STALE_SEC = 20.0         # v5.4.4: пилот «не тикает» — не раньше N с после последнего тика (или запуска)
 _LEVEL_ORDER = {"err": 0, "warn": 1, "info": 2}
 
 
-def _prob(kind: str, level: str, text: str, ts: float | None = None) -> dict:
-    return {"kind": kind, "level": level, "text": text, "ts": ts}
+def _prob(kind: str, level: str, text: str, ts: float | None = None, key: str | None = None) -> dict:
+    """Проблема панели; key (v5.4.4) — вид проблемы для Telegram (одна и та же — не чаще раза в 10 мин), по умолчанию
+    kind: у пилота их несколько разных (связь, не тикает, отказ биржи, killswitch) — ключ не даёт им глушить друг друга."""
+    return {"kind": kind, "level": level, "text": text, "ts": ts, "key": key or kind}
+
+
+_WHAT_RU = {"entry": "вход", "topup": "добор", "close": "закрытие", "stop": "стоп-заявку"}
+_SRC_RU = {"market": "котировки", "orders": "заявки", "account": "счёт"}
+_TK_HINT = {"auth": " — токен не принят: выпусти новый с полным доступом и вставь в «Ключи»",
+            "rights": " — у токена нет прав: нужен токен с полным доступом к этому счёту («Ключи»)",
+            "cert": " — TLS: нужны CA Минцифры (data/russian_trusted.pem), см. журнал сервера"}
 
 
 def _ws_clients() -> int | None:
@@ -185,31 +209,70 @@ def _pilot_problems(ms: dict, market: dict | None, now: float) -> tuple[list[dic
     if pst.get("error"):
         out.append(_prob("pilot", "err", f"Пилот {t} не отдал состояние: {str(pst['error'])[:120]}", now))
     pos = pst.get("position") if isinstance(pst.get("position"), dict) else {}
+    feed = pst.get("feed") if isinstance(pst.get("feed"), dict) else {}
+    feed_down = bool(feed) and feed.get("ok") is False
+    if feed_down:
+        # v5.4.4: связи с брокером нет — пилот не тикает, решений и заявок нет; позиция без защиты программы
+        fk = str(feed.get("kind") or "")
+        since = feed.get("since")
+        mins = int((now - float(since)) // 60) if since else 0
+        pos_t = (f"; позиция {pos.get('side')} {pos.get('lots')} лот БЕЗ ЗАЩИТЫ программы (стопов на бирже нет) — закрой "
+                 f"в приложении брокера" if pos and not pos.get("stop_id") else
+                 f"; позиция {pos.get('side')} {pos.get('lots')} лот: программа её не ведёт" if pos else "")
+        cause = str(feed.get("cause") or feed.get("reason") or fk)
+        out.append(_prob("pilot", "err" if fk in ("auth", "rights", "cert") or pos else "warn",
+                         f"Пилот {t}: {'нет доступа к брокеру' if fk in ('auth', 'rights') else 'нет связи с брокером'} "
+                         f"{mins} мин — {cause[:180]}{pos_t}", since or now, key="pilot:feed"))
+    elif (ms.get("live") and pst.get("loop_alive") is True and pst.get("ticking") is False
+          and feed.get("kind") != "closed"                 # рынок закрыт и цены нет — ночь, не авария
+          and now - float(pst.get("last_tick_ts") or pst.get("tick_ts") or pst.get("started_ts") or now) > TICK_STALE_SEC):
+        last = pst.get("last_tick_ts") or pst.get("tick_ts")
+        age = int(now - float(last)) if last else None
+        out.append(_prob("pilot", "err", f"Пилот {t} не тикает" + (f" {age} с" if age is not None else " с запуска") +
+                         " — петля жива, но тиков нет: смотри журнал сервера; «стоп» и «продолжить» перезапустят пилот",
+                         now, key="pilot:ticking"))
+    elif (ms.get("live") and pst and pst.get("loop_alive") is False and not ms.get("error")
+          and pst.get("started_ts") and now - float(pst["started_ts"]) > 90):
+        out.append(_prob("pilot", "warn", f"Пилот {t} готовится {int(now - float(pst['started_ts']))} с и ещё не тикает "
+                                          "(счёт, портфель, контракт у брокера)", now, key="pilot:ticking"))
+    br = pst.get("broker_refusal") if isinstance(pst.get("broker_refusal"), dict) else {}
+    if br and br.get("kind") not in ("auth", "rights") and now - float(br.get("ts") or 0) < 1800:
+        what = str(br.get("what") or "")
+        out.append(_prob("pilot", "err" if what in ("close", "stop") else "warn",
+                         f"Биржа отбила {_WHAT_RU.get(what, what)} {t}: {str(br.get('text') or '')[:160]}"
+                         + (f" ({br.get('count')} подряд)" if int(br.get("count") or 0) > 1 else "")
+                         + (" — повторяю с паузой, не каждый тик" if what in ("close", "stop") else ""),
+                         br.get("ts"), key=f"pilot:refusal:{what}"))
     if pos.get("close_fail"):
-        out.append(_prob("pilot", "err", f"Закрытие позиции {t} отбито биржей ({str(pos['close_fail'])[:100]}) — "
-                                         f"повторяю каждый тик; не закрывается — закрой руками в терминале брокера", now))
+        out.append(_prob("pilot", "err", f"Закрытие позиции {t} не завершено ({str(pos['close_fail'])[:100]}) — "
+                                         f"повторяю с паузой (до 60 с); не закрывается — закрой руками в терминале брокера",
+                         now, key="pilot:close"))
     if pos.get("stop_err") and not pos.get("stop_id"):
         out.append(_prob("pilot", "err", f"Трос {t} на бирже не встал: {str(pos['stop_err'])[:100]} — держу виртуальный "
                                          f"стоп (за уровнем закрою сам), повтор каждые {int(getattr(_mod('ai_pilot'), 'STOP_RETRY_SEC', 30))} с; "
-                                         f"проверь стоп-заявки у брокера", now))
+                                         f"проверь стоп-заявки у брокера", now, key="pilot:stop"))
     sr = pst.get("killswitch") if isinstance(pst.get("killswitch"), dict) else {}
     if sr.get("locked"):
         out.append(_prob("pilot", "err", f"Killswitch {t}: {str(sr.get('reason') or 'дневной лимит убытка')[:100]} — "
-                                         f"торговля остановлена до нового торгового дня (МСК); позиция под тросом", now))
+                                         f"торговля остановлена до нового торгового дня (МСК); приказы не принимаются",
+                         now, key="pilot:killswitch"))
     ef = int(pst.get("entry_fail") or 0)
     left = pst.get("no_entry_in_s")
     if ef > 0 and left:
         out.append(_prob("pilot", "warn", f"Биржа отбивает заявки {t} ({ef} подряд) — бэкофф ещё {int(left)} с, "
                                           f"после {int(getattr(_mod('ai_pilot'), 'ENTRY_FAIL_MAX', 5))} отказов план снимается; "
-                                          f"причина — в «последнем действии» пилота", now))
+                                          f"причина — в «последнем действии» пилота", now, key="pilot:backoff"))
     open_ = None if not isinstance(market, dict) else market.get("open")
     price_ts = pst.get("price_ts")
     tick_ts = pst.get("tick_ts")
-    if ms.get("live") and pst and open_ is not False:
+    # v5.4.4: «рынок мёртв» / «решает по старой цене» — только когда связь есть и пилот тикает; без связи (выше) пилот не
+    # решает вовсе, и причина — связь, а не рынок
+    link_ok = not feed_down and pst.get("ticking") is not False
+    if ms.get("live") and pst and open_ is not False and link_ok:
         age = (now - float(price_ts)) if price_ts else None
         if age is not None and age > PRICE_STALE_SEC:
             out.append(_prob("data", "warn", f"Цена {t} не обновлялась {int(age)} с при открытом рынке — котировки "
-                                             f"Tinkoff не идут (сеть, токен, лимит запросов?); пилот решает по старой цене", price_ts))
+                                             f"Tinkoff не идут (сеть, токен, лимит запросов?)", price_ts))
         elif pst.get("market_alive") is False and (pos or pst.get("plan")):
             ba = pst.get("book_age_s")
             out.append(_prob("data", "warn", f"Стакан {t} пуст или протух" + (f" ({int(ba)} с)" if ba else "") +
@@ -257,21 +320,47 @@ def health_block(*, keys: dict | None = None, mission_snap: dict | None = None,
                                                    f"{last_ai.get('text')}", last_ai.get("ts")))
     except Exception as e:   # noqa: BLE001
         log.info("health: deepseek: %s", str(e)[:80])
-    # 3. Tinkoff — последняя ошибка API брокера (актуальна, пока биржа не ответила снова)
+    # 3. Tinkoff — последняя ошибка API брокера по ИСТОЧНИКАМ (v5.4.4: котировки / заявки / счёт): ошибка актуальна, пока
+    #    ЭТОТ ЖЕ источник не ответил снова — удачная цена не прячет отказ заявок и счёта. Токен/права/TLS — err
     last_tk = None
     try:
         last_tk = tinkoff.last_error()
         last_tk = last_tk if isinstance(last_tk, dict) else None
         if last_tk:
-            ok_ts = float(tinkoff.last_ok_ts() or 0.0)
+            src0 = last_tk.get("source")
+            try:
+                ok_ts = float((tinkoff.last_ok_ts(src0) if src0 else tinkoff.last_ok_ts()) or 0.0)
+            except TypeError:                              # старая подпись last_ok_ts() без источника (фейки)
+                ok_ts = float(tinkoff.last_ok_ts() or 0.0)
             last_tk["stale"] = bool(ok_ts and ok_ts > float(last_tk.get("ts") or 0))
-            if not last_tk["stale"]:
-                txt = str(last_tk.get("text") or "")
-                hint = (" — токен не принят: «Ключи» → токен Tinkoff" if " 401" in f" {txt}" or "UNAUTHENTICATED" in txt
-                        else " — биржа ограничила частоту запросов, подожди минуту" if "RESOURCE_EXHAUSTED" in txt or "429" in txt
-                        else "")
-                problems.append(_prob("tinkoff", "warn", f"Tinkoff ({last_tk.get('path') or '?'}, {ai_v5.fmt_ts(last_tk.get('ts'))}): "
-                                                         f"{txt}{hint}", last_tk.get("ts")))
+        by_src = {}
+        fn_err = getattr(tinkoff, "errors", None)
+        try:
+            by_src = fn_err() if callable(fn_err) else {}
+        except Exception:    # noqa: BLE001
+            by_src = {}
+        rows = [r for r in (by_src or {}).values() if isinstance(r, dict)] or ([last_tk] if last_tk else [])
+        for rec in sorted(rows, key=lambda r: float(r.get("ts") or 0), reverse=True):
+            if rec.get("stale"):
+                continue
+            txt = str(rec.get("text") or "")
+            kind = str(rec.get("kind") or "")
+            if not kind:                                  # старая запись без вида — по тексту
+                fn_cl = getattr(tinkoff, "classify", None)
+                try:
+                    kind = fn_cl(txt)[0] if callable(fn_cl) else ""
+                except Exception:    # noqa: BLE001
+                    kind = ""
+            hint = _TK_HINT.get(kind, "")
+            if not hint and ("RESOURCE_EXHAUSTED" in txt or "429" in txt or "80002" in txt):
+                hint = " — биржа ограничила частоту запросов, подожди минуту"
+            if hint and ("«Ключи»" in txt or "CA Минцифры" in txt or "подожди минуту" in txt):
+                hint = ""                                 # подсказка уже в тексте (humanize_api_error)
+            src = rec.get("source")
+            problems.append(_prob("tinkoff", "err" if kind in ("auth", "rights", "cert") else "warn",
+                                  f"Tinkoff{' · ' + _SRC_RU[src] if src in _SRC_RU else ''} ({rec.get('path') or '?'}, "
+                                  f"{ai_v5.fmt_ts(rec.get('ts'))}): {txt}{hint}", rec.get("ts"),
+                                  key=f"tinkoff:{src or 'api'}"))
     except Exception as e:   # noqa: BLE001
         log.info("health: tinkoff: %s", str(e)[:80])
     # 3б. Telegram (фаза 4 · W2): токен есть, но чат не привязан / бот отбит (401, 403, сеть) — пока не ответил снова
@@ -447,18 +536,34 @@ async def api_keys_set(payload: dict):
         config.set_deepseek_keys(ds_keys)
     if updates:
         config.set_many(updates)
+    tk_check = None
     if "deepseek" in changed or "tinkoff" in changed:
         ai.reset_client()
         try:
             await tinkoff.aclose()
         except Exception:        # noqa: BLE001
             pass
+    if "tinkoff" in changed:
+        # v5.4.4: новый токен — прошлые ошибки в прошлое (панель не держит старый 401) и сразу проверка: GetAccounts +
+        # уровень доступа (полный / только чтение); пилот без связи видит новую эпоху токена и проверяет брокера сразу
+        try:
+            fn_reset = getattr(tinkoff, "reset_errors", None)
+            if callable(fn_reset):
+                fn_reset()
+            fn_chk = getattr(tinkoff, "check_access", None)
+            if callable(fn_chk) and os.getenv("PYTHIA_MOCK_TINKOFF", "") != "1":
+                tk_check = await asyncio.wait_for(fn_chk(), 20)
+        except Exception as e:   # noqa: BLE001
+            tk_check = {"ok": False, "kind": "network", "reason": f"проверка токена не завершилась: {str(e)[:100]}"}
     if changed and telegram is not None and ("telegram_token" in changed or "telegram_chat" in changed):
         try:
             await telegram.aclose()
         except Exception:        # noqa: BLE001
             pass
-    return {"ok": True, "changed": changed, **keys_status(), "settings": settings_block()}   # v5.4.1: + настройки
+    out = {"ok": True, "changed": changed, **keys_status(), "settings": settings_block()}   # v5.4.1: + настройки
+    if tk_check is not None:                 # v5.4.4: итог проверки нового токена — сразу в ответ «Ключей»
+        out["tinkoff_check"] = {k: tk_check.get(k) for k in ("ok", "trade", "kind", "reason", "access", "ts")}
+    return out
 
 
 @router.delete("/api/v5/keys")
@@ -626,8 +731,83 @@ if __name__ == "__main__":
             globals()["health_block"] = _hb0
         finally:
             globals()["_market_state"] = _mk0
+        # 9) v5.4.4: источники Tinkoff (котировки/заявки/счёт) — удачная цена не прячет отказ заявок; токен/права — err
+        #    с подсказкой; пилот без связи — err «нет доступа» с позицией без защиты, без ложных «рынок мёртв» / «старая
+        #    цена»; петля жива, но не тикает — err; отказ биржи по закрытию — err с паузой; ключ проблемы для Telegram
+        astro.peek_context = lambda: ({"mode": "precise"}, 5.0)
+        _errs0 = getattr(tinkoff, "errors", None)
+        tinkoff.last_error = lambda: {"ts": now - 5, "path": "GetLastPrices", "source": "market", "kind": "network",
+                                      "text": "таймаут", "stale": True}
+        tinkoff.last_ok_ts = lambda source=None: now
+        tinkoff.errors = lambda: {
+            "market": {"ts": now - 50, "path": "GetLastPrices", "source": "market", "kind": "network", "text": "таймаут",
+                       "stale": True},
+            "orders": {"ts": now - 20, "path": "PostOrder", "source": "orders", "kind": "rights", "code": "40002",
+                       "text": "Tinkoff 403 · 40002: Insufficient privileges [PostOrder]", "stale": False},
+            "account": {"ts": now - 10, "path": "GetAccounts", "source": "account", "kind": "auth", "code": "40003",
+                        "text": "Tinkoff 401 · 40003: Authentication token is missing or invalid [GetAccounts]", "stale": False}}
+        h = health_block(keys=ks_ok, mission_snap={}, market={"open": True, "enabled": True}, now=now)
+        tk = [x for x in h["problems"] if x["kind"] == "tinkoff"]
+        assert [(x["level"], x["key"]) for x in tk] == [("err", "tinkoff:account"), ("err", "tinkoff:orders")], tk
+        assert "токен не принят" in tk[0]["text"] and "«Ключи»" in tk[0]["text"] and "· счёт" in tk[0]["text"], tk[0]
+        assert "нет прав" in tk[1]["text"] and "40002" in tk[1]["text"] and "· заявки" in tk[1]["text"], tk[1]
+        tinkoff.errors = lambda: {}
+        tinkoff.last_error = lambda: None
+        pst9 = {"position": {"side": "long", "lots": 3, "stop_id": None}, "killswitch": {"locked": False}, "entry_fail": 0,
+                "price_ts": now - 400, "tick_ts": now - 400, "market_alive": False, "book_age_s": 500.0,
+                "loop_alive": True, "ticking": False, "last_tick_ts": now - 400,
+                "feed": {"ok": False, "kind": "auth", "reason": "токен Т-Банка не принят (40003) — выпусти новый",
+                         "since": now - 300}, "broker_refusal": None}
+        snap9 = {"active": "AFLT", "missions": {"AFLT": {"ticker": "AFLT", "live": True, "pilot": pst9, "error": None}}}
+        h = health_block(keys=ks_ok, mission_snap=snap9, market={"open": True, "enabled": True}, now=now)
+        txt9 = " | ".join(x["text"] for x in h["problems"])
+        assert [(x["kind"], x["level"], x["key"]) for x in h["problems"]] == [("pilot", "err", "pilot:feed")], h["problems"]
+        assert "нет доступа" in txt9 and "5 мин" in txt9 and "БЕЗ ЗАЩИТЫ" in txt9 and "long 3 лот" in txt9, txt9
+        assert "мёртв" not in txt9 and "старой цене" not in txt9, txt9
+        pst9b = dict(pst9, feed={"ok": True, "kind": "ok", "reason": "", "since": None}, ticking=False)
+        snap9b = {"active": "AFLT", "missions": {"AFLT": {"ticker": "AFLT", "live": True, "pilot": pst9b, "error": None}}}
+        h = health_block(keys=ks_ok, mission_snap=snap9b, market={"open": True, "enabled": True}, now=now)
+        assert [(x["key"], x["level"]) for x in h["problems"]] == [("pilot:ticking", "err")], h["problems"]
+        assert "не тикает 400 с" in h["problems"][0]["text"], h["problems"][0]
+        pst9c = dict(pst9b, ticking=True, price_ts=now - 1, market_alive=True,
+                     broker_refusal={"what": "close", "code": "30042", "text": "недостаточно средств (30042)", "count": 3,
+                                     "ts": now - 30, "kind": "other"},
+                     position={"side": "long", "lots": 3, "stop_id": None, "close_fail": "приказ совета: закрыть"})
+        snap9c = {"active": "AFLT", "missions": {"AFLT": {"ticker": "AFLT", "live": True, "pilot": pst9c, "error": None}}}
+        h = health_block(keys=ks_ok, mission_snap=snap9c, market={"open": True, "enabled": True}, now=now)
+        keys9 = [(x["key"], x["level"]) for x in h["problems"]]
+        assert keys9 == [("pilot:refusal:close", "err"), ("pilot:close", "err")], keys9
+        assert "3 подряд" in h["problems"][0]["text"] and "с паузой" in h["problems"][1]["text"], h["problems"]
+        # «Ключи»: новый токен — прошлые ошибки сброшены, проверка GetAccounts в ответе (фейки, без сети и без записи ключей)
+        _sm, _chk, _rst, _acl = config.set_many, getattr(tinkoff, "check_access", None), getattr(tinkoff, "reset_errors", None), tinkoff.aclose
+        seen9: list = []
+        config.set_many = lambda upd: seen9.append(("set", sorted(upd)))
+
+        async def _fake_check(timeout=15.0):
+            seen9.append(("check",))
+            return {"ok": True, "trade": False, "kind": "rights", "reason": "токен принят, но только для чтения",
+                    "access": "READ_ONLY", "ts": now}
+
+        async def _fake_aclose():
+            seen9.append(("aclose",))
+        tinkoff.check_access, tinkoff.reset_errors, tinkoff.aclose = _fake_check, (lambda: seen9.append(("reset",))), _fake_aclose
+        try:
+            r9 = asyncio.run(api_keys_set({"tinkoff": "t.fake-token-for-selftest"}))
+        finally:
+            config.set_many, tinkoff.aclose = _sm, _acl
+            if _chk is not None:
+                tinkoff.check_access = _chk
+            if _rst is not None:
+                tinkoff.reset_errors = _rst
+        assert r9["ok"] and "tinkoff" in r9["changed"] and r9["tinkoff_check"]["access"] == "READ_ONLY", r9
+        assert r9["tinkoff_check"]["ok"] and r9["tinkoff_check"]["trade"] is False, r9["tinkoff_check"]
+        assert [x[0] for x in seen9] == ["set", "aclose", "reset", "check"], seen9
+        if _errs0 is not None:
+            tinkoff.errors = _errs0
     finally:
         ai_v5.last_error, tinkoff.last_error, tinkoff.last_ok_ts, astro.peek_context, ai.last_error = _saved
     print("api_v5 self-test OK: health — ключи (err/warn/info, мок), ошибки DeepSeek/Tinkoff со старением, рынок закрыт/часы, "
           "небо lite/precise/сбой, пилот (трос, закрытие, killswitch, бэкофф), протухшая цена/стакан, state_age_s, "
-          "мусорный снимок и сломанный блок не роняют /api/v5/state")
+          "мусорный снимок и сломанный блок не роняют /api/v5/state; v5.4.4: Tinkoff по источникам (котировки/заявки/счёт), "
+          "токен/права — err с подсказкой, пилот без связи — err без «рынок мёртв», не тикает — err, отказ закрытия — err, "
+          "новый токен в «Ключах» — сброс ошибок и проверка GetAccounts")
