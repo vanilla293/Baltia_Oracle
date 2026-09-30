@@ -388,6 +388,15 @@ async def enrich_ticker(run_id: str, ticker: str, name: str, asset_class: str, d
                                 f"размечено {out['characterized']}") if out["new"] else
                                f"Google News по {t}: нового нет (всё уже в базе)")
         return out
+    except asyncio.CancelledError:
+        # v5.4.4 (отчёт проверяющего A2): срок сбора у вызывающего вышел (wait_for) или задачу сняли — CancelledError
+        # не Exception: без этой ветки стадия «news» висела в start. Закрыть «error» и пробросить отмену дальше
+        try:
+            await bus.stage(scope, run_id, "news", "error", ticker=t,
+                            detail=f"Google News по {t}: сбор прерван (срок вышел или задачу сняли) — решаем без него")
+        except Exception:        # noqa: BLE001
+            pass
+        raise
     except Exception as e:       # noqa: BLE001
         msg = _hum(e)
         log.warning("enrich_ticker %s: %s", t, msg)
@@ -396,6 +405,9 @@ async def enrich_ticker(run_id: str, ticker: str, name: str, asset_class: str, d
         except Exception:        # noqa: BLE001
             pass
         return {"new": 0, "relevant": 0, "characterized": 0}
+
+
+enrich_ticker.closes_stage_on_cancel = True   # v5.4.4: миссия не дублирует «error» стадии при отмене (_enrich_news)
 
 
 # ── отбор ─────────────────────────────────────────────────────────────────
@@ -1028,6 +1040,21 @@ if __name__ == "__main__":
         assert await enrich_ticker(run2, "SBER", "Сбербанк", "share") == {"new": 0, "relevant": 0, "characterized": 0}
         assert [e for e in events if e.get("run_id") == run2 and e["stage"] == "news"][-1]["status"] == "error"
         store_v5.news_by_ids = real_by_ids
+        # v5.4.4 (A2): срок вызывающего вышел (wait_for отменяет задачу) — стадия «error», не висит в start; отмена дальше
+        async def hang_tk(*a, **k):
+            await asyncio.sleep(5)
+            return []
+        news.fetch_for_ticker = hang_tk
+        n_ev = len(events)
+        try:
+            await asyncio.wait_for(enrich_ticker(run2, "SBER", "Сбербанк", "share"), 0.05)
+            raise AssertionError("срок вышел — TimeoutError у вызывающего")
+        except asyncio.TimeoutError:
+            pass
+        st_c = [e for e in events[n_ev:] if e.get("run_id") == run2 and e["stage"] == "news"]
+        assert [e["status"] for e in st_c] == ["start", "error"] and "сбор прерван" in st_c[-1]["detail"], st_c
+        assert enrich_ticker.closes_stage_on_cancel is True
+        news.fetch_for_ticker = fake_tk
         bus.end_run(run2)
 
         # ── v5.1: 200 новостей — отбор пачками по 50, разметка каждой отдельным вызовом ──

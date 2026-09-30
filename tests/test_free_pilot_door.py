@@ -531,8 +531,11 @@ def test_review_words_and_garbage(free):
             fake.queue("mission_review", {"choice": junk, "why": "?"})
             await p._review(100.0)
             assert len(m.reviews) == n and p.plan is None, (junk, m.reviews[-1:])
-            assert p._review_reason == "резкий ход: тест" and p.review_ts <= time.time() + mission.REVIEW_RETRY_SEC + 1
-            assert "ответ не разобран" in p.last_action, p.last_action
+            # v5.4.4 (воля владельца «только триггеры и раз в 30 мин»): быстрого повтора через 5 мин нет — повод ждёт
+            # плановой перепроверки, в её ситуации — «ПРОШЛЫЙ ОТВЕТ … НЕ РАЗОБРАН» с подсказкой
+            assert p._review_reason == "резкий ход: тест" and p.review_ts >= time.time() + 1790, p.review_ts - time.time()
+            assert "ответ не разобран" in p.last_action and "плановой перепроверки" in p.last_action, p.last_action
+            assert p._review_unparsed and "НЕ РАЗОБРАН" in p._situation_text(100.0), p._review_unparsed
         assert all(r["choice"] != "ЖДЁМ" for r in m.reviews), "ЖДЁМ за ИИ не записан"
         # в позиции «CLOSE» — закрыть
         pos = await open_long(p, fake)
@@ -554,8 +557,9 @@ def test_review_play_mode_out_of_mode_and_flip_to_close(free):
         await p._review(100.0)
         r = m.reviews[-1]
         assert r["choice"] == "ВНЕ_РЕЖИМА" and r["ai_choice"] == "ПРОДАТЬ_СЕЙЧАС" and p.plan is None, r
-        assert p._review_reason == "прошлый ответ ПРОДАТЬ_СЕЙЧАС запрещён режимом long"
-        assert p.review_ts <= time.time() + mission.REVIEW_RETRY_SEC + 1
+        # v5.4.4: метка — как модель выбирала (ПРОДАТЬ); переспрос не через 5 мин, а на плановой перепроверке
+        assert p._review_reason == "прошлый ответ ПРОДАТЬ запрещён режимом long", p._review_reason
+        assert p.review_ts >= time.time() + 1790, p.review_ts - time.time()
         await open_long(p, fake)
         fake.queue("mission_review", {"choice": "ПЕРЕВЕРНУТЬ", "why": "разворот"})
         await p._review(100.0)
@@ -575,12 +579,13 @@ def test_review_buy_during_council_is_deferred_not_lost(free):
         p._reanalyzing = True
         fake.queue("mission_review", {"choice": "КУПИТЬ_СЕЙЧАС", "why": "пробили", "invalidation": 98.0})
         await p._review(100.0)
-        assert p.plan is None and "решение перепроверки КУПИТЬ_СЕЙЧАС отложено: идёт совет" in (p._review_reason or "")
+        assert p.plan is None and "решение перепроверки КУПИТЬ отложено: идёт совет" in (p._review_reason or "")
         assert "отложено: идёт совет" in p.last_action
-        # совет ответил WAIT — решение перепроверки не пропало: повод жив, дежурный PRO вернётся вскоре
+        # совет ответил WAIT — решение перепроверки не пропало: повод жив; v5.4.4 — к плановой перепроверке (не через 3 мин)
         wait, _ = mission._validate_exec({"do": "WAIT", "wait_for": "т"}, "auto", 100)
         assert p.adopt_forecast({"exec": wait})
-        assert "отложено: идёт совет" in (p._review_reason or "") and p.review_ts <= time.time() + mission.EVENT_MIN_GAP_SEC + 1
+        assert "отложено: идёт совет" in (p._review_reason or "")
+        assert p.review_ts > time.time() + mission.EVENT_MIN_GAP_SEC + 60, p.review_ts - time.time()
 
     asyncio.run(scenario())
 
@@ -918,8 +923,10 @@ def test_door_off_drift_is_not_chased(free, monkeypatch):
         assert p.plan is None and p.pending is None and not p.broker.placed and fake.count("mission_entry") == 0
         assert ("с момента решения цена прошла 3.50 % в сторону сделки (решение при 100, сейчас 103.5) — план по старой "
                 "цене снят, реши заново по живой цене") in p._review_reason, p._review_reason
-        assert p.review_ts <= max(time.time(), p._last_review_ts) + mission.EVENT_MIN_GAP_SEC + 1
-        assert m.handoffs[-1]["kind"] == "pilot"
+        # v5.4.4 (воля владельца «только триггеры и раз в 30 мин»): снятый по дрейфу план — не рыночный повод, дежурный
+        # PRO решит на плановой перепроверке (раньше — через EVENT_MIN_GAP_SEC)
+        assert p.review_ts >= time.time() + 1790, p.review_ts - time.time()
+        assert m.handoffs[-1]["kind"] == "pilot" and m.handoffs[-1]["deferred"]
         # в пределах PYTHIA_ENTRY_DRIFT_PCT — вход сразу, как было
         m2, p2 = make_pilot()
         p2._plan_from_review("КУПИТЬ_СЕЙЧАС", {"invalidation": 99.0, "take": 104.0}, "т", 100.0, 100.3, snap_ts=time.time())
@@ -935,7 +942,7 @@ def test_door_off_drift_is_not_chased(free, monkeypatch):
 
 
 # ── «после закрытия» — по строке кода, а не по слову «закрытие» в тексте ИИ ────────────────────────────────────────
-def test_door_cancel_with_closing_word_in_why_pulls_review_soon(free, monkeypatch):
+def test_door_cancel_with_closing_word_in_why_waits_planned_review(free, monkeypatch):
     fake = free
     monkeypatch.setattr(config, "PYTHIA_AFTER_CLOSE_SEC", 900)
 
@@ -946,7 +953,9 @@ def test_door_cancel_with_closing_word_in_why_pulls_review_soon(free, monkeypatc
         fake.queue("mission_entry", {"decision": "ОТМЕНИТЬ", "why": "ход отыгран, закрытие часа ниже 100"})
         await tick(p, 100.0)
         assert p.plan is None and "закрытие часа" in (p._review_reason or "")
-        assert p.review_ts - time.time() <= mission.EVENT_MIN_GAP_SEC + 1, p.review_ts - time.time()
+        # v5.4.4: ОТМЕНИТЬ у двери — повод к плановой перепроверке (не через 3 мин); слово «закрытие» в тексте ИИ не
+        # делает его поводом «после закрытия» (та пауза — ~900 с)
+        assert p.review_ts - time.time() >= 1790, p.review_ts - time.time()
         # настоящий повод «после закрытия» — пауза PYTHIA_AFTER_CLOSE_SEC, как было
         m2, p2 = make_pilot()
         p2.review_ts = time.time() + 1800

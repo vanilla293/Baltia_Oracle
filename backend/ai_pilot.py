@@ -4949,7 +4949,9 @@ if __name__ == "__main__":
                                           ("BUY", True, "short", "ЗАКРЫТЬ"), ("СОВЕТ", False, None, "НОВЫЙ_АНАЛИЗ"),
                                           ("", False, None, None), ("", True, "long", None), ("ВОЙТИ", False, None, None),
                                           ("НЕ ПОКУПАТЬ, ЖДЁМ", False, None, "ЖДЁМ"), ("ДЕРЖАТЬ, не закрывать", True, "long", "ЖДЁМ"),
-                                          ("КУПИТЬ или ЖДАТЬ", False, None, None), ("НЕ ЗАКРЫВАТЬ", True, "long", None)):
+                                          ("КУПИТЬ или ЖДАТЬ", False, None, None),
+                                          # v5.4.4 (разбор слов, ai_v5): «не закрывать» в позиции — держать
+                                          ("НЕ ЗАКРЫВАТЬ", True, "long", "ЖДЁМ")):
             got = AIPilot._parse_choice(raw_c, in_p, side_c)
             assert got == want, (raw_c, in_p, side_c, got, want)
         assert AIPilot._parse_choice("КУПИТЬ", True, None) is None, "в позиции без стороны «купить» не угадываем"

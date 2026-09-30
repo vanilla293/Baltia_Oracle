@@ -813,7 +813,9 @@ class Scene:
                     "prev_exec": mission._exec_text(m), "news": news_txt,
                     "watch": mission._watch_text(p._last_review_ts or p.started_ts), "astro_line": "",
                     "scan": mission._scan_text(m), "wyckoff": wy_txt, "wyckoff_at": wy_at, "scout": self.scout,
-                    "partners": self.partners, "memory": m.memory or ""}
+                    "partners": self.partners, "memory": m.memory or "",
+                    # v5.4.4: взведён вход без позиции — в списке ОТМЕНИТЬ (как в MissionPilot._review)
+                    "armed": p.position is None and bool(p.plan or p.pending)}
 
     def door_args(self) -> dict:
         """Аргументы prompts_mission.entry_check — как собирает MissionPilot._entry_check (у двери без строки ПРОВЕРКА

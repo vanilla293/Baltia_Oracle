@@ -702,6 +702,12 @@ class Scene:
             mission._M.clear()
         return False
 
+    def council_long_ago(self) -> None:
+        """v5.4.4 «ритм PRO»: полный совет по просьбе узла (трос ЖДАТЬ, тейк ПОДЕРЖАТЬ, дверь ОТМЕНИТЬ+council, прибыль
+        СОВЕТ) — не чаще PYTHIA_COUNCIL_GAP_SEC от КОНЦА прошлого совета; сцена, где совет должен пойти, — «прошлый совет
+        был давно» (иначе просьба уходит поводом к плановой перепроверке)."""
+        self.m.council_ts, self.m.council_end_ts = time.time() - 5000, time.time() - 4000
+
     # ── подмена констант на время сцены ──
     def patch(self, mod, attr: str, value) -> None:
         self._saved.setdefault((mod, attr), getattr(mod, attr))
@@ -845,8 +851,8 @@ async def s02_gap_trigger(sc: Scene) -> None:
     сцене — держать с новыми уровнями)."""
     pos = await sc.open_position("long", inv=98.0)
     hard = pos["hard_stop"]
-    sc.p._last_reanalyze_ts = time.time()         # советы «только что» — трос обязан пройти без очереди
-    sc.m.council_ts = time.time()
+    sc.p._last_reanalyze_ts = time.time()         # пейсинг родителя не мешает: просьба узла идёт по окну от конца совета
+    sc.council_long_ago()                         # v5.4.4: окно совета от конца прошлого — открыто
     fake_ai.queue("mission_guard", {"decision": "ЖДАТЬ", "why": "ложный прокол, стакан держит",
                                     "hold_until_price": 97.2, "hold_minutes": 5})
     fake_ai.queue("mission_exec", {"do": "CLOSE", "why": "картина сломалась — выходим"})
@@ -867,6 +873,7 @@ async def s02_gap_trigger(sc: Scene) -> None:
     assert any(f"{MM()} у троса: ЖДАТЬ" in e["title"] for e in sc.xevents("guard"))
     assert any("CLOSE" in e["title"] for e in sc.xevents("council")), [e["title"] for e in sc.xevents()]
     # вторая сцена: совет говорит держать (ревью 5.4.2: HOLD — без добора, новые уровни) — позиция цела
+    sc.council_long_ago()                         # v5.4.4: первый совет только что кончился — окно закрыто; «прошёл час»
     fake_ai.queue("mission_guard", {"decision": "ЖДАТЬ", "why": "прокол", "hold_minutes": 5})
     fake_ai.queue("mission_exec", {"do": "HOLD", "entry": None, "take": 112.0, "invalidation": 96.0, "why": "держать"})
     sc.p.pnls, sc.p.session_risk = [], trader_risk.SessionRisk(DEPOSIT)
@@ -1345,11 +1352,16 @@ async def s16_flip_quiet(sc: Scene) -> None:
     assert sc.p.adopt_forecast(sc.ex("SELL", None, 90.0, 102.0)) is False
     assert sc.p.position is pos and "переворот отклонён" in sc.p.last_action and sc.p.plan is None
     assert sc.p._close_pending and "закрываю без переворота" in sc.p.last_action, sc.p.last_action
-    assert sc.p.review_ts <= time.time() + 300, "перепроверка через 5 мин решит сама"
     assert "закрыта без переворота" in (sc.p._review_reason or ""), sc.p._review_reason
+    assert "приказ не принят" not in sc.p.last_action and sc.p.adopt_refused == sc.p.last_action, sc.p.adopt_refused
     n_o = len(sc.broker.placed)
     await sc.tick(100.0)                          # выход: закрыть лонг, шорт не открывать
     assert sc.p.position is None and len(sc.broker.placed) == n_o + 1 and sc.broker.placed[-1]["tag"] == "aip-close"
+    # v5.4.4 «ритм PRO»: вход в другую сторону решит дежурный PRO по поводу «после закрытия» (PYTHIA_AFTER_CLOSE_SEC —
+    # рыночный триггер), а не отдельной перепроверкой через 5 мин
+    after = float(config.PYTHIA_AFTER_CLOSE_SEC)
+    assert sc.p.review_ts <= time.time() + after + 1 and "закрыта без переворота" in (sc.p._review_reason or ""), \
+        (sc.p.review_ts - time.time(), sc.p._review_reason)
     await sc.tick(100.0)
     assert sc.p.position is None and sc.p.pending is None and len(sc.broker.placed) == n_o + 1, "переворота нет"
     pos = await sc.open_position("long", inv=98.0)
@@ -1424,8 +1436,8 @@ async def s19_take_hold_council(sc: Scene) -> None:
     sc.patch(config, "PYTHIA_EXCHANGE_STOP", True)     # сцена про трос НА БИРЖЕ (умолчание 5.4.1 — только в программе)
     pos = await sc.open_position("long", inv=98.0, take=103.0)
     entry, sid0 = pos["entry"], pos["stop_id"]
-    sc.p._last_reanalyze_ts = time.time()         # советы «только что» — тейк обязан пройти без очереди
-    sc.m.council_ts = time.time()
+    sc.p._last_reanalyze_ts = time.time()         # пейсинг родителя не мешает: просьба узла идёт по окну от конца совета
+    sc.council_long_ago()                         # v5.4.4: окно совета от конца прошлого — открыто
     fake_ai.queue("mission_take", {"decision": "ПОДЕРЖАТЬ", "why": "импульс не выдохся, лента за нас",
                                    "lock_price": 100.5, "tp_next": 106.0, "hold_minutes": 10})
     fake_ai.queue("mission_exec", {"do": "HOLD", "entry": None, "take": 107.0, "invalidation": 101.0, "why": "держать выше"})
@@ -1455,6 +1467,7 @@ async def s19_take_hold_council(sc: Scene) -> None:
     await sc.settle_ai()
     assert any(f"{MM()} у тейка: ПОДЕРЖАТЬ" in e["title"] and "заперта" in e["detail"] for e in sc.xevents("take")), sc.xevents()
     # вторая сцена: ПОДЕРЖАТЬ → совет говорит CLOSE → закрыто в плюс
+    sc.council_long_ago()                         # v5.4.4: первый совет только что кончился — окно закрыто; «прошёл час»
     fake_ai.queue("mission_take", {"decision": "ПОДЕРЖАТЬ", "why": "ещё растёт", "tp_next": 112.0})
     fake_ai.queue("mission_exec", {"do": "CLOSE", "why": "цель взята — в кассу"})
     fake_ai.gate = asyncio.Event()
@@ -1504,7 +1517,7 @@ async def s21_take_lock_pullback(sc: Scene) -> None:
     pos = await sc.open_position("long", inv=98.0, take=103.0)
     entry = pos["entry"]
     sc.p._last_reanalyze_ts = time.time()
-    sc.m.council_ts = time.time()
+    sc.council_long_ago()                         # v5.4.4: окно совета от конца прошлого — открыто
     fake_ai.queue("mission_take", {"decision": "ПОДЕРЖАТЬ", "why": "разгон", "lock_price": 102.0, "tp_next": None})
     fake_ai.queue("mission_exec", {"do": "BUY", "entry": None, "take": None, "invalidation": 102.0, "why": "трейлим"})
     fake_ai.gate = asyncio.Event()
@@ -2186,14 +2199,16 @@ async def s33_gate_cancel(sc: Scene) -> None:
     await sc.tick(100.0)
     assert sc.p.plan is None and sc.p.state == "ЖДУ_ПЛАН" and sc.p.pending is None and not b.placed, sc.p.last_action
     assert sc.p.gates[-1]["decision"] == "ОТМЕНИТЬ" and "план снят" in sc.p.gates[-1]["applied"], sc.p.gates[-1]
-    assert len(sc.m.handoffs) == n_h + 1 and sc.m.handoffs[-1]["kind"] == "pilot" and not sc.m.handoffs[-1]["deferred"], sc.m.handoffs[-1]
+    assert len(sc.m.handoffs) == n_h + 1 and sc.m.handoffs[-1]["kind"] == "pilot" and sc.m.handoffs[-1]["deferred"], sc.m.handoffs[-1]
     assert "вход отменён" in sc.m.handoffs[-1]["reason"] and "отыграна" in (sc.p._review_reason or "")
-    assert sc.p.review_ts <= time.time() + mission.EVENT_MIN_GAP_SEC + 1, "v5.4.2: вне рынка без плана — PRO решает скоро"
+    # v5.4.4 «ритм PRO» (воля владельца 30.09.2026): ОТМЕНИТЬ у двери — не рыночный триггер: повод к ПЛАНОВОЙ перепроверке
+    # (было v5.4.2: вне рынка без плана — PRO через EVENT_MIN_GAP_SEC)
+    assert sc.p.review_ts >= time.time() + 1700, ("к плановой", sc.p.review_ts - time.time(), sc.p.last_action)
     assert mission.status(TICKER)["phase"] == "idle" and sc.p.status()["entry_gate"] is None and sc.p.status()["gates"][-1]["decision"] == "ОТМЕНИТЬ"
     assert fake_ai.count("mission_review") == 0 and fake_ai.count("mission_exec") == 0
     # council=true → полный совет без очереди → BUY → проверка у двери (ВОЙТИ по умолчанию) → вход
     sc.p._last_reanalyze_ts = time.time()
-    sc.m.council_ts = time.time()
+    sc.council_long_ago()                         # v5.4.4: окно совета от конца прошлого — открыто
     assert sc.p.adopt_forecast(sc.ex("BUY", None, 110.0, 98.0))
     fake_ai.queue("mission_entry", {"decision": "ОТМЕНИТЬ", "why": "картина спорная — нужен совет", "council": True})
     fake_ai.queue("mission_exec", {"do": "BUY", "entry": None, "take": 109.0, "invalidation": 97.0, "why": "совет: входим"})
@@ -2364,8 +2379,8 @@ async def s37_profit_council(sc: Scene) -> None:
     5.4.4 — без быстрого повтора: следующая мысль не раньше PYTHIA_PROFIT_THINK_COOL_SEC."""
     pos = await sc.open_position("long", inv=98.0, take=110.0)
     entry = pos["entry"]
-    sc.p._last_reanalyze_ts = time.time()         # советы «только что» — мысль обязана пройти без очереди
-    sc.m.council_ts = time.time()
+    sc.p._last_reanalyze_ts = time.time()         # пейсинг родителя не мешает: просьба узла идёт по окну от конца совета
+    sc.council_long_ago()                         # v5.4.4: окно совета от конца прошлого — открыто
     fake_ai.queue("mission_profit", {"decision": "СОВЕТ", "why": "картина спорная: рывок на новости, объёмы падают",
                                      "lock_price": 104.0, "take": 111.0})
     fake_ai.queue("mission_exec", {"do": "HOLD", "entry": None, "take": 112.0, "invalidation": 105.0, "why": "держать выше"})
@@ -2591,8 +2606,8 @@ async def s41_council_hold(sc: Scene) -> None:
     # ревью 5.4.2 (финал): остаток авто-добора самого входа (topup_left) не обнуляется руками — его снимает HOLD
     b.mx = {"buy": 4, "sell": 4}                  # биржа снова даёт лоты
     sc.p._mx = None
-    sc.p._last_reanalyze_ts = time.time()         # тейк зовёт совет без очереди
-    sc.m.council_ts = time.time()
+    sc.p._last_reanalyze_ts = time.time()         # пейсинг родителя не мешает: просьба узла идёт по окну от конца совета
+    sc.council_long_ago()                         # v5.4.4: окно совета от конца прошлого — открыто
     n_entry = fake_ai.count("mission_entry")
     fake_ai.queue("mission_take", {"decision": "ПОДЕРЖАТЬ", "why": "импульс жив, лента за нас", "tp_next": 106.0})
     fake_ai.queue("mission_exec", {"do": "ДЕРЖАТЬ", "entry": None, "take": 107.0, "invalidation": 101.0,
@@ -2708,7 +2723,7 @@ async def s43_wait_alarm_kept(sc: Scene) -> None:
     sc.p._last_review_ts -= mission.EVENT_MIN_GAP_SEC + 60
     sc.p.review_ts = 0.0
     fake_ai.queue("mission_review", {"choice": "ЖДЁМ", "why": "у 101 без объёма — вынос", "entry": 101.0})
-    await sc.tick(101.3)
+    await sc.tick(101.4)                          # v5.4.4: будильник не ближе 0.3 % к цене (у 101.3 уровень 101 — 0.296 %)
     assert await sc.settle(lambda: fake_ai.count("mission_review") == 3 and not sc.p._review_busy)
     ur = fake_ai.last_user["mission_review"]
     assert "ПОВОД ПЕРЕПРОВЕРКИ (внеплановая): цена 101.3 прошла уровень 101" in ur and "сработал в" in ur, ur[:1500]
@@ -2972,6 +2987,90 @@ async def s46_prepare_unread_portfolio(sc: Scene) -> None:
     sc.note = "портфель не прочитан → позиция из файла «сверить со счётом», входов нет до сверки, сверка подтвердила; счёт не прочитан → не стартовал с причиной, файл цел"
 
 
+async def s44_ambush_answer(sc: Scene) -> None:
+    """v5.4.4 (разбор слов): вне рынка по приказу WAIT дежурный PRO отвечает «ЗАСАДА» — без уровней ответ не разобран:
+    решения не было, быстрого повтора нет (повод ждёт плановой через ~30 мин, тики PRO не зовут), в следующей ситуации —
+    «ПРОШЛЫЙ ОТВЕТ «ЗАСАДА» НЕ РАЗОБРАН» с подсказкой; на плановой — «ЗАСАДА» с уровнями: сторона по уровням (вход 99 и
+    стоп 98 ниже цены 100 → КУПИТЬ), засада (откат) @99 взведена, метка «КУПИТЬ — засада (откат) @99», исход в статусе."""
+    sc.p.plan = None
+    wait, err = mission._validate_exec({"do": "WAIT", "wait_for": "откат к поддержке 99", "why": "стенд: вне рынка",
+                                        "plan": "ждём"}, "auto", 100.0)
+    assert wait and not err, (wait, err)
+    assert sc.p.adopt_forecast({"exec": wait}) and sc.p.plan is None
+    sc.m.exec, sc.m.exec_ts = wait, time.time()
+    await sc.tick(100.0, n=2)                     # стакан появился, рынок жив
+    # 1) «ЗАСАДА» без уровней: сторону взять не из чего — не разобран, код за ИИ не решает
+    sc.p.review_ts = 0.0
+    fake_ai.queue("mission_review", {"choice": "ЗАСАДА", "why": "жду отката"})
+    await sc.tick(100.0)
+    assert await sc.settle(lambda: fake_ai.count("mission_review") == 1 and not sc.p._review_busy)
+    assert sc.p.plan is None and sc.p.pending is None and not sc.m.reviews, (sc.p.plan, sc.m.reviews)
+    assert "не разобран" in sc.p.last_action and "решения не было" in sc.p.last_action, sc.p.last_action
+    left = sc.p.review_ts - time.time()
+    assert left >= float(config.PYTHIA_WAIT_REVIEW_SEC) - 60, ("без быстрого повтора — к плановой", left)
+    up = sc.p.status()["review_unparsed"]
+    assert up and up["raw"] == "ЗАСАДА" and "entry" in up["hint"], up
+    sit = sc.p._situation_text(100.0)
+    assert "ПРОШЛЫЙ ОТВЕТ «ЗАСАДА» НЕ РАЗОБРАН" in sit and "КУПИТЬ/ПРОДАТЬ с entry" in sit, sit
+    await sc.tick(100.0, n=3)                     # до плановой тики PRO не зовут
+    assert fake_ai.count("mission_review") == 1, fake_ai.summary()
+    # 2) плановая: «ЗАСАДА» с уровнями — сторона по уровням → КУПИТЬ, засада @99 (откат)
+    sc.p.review_ts = 0.0
+    fake_ai.queue("mission_review", {"choice": "ЗАСАДА", "why": "откат к 99 — берём у поддержки", "entry": 99.0,
+                                     "invalidation": 98.0, "take": 103.0, "entry_kind": "откат"})
+    await sc.tick(100.0)
+    assert await sc.settle(lambda: fake_ai.count("mission_review") == 2 and not sc.p._review_busy)
+    assert "ПРОШЛЫЙ ОТВЕТ «ЗАСАДА» НЕ РАЗОБРАН" in fake_ai.last_user["mission_review"], "PRO видит, что ответ не разобран"
+    r = sc.m.reviews[-1]
+    assert r["choice"] == "КУПИТЬ_СЕЙЧАС" and r["label"] == "КУПИТЬ — засада (откат) @99", r
+    assert sc.p.plan and sc.p.plan["side"] == "long" and sc.p.plan["entry"] == 99.0, sc.p.plan
+    assert sc.p.pending is None and sc.p._review_unparsed is None, "ответ разобран — строка «не разобран» снята"
+    st = sc.p.status()
+    assert st["last_review"]["label"] == "КУПИТЬ — засада (откат) @99", st["last_review"]
+    assert "засада взведена @99" in st["review_outcome"]["outcome"], st["review_outcome"]
+    assert "НЕ РАЗОБРАН" not in sc.p._situation_text(100.0)
+    await sc.settle_ai()
+    assert any(e["title"] == "Ответ PRO на перепроверке не разобран" for e in sc.xevents("review")), \
+        [e["title"] for e in sc.xevents()]
+    sc.note = "«ЗАСАДА» без уровней → не разобран, повод к плановой; «ЗАСАДА» 99/98 → КУПИТЬ, засада (откат) @99 взведена"
+
+
+async def s45_rhythm_30min(sc: Scene) -> None:
+    """v5.4.4 «ритм PRO» (воля владельца 30.09.2026: «только триггеры и раз в 30 мин»): вне рынка по приказу WAIT, 2 часа
+    виртуального времени без рыночных событий (цена в коридоре ±0.1 %, стакан живой), дежурный PRO отвечает ЖДЁМ без
+    уровня, молчит (таймаут), отвечает непонятным словом, снова ЖДЁМ — ровно 4 перепроверки PRO (по одной в
+    PYTHIA_WAIT_REVIEW_SEC), без быстрых повторов, без триажа, двери, мысли о прибыли, троса и совета."""
+    clock = [time.time()]
+    sc.patch(time, "time", lambda: clock[0])      # виртуальные часы: всё, что зовёт time.time(), живёт по ним
+    sc.p.plan = None
+    wait, err = mission._validate_exec({"do": "WAIT", "wait_for": "картина без перевеса", "why": "стенд: вне рынка",
+                                        "plan": "ждём"}, "auto", 100.0)
+    assert wait and not err and wait["levels"] == [], (wait, err)
+    assert sc.p.adopt_forecast({"exec": wait}) and sc.p.plan is None
+    sc.m.exec, sc.m.exec_ts = wait, clock[0]
+    t0 = clock[0]
+    sc.p._last_review_ts = t0                     # приказ совета только что — плановый взгляд через 30 мин
+    sc.p.review_ts = t0 + float(config.PYTHIA_WAIT_REVIEW_SEC)
+    fake_ai.queue("mission_review", {"choice": "ЖДЁМ", "why": "перевеса нет — жду 17:00 МСК"}, FakeAI.SILENT,
+                  {"choice": "ХЗ", "why": "непонятно"}, {"choice": "ЖДЁМ", "why": "картина та же"})
+    money = ("mission_entry", "mission_profit", "mission_guard", "mission_take", "event_triage")
+    council = ("mission_analysis", "mission_critique", "mission_verdict", "mission_exec")
+    seen: list[float] = []
+    for k in range(1, 122):                       # 121 тик по минуте: 2 часа и минута сверху (запас на округление)
+        clock[0] = t0 + 60.0 * k
+        n0 = fake_ai.count("mission_review")
+        await sc.tick(round(100.0 + 0.1 * ((k % 3) - 1), 2))
+        # фоновая перепроверка (_spawn_background) стартует на следующем обороте цикла событий — дождаться и её
+        assert await sc.settle(lambda: not sc.p._review_busy and all(t.done() for t in sc.p._background_tasks))
+        if fake_ai.count("mission_review") > n0:
+            seen.append(round((clock[0] - t0) / 60.0))
+    assert fake_ai.count("mission_review") == 4 and seen == [30, 60, 90, 120], (seen, fake_ai.summary())
+    assert not [r for r in money + council if fake_ai.count(r)], fake_ai.summary()
+    assert sc.p.plan is None and sc.p.pending is None and sc.p.position is None and not sc.broker.placed
+    assert [r["choice"] for r in sc.m.reviews] == ["ЖДЁМ", "ЖДЁМ"], sc.m.reviews
+    sc.note = f"2 ч без событий: PRO на {', '.join(f'{x} мин' for x in seen)} — ЖДЁМ / молчание / «ХЗ» / ЖДЁМ, повторов нет"
+
+
 SCENARIOS: list[tuple[str, Callable[[Scene], Awaitable[None]]]] = [
     ("гэп_за_трос", s01_gap_hard), ("гэп_за_триггер", s02_gap_trigger), ("мёртвый_рынок", s03_dead_market),
     ("рынок_закрыт", s04_market_closed), ("частичка_30042", s05_partial_then_30042),
@@ -3002,6 +3101,8 @@ SCENARIOS: list[tuple[str, Callable[[Scene], Awaitable[None]]]] = [
     # v5.4.4 «связь с брокером»: токен отозван — честно и без ИИ; заявки 40002 — без петли PRO; портфель не прочитан ≠ 0 лотов
     ("токен_отозван", s44_token_revoked), ("заявки_40002", s45_orders_rights),
     ("портфель_не_прочитан", s46_prepare_unread_portfolio),
+    # v5.4.4 «ритм PRO» и разбор слов: ЗАСАДА — сторона по уровням, без уровней — не разобран без петли; 2 часа — 4 PRO
+    ("ответ_засада", s44_ambush_answer), ("ритм_30_мин", s45_rhythm_30min),
 ]
 
 
@@ -3082,4 +3183,6 @@ if __name__ == "__main__":
           "засада у уровня, дрейф — один переспрос, второй ВОЙТИ по отношению исполнен или «ход отыгран»; "
           "v5.4.4: токен отозван — НЕТ_ДОСТУПА без "
           "ИИ и заявок, новый токен — связь сама; заявки 40002 — одна попытка, без петли PRO; закрытие 30042 — с паузой; "
-          "портфель не прочитан ≠ 0 лотов — state-файл цел)")
+          "портфель не прочитан ≠ 0 лотов — state-файл цел); "
+          "v5.4.4 «ритм PRO»: ответ ЗАСАДА — "
+          "сторона по уровням, без уровней — не разобран без петли повторов; 2 часа без событий — 4 перепроверки PRO)")

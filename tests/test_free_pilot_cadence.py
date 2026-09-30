@@ -254,8 +254,9 @@ def test_puncture_against_play_mode_stays_quiet(monkeypatch):
     asyncio.run(scenario())
 
 
-# ── 3. поводы пилота вне рынка без плана — перепроверка скоро ────────────────────────────────────────────────
-def test_stale_order_flat_pulls_review_soon():
+# ── 3. поводы пилота вне рынка без плана — v5.4.4: к ПЛАНОВОЙ перепроверке (воля владельца «только триггеры и раз в
+#       30 мин»; в 5.4.2 они звали PRO через EVENT_MIN_GAP_SEC — петли «перепроверка — отказ — перепроверка») ─────────
+def test_stale_order_flat_waits_planned_review():
     async def scenario():
         m, p = make_pilot()
         assert p.adopt_forecast(ex("BUY", entry=95.0, take=110.0, inv=93.0))     # засада ниже рынка
@@ -264,14 +265,15 @@ def test_stale_order_flat_pulls_review_soon():
         await tick(p, 100.0)
         assert p.plan is None and p.position is None and "приказ протух" in (p._review_reason or "")
         h = m.handoffs[-1]
-        assert h["kind"] == "pilot" and not h["deferred"] and h["reason"] == "приказ протух", h
-        assert p.review_ts <= time.time() + mission.EVENT_MIN_GAP_SEC + 1, p.review_ts - time.time()
+        assert h["kind"] == "pilot" and h["deferred"] and h["reason"] == "приказ протух", h
+        assert p.review_ts >= time.time() + 1790, p.review_ts - time.time()
+        assert "повод к плановой перепроверке" in p.last_action, p.last_action
         p.reanalyze_cb.assert_not_awaited()
 
     asyncio.run(scenario())
 
 
-def test_zero_lots_flat_pulls_review_with_reason():
+def test_zero_lots_flat_waits_planned_review_with_reason():
     async def scenario():
         m, p = make_pilot()
         p.broker.mx = {"buy": 8, "sell": 0}                  # шорт недоступен
@@ -280,8 +282,9 @@ def test_zero_lots_flat_pulls_review_with_reason():
         await tick(p, 100.0)
         assert p.plan is None and p.pending is None and not p.broker.placed
         h = m.handoffs[-1]
-        assert h["kind"] == "pilot" and not h["deferred"] and "биржа не даёт ни лота short" in h["reason"], h
-        assert p.review_ts <= time.time() + mission.EVENT_MIN_GAP_SEC + 1
+        assert h["kind"] == "pilot" and h["deferred"] and "биржа не даёт ни лота short" in h["reason"], h
+        assert p.review_ts >= time.time() + 1790, "лотов 0 — не рыночный повод: к плановой перепроверке"
+        assert "биржа не даёт ни лота short" in (p._review_reason or "")
 
     asyncio.run(scenario())
 
@@ -334,7 +337,7 @@ def _council_offline(monkeypatch, exec_answers, frame=None):
     return prompts
 
 
-def test_first_council_failure_starts_idle_pilot_with_review_soon(monkeypatch):
+def test_first_council_failure_starts_idle_pilot_with_planned_review(monkeypatch):
     _council_offline(monkeypatch, [{"do": "BUY"}, {"do": "BUY"}])     # без invalidation — приказ не собирается
 
     async def scenario():
@@ -347,7 +350,8 @@ def test_first_council_failure_starts_idle_pilot_with_review_soon(monkeypatch):
             assert m.pilot_alive() and m.phase == "idle" and mission.status("SBER")["phase"] == "idle", m.phase
             p = m.pilot
             assert p.plan is None and p.state == "ЖДУ_ПЛАН" and p.reanalyze_cb is not None
-            assert p.review_ts <= time.time() + mission.REVIEW_RETRY_SEC + 1
+            # v5.4.4: не через 5 мин (REVIEW_RETRY_SEC убран), а на плановой перепроверке — раньше будят триггеры
+            assert p.review_ts >= time.time() + float(config.PYTHIA_REVIEW_SEC) - 10, p.review_ts - time.time()
             assert (p._review_reason or "").startswith("совет не собрал приказ: приказ не собрался")
             assert p._review_reason.endswith("реши по живой картине") and "без плана" in m.note
         finally:
@@ -395,7 +399,8 @@ def test_flip_quiet_closes_young_position_without_reversal():
         assert p.adopt_forecast(ex("SELL", None, 90.0, 102.0)) is False
         assert p.position is pos and p.plan is None and p._close_pending, p.last_action
         assert "переворот отклонён" in p.last_action and "закрываю без переворота" in p.last_action
-        assert "закрыта без переворота" in (p._review_reason or "") and p.review_ts <= time.time() + 300
+        # v5.4.4: вход в другую сторону решит PRO по поводу «после закрытия» (PYTHIA_AFTER_CLOSE_SEC), не через 5 мин
+        assert "закрыта без переворота" in (p._review_reason or "") and p.review_ts > time.time() + 300
         for _ in range(4):
             await tick(p, 100.0)
             if p.position is None:
@@ -415,40 +420,67 @@ def test_flip_quiet_ignores_wait_and_same_side():
     assert p.position["take"] == 105.0, "та же сторона — обновил уровни, не закрыл"
 
 
-# ── 6. НОВЫЙ_АНАЛИЗ в окне совета — отложен, не потерян ───────────────────────────────────────────────────────
-def test_new_analysis_in_council_gap_is_deferred_then_fires():
+# ── 6. НОВЫЙ_АНАЛИЗ в окне совета — v5.4.4: не ждёт окна, чтобы запустить совет сам (тик §3б), а уходит поводом к
+#       плановой перепроверке; окно — от КОНЦА прошлого совета (воля владельца 30.09.2026) ───────────────────────────
+def test_new_analysis_in_council_gap_goes_to_planned_review():
     async def scenario():
         m, p = make_pilot()
         gap = float(config.PYTHIA_COUNCIL_GAP_SEC)
-        m.council_ts = time.time() - 600
+        m.council_ts, m.council_end_ts = time.time() - 2400, time.time() - 600   # начат 40 мин назад, кончился 10 мин назад
         p._last_reanalyze_ts = time.time() - 4000
         p.review_ts = time.time() + 1800
         why = "перепроверка потребовала свежий разбор: картина сломалась"
         p._fire_reanalyze(why, kind="council")
-        assert not p._reanalyzing and p._reanalyze_pending == why and "просьба отложена до окна" in p._council_blocked
-        assert p.review_ts <= m.council_ts + gap + 61, "перепроверка — к открытию окна"
+        assert not p._reanalyzing and p._reanalyze_pending is None, "совет сам не запустится"
+        assert "окно откроется в" in p._council_blocked and "от конца совета" in p._council_blocked, p._council_blocked
+        assert p._council_deferred == why and why in (p._review_reason or "")
+        assert p.review_ts >= time.time() + 1790, "повод к плановой, перепроверку не тянет"
         assert m.handoffs[-1]["kind"] == "council" and m.handoffs[-1]["deferred"]
         n_h = len(m.handoffs)
-        await tick(p, 100.0, n=2)                            # окно закрыто: просьба ждёт молча
-        assert p._reanalyze_pending == why and len(m.handoffs) == n_h
-        p.reanalyze_cb.assert_not_awaited()
-        m.council_ts = time.time() - gap - 1                 # окно открылось → тик §3б зовёт совет сам
+        await tick(p, 100.0, n=2)
+        m.council_end_ts = time.time() - gap - 1             # окно открылось — тик совет всё равно не зовёт
         await tick(p, 100.0)
+        p.reanalyze_cb.assert_not_awaited()
+        assert len(m.handoffs) == n_h and p._reanalyze_pending is None
+        # PRO на плановой снова сказал НОВЫЙ_АНАЛИЗ — окно открыто: совет
+        p._fire_reanalyze(why, kind="council")
+        assert p._reanalyzing
+        await settle_bg(p)
         p.reanalyze_cb.assert_awaited_once()
-        assert p._reanalyze_pending is None
 
     asyncio.run(scenario())
 
 
-def test_deferred_council_withdrawn_by_later_review_answer():
-    m, p = make_pilot()
-    m.council_ts = time.time() - 60
-    why = "перепроверка потребовала свежий разбор: x"
-    p._fire_reanalyze(why, kind="council")
-    assert p._reanalyze_pending == why
-    p._council_blocked = ""                                  # PRO ответил снова и совет не просил
-    p._deferred_council_watch()
-    assert p._reanalyze_pending is None and p._council_deferred is None
+def test_council_window_counts_from_end_not_start():
+    """Совет шёл 40 мин: начат 45 мин назад, кончился 5 мин назад — окно 30 мин от КОНЦА ещё закрыто (в 5.4.3 окно
+    считалось от начала и было бы открыто)."""
+    async def scenario():
+        m, p = make_pilot()
+        m.council_ts, m.council_end_ts = time.time() - 2700, time.time() - 300
+        assert 1400 <= mission._council_gap_left(m) <= 1500
+        p._fire_reanalyze("мягкий стоп: PRO решил ждать и передать задачу Совету — вынос", force=True, kind="stop")
+        assert not p._reanalyzing and m.handoffs[-1]["kind"] == "stop" and m.handoffs[-1]["deferred"], m.handoffs[-1]
+        assert "мягкий стоп" in (p._review_reason or "") and p.review_ts > time.time() + 1700
+        m.council_end_ts = time.time() - 1900                # окно открыто — просьба узла зовёт совет
+        p._fire_reanalyze("мягкий стоп: PRO решил ждать и передать задачу Совету — вынос", force=True, kind="stop")
+        assert p._reanalyzing and p._council_kind == "stop" and not m.handoffs[-1]["deferred"]
+        await settle_bg(p)
+        p.reanalyze_cb.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
+def test_deferred_parent_council_goes_to_planned_review():
+    """Страховка: отложенный пейсингом родителя совет (_reanalyze_pending) тик §3б сам не запускает — повод к плановой."""
+    async def scenario():
+        m, p = make_pilot()
+        p._reanalyze_pending = "перепроверка потребовала свежий разбор: x"
+        p._last_reanalyze_ts = time.time() - 4000
+        await tick(p, 100.0)
+        p.reanalyze_cb.assert_not_awaited()
+        assert p._reanalyze_pending is None and "свежий разбор: x" in (p._review_reason or "")
+
+    asyncio.run(scenario())
 
 
 def test_routing_by_kind_not_by_words_in_pro_why():
@@ -493,7 +525,8 @@ def test_council_timeout_unfreezes_pilot_and_keeps_position(offline, monkeypatch
         await settle_bg(p)
         assert not p._reanalyzing and p.position is pos, "разморожен, позиция на месте"
         assert m.council_task.done() and not m.council_running()
-        assert p.review_ts <= time.time() + mission.EVENT_MIN_GAP_SEC + 1
+        # v5.4.4: обрыв совета — не рыночный повод: плановая перепроверка (её срок не тянется к «через 3 мин»)
+        assert p.review_ts > time.time() + mission.EVENT_MIN_GAP_SEC + 60, p.review_ts - time.time()
         assert "совет не уложился" in (p._review_reason or "") and "прерван" in (m.error or "")
         assert any(r == "mission_council" for r, _ in fake.errors), fake.errors
         # ревью 5.4.2: окно совета — от обрыва: НОВЫЙ_АНАЛИЗ сразу после него ждёт окна, а не крутит «совет — обрыв»
@@ -501,7 +534,8 @@ def test_council_timeout_unfreezes_pilot_and_keeps_position(offline, monkeypatch
         assert "Последний полный совет прерван 0 мин назад (не уложился в срок)" in p._situation_text(100.0)
         monkeypatch.setattr(config, "PYTHIA_COUNCIL_GAP_SEC", 1800)
         p._fire_reanalyze("перепроверка потребовала свежий разбор: снова", kind="council")
-        assert not p._reanalyzing and p._reanalyze_pending == p._council_deferred, p.last_action
+        assert not p._reanalyzing and p._council_deferred and p._reanalyze_pending is None, p.last_action
+        assert "свежий разбор: снова" in (p._review_reason or "")
 
     asyncio.run(scenario())
 
@@ -550,8 +584,8 @@ def test_young_position_event_goes_to_triage(offline):
     asyncio.run(scenario())
 
 
-# ── 10. resume без приказа — перепроверка скоро ───────────────────────────────────────────────────────────────
-def test_resume_without_adopted_order_reviews_soon(monkeypatch):
+# ── 10. resume без приказа — v5.4.4: плановая перепроверка от последнего решения PRO (просрочена — сразу) ─────────
+def test_resume_without_adopted_order_reviews_on_plan(monkeypatch):
     async def fake_run(self):
         await asyncio.Event().wait()
 
@@ -567,13 +601,24 @@ def test_resume_without_adopted_order_reviews_soon(monkeypatch):
         mission._M["TEST"] = m
         m.exec = {"do": "WAIT", "entry": None, "entry_kind": "сейчас", "take": None, "invalidation": None,
                   "why": "нет перевеса", "wait_for": "уровень 101", "levels": [101.0]}
-        m.exec_ts = time.time()
+        m.exec_ts = time.time() - 7200                       # последний приказ совета — 2 ч назад: плановая просрочена
         r = await mission.resume("TEST")
         try:
             p = m.pilot
             assert r["ok"] and m.phase == "idle" and p.plan is None, r
             assert p.review_ts <= time.time() + max(ai_pilot.OPEN_REVIEW_GRACE_SEC, 120.0) + 1
             assert "пилот поднят заново: приказа нет — реши по живой картине" in (p._review_reason or "")
+        finally:
+            m.task.cancel()
+            await asyncio.gather(m.task, return_exceptions=True)
+        # решение PRO было 10 мин назад — плановая через 20 мин, а не «скоро»
+        m.pilot, m.task = None, None
+        m.reviews = [{"ts": time.time() - 600, "choice": "ЖДЁМ", "why": "т", "in_pos": False, "price": 100.0}]
+        r = await mission.resume("TEST")
+        try:
+            p = m.pilot
+            assert r["ok"] and 1100 <= p.review_ts - time.time() <= 1210, p.review_ts - time.time()
+            assert abs(p._last_review_ts - m.reviews[-1]["ts"]) < 1, "новости — с прошлого решения, не со старта"
         finally:
             m.task.cancel()
             await asyncio.gather(m.task, return_exceptions=True)
@@ -720,6 +765,6 @@ def test_two_triggers_same_tick_second_not_marked_deferred():
         p._ask_review_now("резкий ход +1.2%", kind="shock")
         p._ask_review_now("WAIT: цена прошла уровень 101", kind="wait_level")
         assert not m.handoffs[-1]["deferred"], m.handoffs[-1]
-        assert "через 0 мин" not in (p.last_action or "") or "решит через" in (p.last_action or "")
+        assert "дежурный PRO решит в" in (p.last_action or ""), p.last_action   # v5.4.4: время решения — абсолютное
 
     asyncio.run(scenario())

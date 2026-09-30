@@ -24,6 +24,19 @@ v5.3 — толмач и память (explain.py): после ключевых 
 m.memory (блок «ПАМЯТЬ МИССИИ» у аналитика/критика/вердикта, перепроверки, троса, чата) и режет сырые
 списки; новости старше последнего совета в перепроверку/трос не идут — они в памяти.
 
+v5.4.4 «РИТМ PRO» (воля владельца 30.09.2026: «если у тебя есть такое, чтобы он был работающим не раз в 30 мин и
+триггеры, то так не надо — только триггеры и только раз в 30 мин; также это про PRO»): PRO (перепроверка, триаж, совет по
+поводу) зовётся только (1) плановой перепроверкой раз в PYTHIA_REVIEW_SEC (при WAIT — PYTHIA_WAIT_REVIEW_SEC); (2)
+рыночным триггером — резкий ход, серьёзная новость (через триаж), проход уровня WAIT совета и будильника ЖДЁМ, прокол
+сканера, открытие рынка, закрытие позиции (через PYTHIA_AFTER_CLOSE_SEC), «идея мертва до входа», восстановление связи с
+брокером; (3) советом — старт миссии, НОВЫЙ_АНАЛИЗ, просьба узла (дверь, прибыль, трос, тейк) — не чаще
+PYTHIA_COUNCIL_GAP_SEC от КОНЦА прошлого совета, раньше — просьба поводом к плановой. Всё прочее — молчание / таймаут /
+неразобранный ответ перепроверки, отказ биржи, лотов 0, приказ протух, ОТМЕНИТЬ у двери, ВНЕ_РЕЖИМА — копится поводом
+(_review_reason) к СЛЕДУЮЩЕЙ ПЛАНОВОЙ перепроверке, быстрых повторов нет. Будильник ЖДЁМ — не ближе WAKE_MIN_PCT % и
+WAKE_MIN_TICKS шагов цены к цене решения и не чаще WAKE_MAX_PER_HOUR раз в час. Брокер недоступен (broker_ok) — PRO не
+зовётся вовсе; связь вернулась (_on_feed_change) — одна перепроверка с поводом. Решение перепроверки объявляется с
+фактическим исходом (засада взведена / вход сейчас / отложено / не исполнено / снято), у записи — метка модели (label).
+
 Self-тест (без сети): python3 -m backend.mission
 """
 from __future__ import annotations
@@ -40,6 +53,8 @@ from typing import Any
 from . import ledger  # noqa: E402  (v5.3 фаза 4 · W1: журнал по операциям брокера)
 from . import (ai, ai_pilot, ai_v5, bus, compress, config, correlate, instruments,
                market_ctx, prompts_mission, scout, store_v5, tinkoff, trader_broker)
+# v5.4.4: чистые помощники разбора слова решения (без сети) — напрямую: подмены ai_v5 в тестах и стендах их не прячут
+from .ai_v5 import ENTRY_ANY, REVIEW_CANCEL, ambush_of, echo_of, partial_of, side_by_levels
 
 try:                                                 # сканер стакана 4.x («8 ч»): онлайн-наблюдение
     from . import maya_scan
@@ -80,12 +95,31 @@ EXEC_FRESH_SEC = 2 * 3600.0     # приказ старше — протух, п
 # v5.4.2 «СВОБОДНЫЙ ПИЛОТ»: вне рынка без плана повод пилота зовёт PRO через EVENT_MIN_GAP_SEC (а не плановую);
 # приказ WAIT — уровни под наблюдением и ритм PYTHIA_WAIT_REVIEW_SEC; прокол без плана — «вне рынка»;
 # НОВЫЙ_АНАЛИЗ в окне совета отложен, не потерян; совет по поводу — не дольше PYTHIA_COUNCIL_MAX_SEC.
-REVIEW_RETRY_SEC = 300.0   # v5.3 фаза 3: PRO промолчал на перепроверке (таймаут / не JSON) → повтор через 5 мин, повод хранится
+# v5.4.4 (воля владельца): быстрого повтора перепроверки больше нет — REVIEW_RETRY_SEC (300 с после молчания, ВНЕ_РЕЖИМА,
+# совета без приказа) убран: молчание, таймаут, неразобранный ответ, вход против режима — повод к СЛЕДУЮЩЕЙ ПЛАНОВОЙ
+# перепроверке (PYTHIA_REVIEW_SEC), ответ не разобран — строка «ПРОШЛЫЙ ОТВЕТ … НЕ РАЗОБРАН» в её ситуации.
 PILOT_REASONS = ("приказ протух", "идея мертва до входа", "после закрытия", "внешнее закрытие",
                  "серия отказов биржи", "вход невозможен")
 # поводы пилота «позиция закрыта» — строки кода (AIPilot._finish_closed / _reconcile), узнаются по НАЧАЛУ, а не по
 # подстроке «закрыт» в свободном тексте ИИ («закрытие часа ниже 100» в причине отмены у двери — не закрытие позиции)
 CLOSED_REASONS = ("после закрытия", "внешнее закрытие")
+DEAD_REASON = "идея мертва до входа"   # v5.4.4: рыночный триггер (цена прошла стоп до входа) — PRO зовётся, не копится
+# v5.4.4: виды поводов. Рыночные триггеры будят дежурного PRO (с пейсингом); прочие копятся к плановой перепроверке
+TRIGGER_KINDS = ("shock", "news", "puncture", "wait_level", "open", "dead", "event")
+QUIET_KINDS = ("pilot", "council", "take", "stop", "entry", "profit")
+# v5.4.4: будильник ЖДЁМ (лестница будильников в тренде давала 5–9 перепроверок в час, живой прогон на моке — раз в
+# ~4 мин): уровень не ближе max(WAKE_MIN_PCT % цены, WAKE_MIN_TICKS шагов цены) к цене решения — ближе код не ставит;
+# уровни (будильник ЖДЁМ и уровни приказа WAIT совета вместе) будят PRO не чаще LEVEL_MAX_PER_HOUR раз в час —
+# дальнейший проход уровня копится поводом к плановой перепроверке
+WAKE_MIN_PCT = 0.3
+WAKE_MIN_TICKS = 3
+LEVEL_MAX_PER_HOUR = 2
+# v5.4.4: что сказать модели, если её ответ перепроверки не разобран (строка «ПРОШЛЫЙ ОТВЕТ … НЕ РАЗОБРАН» в ситуации)
+UNPARSED_HINT = "choice — одно слово из списка; засада — КУПИТЬ/ПРОДАТЬ с entry и entry_kind"
+UNPARSED_ECHO = "в choice — список вариантов; нужно одно слово из списка"
+UNPARSED_PARTIAL = "частичного закрытия нет: ЗАКРЫТЬ всё или ДЕРЖАТЬ"
+UNPARSED_SIDELESS = ("вход без стороны и без уровней: КУПИТЬ/ПРОДАТЬ с entry, entry_kind и invalidation (засада — с "
+                     "entry числом)")
 GUARD_LIGHT_TIMEOUT = 15.0      # мягкий стоп: живой рынок для FLASH — не дольше N с
 GUARD_SCOUT_TIMEOUT = 12.0      # …и свежие данные разведки — не дольше N с
 SCOUT_REVIEW_TIMEOUT = 20.0     # перепроверка: обновить данные разведки — не дольше N с
@@ -250,6 +284,9 @@ class Mission:
         self.exec_ts: float | None = None
         self.council_ts: float = 0.0    # когда последний раз шёл полный совет (пейсинг автоматических советов)
         self.council_dur: float | None = None   # v5.4.3: сколько длился последний совет (с) — цена НОВЫЙ_АНАЛИЗ в ситуации
+        # v5.4.4 (воля владельца): когда последний полный совет закончился (приказ, сбой, обрыв) — окно
+        # PYTHIA_COUNCIL_GAP_SEC для совета по поводу считается от КОНЦА, а не от начала (совет идёт десятки минут)
+        self.council_end_ts: float = 0.0
         self.frame: dict | None = None
         self.texts: dict = {}
         self.news: list[dict] = []
@@ -295,6 +332,19 @@ class Mission:
 
 _M: dict[str, Mission] = {}
 _last_resume_ts = 0.0
+
+
+def _council_gap_left(m: Mission | None, now: float | None = None) -> float:
+    """v5.4.4: сколько секунд до открытия окна совета по поводу (PYTHIA_COUNCIL_GAP_SEC от КОНЦА прошлого совета; 0 —
+    окно открыто). Совет идёт — окно закрыто на весь шаг. Конец не записан (совет прошлой версии) — от начала."""
+    gap = float(getattr(config, "PYTHIA_COUNCIL_GAP_SEC", 1800) or 0)
+    if m is None or gap <= 0:
+        return 0.0
+    if m.council_running():
+        return gap
+    now = time.time() if now is None else now
+    end = _f(getattr(m, "council_end_ts", 0.0), 0.0) or _f(getattr(m, "council_ts", 0.0), 0.0) or 0.0
+    return max(0.0, gap - (now - end)) if end else 0.0
 
 
 def _persist(m: Mission) -> bool:
@@ -662,16 +712,41 @@ def _render_all(nf, items: list[dict]) -> str:
 
 async def _enrich_news(m: Mission, rid: str | None, timeout: float = 480.0) -> None:
     """Google News по инструменту → отбор → разметка (newsflow.enrich_ticker).
-    Молчит без флага PYTHIA_GNEWS и без функции; любой сбой — только лог."""
+    Молчит без флага PYTHIA_GNEWS и без функции; любой сбой — только лог.
+    v5.4.4 (отчёт проверяющего A2): стадия «news» не висит в start — срок вышел (wait_for) или задачу сняли: сам
+    enrich_ticker закрывает стадию «error» и пробрасывает отмену; здесь — страховка для соседнего модуля без этого
+    (фейк, старая версия): «error» с причиной. Отмена снаружи (перепроверку/совет сняли) пробрасывается."""
     nf = _mod("newsflow")
     fn = getattr(nf, "enrich_ticker", None) if nf else None
     if not fn or not getattr(config, "PYTHIA_GNEWS", True):
         return
+    run = rid or m.run_id or "mission"
     try:
-        await asyncio.wait_for(fn(rid or m.run_id or "mission", m.ticker, m.name, m.asset_class,
+        await asyncio.wait_for(fn(run, m.ticker, m.name, m.asset_class,
                                   float(getattr(config, "PYTHIA_V5_DAYS", 3))), timeout)
+    except asyncio.TimeoutError:
+        log.info("целевые новости %s: не уложились в %d с", m.ticker, int(timeout))
+        if not _enrich_closes_stage(fn):
+            try:
+                await bus.stage("mission", run, "news", "error", ticker=m.ticker,
+                                detail=f"Google News по {m.ticker}: не уложились в {int(timeout)} с — решаю без них")
+            except Exception:                        # noqa: BLE001
+                pass
+    except asyncio.CancelledError:
+        if not _enrich_closes_stage(fn):
+            try:
+                await bus.stage("mission", run, "news", "error", ticker=m.ticker,
+                                detail=f"Google News по {m.ticker}: сбор прерван")
+            except Exception:                        # noqa: BLE001
+                pass
+        raise
     except Exception as e:                           # noqa: BLE001
         log.info("целевые новости %s: %s", m.ticker, str(e)[:100])
+
+
+def _enrich_closes_stage(fn) -> bool:
+    """newsflow.enrich_ticker 5.4.4 сам закрывает стадию «news» при отмене (флаг closes_stage_on_cancel)."""
+    return bool(getattr(fn, "closes_stage_on_cancel", False))
 
 
 async def _news_for(m: Mission, rid: str | None = None) -> tuple[list[dict], str]:
@@ -767,6 +842,57 @@ def _exec_text(m: Mission, price: float | None = None) -> str:
             f"План: {ex.get('plan')}\nТайминг: {ex.get('time_note')}")
 
 
+def _exec_how(ex: dict | None) -> str:
+    """v5.4.4 (D6): вид входа приказа BUY/SELL словами — «вход сейчас», «засада (откат) @296.6», «на пробитии @303.83»
+    (а не «вход 303.83», что читалось как вход по цене)."""
+    ex = ex or {}
+    e = _f(ex.get("entry"))
+    if not e:
+        return "вход сейчас"
+    kind = str(ex.get("entry_kind") or ex.get("kind") or "").strip().lower()
+    return f"на пробитии @{e:g}" if kind == "прорыв" else f"засада (откат) @{e:g}"
+
+
+def _pilot_broker_ok(p) -> bool:
+    """v5.4.4: связь пилота с брокером есть? (AIPilot.broker_ok — агент Y; метода нет — есть)."""
+    try:
+        return bool(getattr(p, "broker_ok", lambda: True)())
+    except Exception:                                # noqa: BLE001
+        return True
+
+
+def _killswitch_why(p) -> str | None:
+    """v5.4.4 (D4): killswitch пилота заперт → текст с причиной и сроком, иначе None (AIPilot.killswitch_reason — агент
+    Y; метода нет — по session_risk)."""
+    if p is None:
+        return None
+    why = None
+    fn = getattr(p, "killswitch_reason", None)
+    try:
+        if callable(fn):
+            why = fn()
+            if not why:
+                return None
+        else:
+            sr = getattr(p, "session_risk", None)
+            if sr is None or not getattr(sr, "locked", False):
+                return None
+            why = (sr.state() or {}).get("reason")
+    except Exception:                                # noqa: BLE001
+        return None
+    why = str(why or "").strip()
+    return f"killswitch заблокирован{(' (' + why + ')') if why else ''} — торговля стоит до нового торгового дня"
+
+
+def _refused_why(p) -> str:
+    """v5.4.4 (D4): почему пилот не принял приказ совета — adopt_refused пилота (AIPilot, агент Y; MissionPilot ставит его
+    и сам — переворот при молодой позиции), иначе killswitch (с причиной и сроком), иначе его last_action."""
+    if p is None:
+        return "пилота нет"
+    why = str(getattr(p, "adopt_refused", None) or "").strip()
+    return (why or _killswitch_why(p) or str(getattr(p, "last_action", "") or "причина не названа"))[:300]
+
+
 _LABEL_ENTRY = {"КУПИТЬ_СЕЙЧАС": "КУПИТЬ", "ПРОДАТЬ_СЕЙЧАС": "ПРОДАТЬ"}
 
 
@@ -779,7 +905,28 @@ def _choice_label(r: dict | None) -> str:
         return _LABEL_ENTRY[c]
     if c == "ЖДЁМ" and (r or {}).get("in_pos"):
         return "ДЕРЖАТЬ"
+    if c == REVIEW_CANCEL:                     # v5.4.4: «снять взведённый вход» — модель выбирала «ОТМЕНИТЬ»
+        return "ОТМЕНИТЬ"
     return c
+
+
+def _decision_label(r: dict | None) -> str:
+    """v5.4.4: метка решения перепроверки для панели и Telegram — как выбирала модель и с деталями: «КУПИТЬ — засада
+    (откат) @296.6», «ПРОДАТЬ — вход сейчас», «ЖДЁМ — будильник 304», «ДЕРЖАТЬ — трос 299 → 300», «ОТМЕНИТЬ»,
+    «ПРОДАТЬ — против режима long». Детали — из записи (что сделал код), а не из пересказа."""
+    r = r or {}
+    base = _choice_label(r)
+    c = str(r.get("choice") or "")
+    if c == "ВНЕ_РЕЖИМА":
+        return f"{_choice_label({'choice': r.get('ai_choice')}) or '?'} — против режима игры"
+    if c in _LABEL_ENTRY:
+        return f"{base} — {_exec_how({'entry': r.get('entry'), 'entry_kind': r.get('entry_kind')})}"
+    if c == "ЖДЁМ" and not r.get("in_pos") and _f(r.get("wake")):
+        return f"{base} — будильник {_f(r.get('wake')):g}"
+    rt = r.get("retune") if isinstance(r.get("retune"), dict) else {}
+    if c == "ЖДЁМ" and r.get("in_pos") and rt.get("applied"):
+        return f"{base} — " + ", ".join(rt["applied"])
+    return base
 
 
 def _streak_of(streak: dict | None) -> dict | None:
@@ -963,6 +1110,16 @@ async def _partners_block(m: Mission, rid: str | None) -> str:
         return m.partners_text or ""
 
 
+POS_UNKNOWN = "ПОЗИЦИЯ НА СЧЁТЕ НЕИЗВЕСТНА"
+
+
+def _pos_known(text: Any) -> bool:
+    """v5.4.4: строка позиции для совета говорит, что позиция ЕСТЬ? «ПОЗИЦИЯ НА СЧЁТЕ НЕИЗВЕСТНА: …» (счёт не прочитан —
+    _account_position_text, агент Y) — не «есть»: иначе WAIT совета отклонялся бы как «WAIT только без позиции»."""
+    t = str(text or "").strip()
+    return bool(t) and not t.startswith(POS_UNKNOWN)
+
+
 def _position_text(m: Mission) -> str:
     """Открытая позиция пилота одной строкой (для совета и шифровальщика): сторона, лоты,
     вход, сколько в рынке, плавающий P/L, трос, тейк. Пилота нет — позиция на счёте
@@ -1114,6 +1271,30 @@ def _tolmach(m: Mission | None, kind: str, title: str, detail: str = "", refs: d
         explain.note(m, kind, title, detail, refs, ctx=lambda: _explain_ctx(m), persist=lambda: _persist(m))
     except Exception as e:                           # noqa: BLE001
         log.info("толмач %s: %s", m.ticker, str(e)[:100])
+
+
+def _pilot_note(m: Mission | None, detail: str, data: dict | None = None, final: str = "done") -> None:
+    """v5.4.4 (отчёт проверяющего A1): событие пилота в шину с ИТОГОМ, а не одним «progress». Было: «pilot progress» на
+    каждом поводе/входе/закрытии и «pilot done» только в конце совета — пилюля «Пилот» в степпере горела (пульс) часами.
+    Стало: final="done" — «progress» с detail (хроника панели, Telegram по словам узла) и сразу «done» без detail (Telegram
+    до 5.4.4 на «pilot done» с detail писал «пилот остановился», с 5.4.4 агента Y — только при отказе / настоящей
+    остановке; без detail молчит в обоих случаях; текст — в data.note); final="error" — одно «error» с detail (панель
+    проблем, Telegram «⚠️»). Фоном, сбой шины — только лог."""
+    if m is None:
+        return
+    rid, t = m.run_id, m.ticker
+    extra = {"data": data} if data else {}
+
+    async def _two() -> None:
+        try:
+            if final == "error":
+                await bus.stage("mission", rid, "pilot", "error", ticker=t, detail=detail, **extra)
+                return
+            await bus.stage("mission", rid, "pilot", "progress", ticker=t, detail=detail, **extra)
+            await bus.stage("mission", rid, "pilot", "done", ticker=t, data={"note": str(detail or "")[:300]})
+        except Exception as e:                       # noqa: BLE001
+            log.info("шина: событие пилота %s: %s", t, str(e)[:80])
+    _bg(_two())
 
 
 def _memorize(m: Mission | None, why: str) -> None:
@@ -1273,7 +1454,14 @@ async def _council(m: Mission, reason: str, first: bool) -> dict | None:
                 continue
             m.sizes["exec"] = _sizes_rec(len(u), eb, _json_len(raw))
             ps_side = (getattr(m.pilot, "position", None) or {}).get("side") if m.pilot is not None else None
-            ex, err = _validate_exec(raw, m.play, price, in_pos=bool(pctx.get("position")), pos_side=ps_side)
+            # v5.4.4: «ПОЗИЦИЯ НА СЧЁТЕ НЕИЗВЕСТНА» (счёт не прочитан, агент Y) — не «позиция есть»: WAIT / BUY / SELL
+            # законны; вердикт «на случай позиции» (HOLD / CLOSE) — тоже (пилот сверит со счётом)
+            pos_known = _pos_known(pctx.get("position"))
+            ex, err = _validate_exec(raw, m.play, price, in_pos=pos_known, pos_side=ps_side)
+            if ex is None and pctx.get("position") and not pos_known:
+                ex2, _err2 = _validate_exec(raw, m.play, price, in_pos=True, pos_side=ps_side)
+                if ex2:
+                    ex, err = ex2, None
             err_code = err
             if ex:
                 break
@@ -1288,7 +1476,7 @@ async def _council(m: Mission, reason: str, first: bool) -> dict | None:
                                 f"WAIT — вне рынка, ждём: {ex.get('wait_for')}" if ex["do"] == "WAIT" else
                                 f"HOLD — держать позицию без добора: стоп {_lvl_s(ex.get('invalidation'))}, "
                                 f"тейк {_lvl_s(ex.get('take'))}" if ex["do"] == "HOLD" else
-                                f"{ex['do']} вход {ex['entry'] if ex['entry'] is not None else 'сейчас'} "
+                                f"{ex['do']} {_exec_how(ex)}, "          # v5.4.4 (D6): вид входа в деталях приказа
                                 f"тейк {ex['take']} стоп {ex['invalidation']:g}") + " · "
                                f"ответ {_fmt_n(m.sizes.get('exec', {}).get('answer', 0))} симв.", data=ex)
 
@@ -1308,24 +1496,33 @@ async def _council(m: Mission, reason: str, first: bool) -> dict | None:
         m.news = news_items[:30]
 
         # 4. пилот (v5.4.2: приказ — пилоту сразу, до косметической рамки: до 240 с дрейфа против цены совета нет)
+        m.council_end_ts = m.exec_ts                 # v5.4.4: окно совета по поводу — от КОНЦА этого совета
         await bus.stage("mission", rid, "pilot", "start", ticker=m.ticker)
+        adopted: bool | None = None
         if tinkoff.enabled():
             if not m.pilot_alive():
                 pilot = MissionPilot(m.ticker, deposit=m.deposit, broker=_make_broker(), mission=m)
                 _bind_pilot(m, pilot)
                 m.pilot = pilot
-                pilot.adopt_forecast({"exec": ex})
+                adopted = pilot.adopt_forecast({"exec": ex})
                 # v5.4.4: «пилот запущен» — только после успешной подготовки (счёт, портфель, контракт): не поднялся —
                 # причина в m.error, фаза error (_pilot_prepared / _pilot_done), а не тихая смерть под «запущен»
                 _launch_pilot(m, pilot)
                 m.note = f"пилот запускается ({pilot.broker.mode}): готовлю счёт и контракт; {pilot.last_action}"
             else:
-                took = m.pilot.adopt_forecast({"exec": ex})
-                m.note = (f"пилот принял свежий приказ: {m.pilot.last_action}" if took else
-                          f"приказ не принят пилотом: {getattr(m.pilot, 'adopt_refused', None) or m.pilot.last_action}")
-            # v5.4.1: WAIT — пилот без плана (фаза idle), дежурный PRO вернётся к вопросу на перепроверке
-            m.phase = ("in_position" if ex["do"] in ("CLOSE", "HOLD") else "idle" if ex["do"] == "WAIT" else
-                       "armed" if ex["entry"] is not None else "entering")
+                adopted = m.pilot.adopt_forecast({"exec": ex})
+                m.note = (f"пилот принял свежий приказ: {m.pilot.last_action}" if adopted else
+                          f"приказ не принят пилотом: {_refused_why(m.pilot)}")
+            if adopted:
+                # v5.4.1: WAIT — пилот без плана (фаза idle), дежурный PRO вернётся к вопросу на перепроверке
+                m.phase = ("in_position" if ex["do"] in ("CLOSE", "HOLD") else "idle" if ex["do"] == "WAIT" else
+                           "armed" if ex["entry"] is not None else "entering")
+            else:
+                # v5.4.4 (D4): пилот приказ НЕ принял (killswitch, HOLD без позиции, переворот при молодой позиции) —
+                # честно: не «пилот принял свежий приказ», а почему нет (Telegram: «приказ не принят» — ⛔ сразу)
+                m.note = f"приказ не принят пилотом: {_refused_why(m.pilot)}"
+                m.phase = "in_position" if getattr(m.pilot, "position", None) else "idle"
+                log.warning("миссия %s: %s", m.ticker, m.note)
             await bus.stage("mission", rid, "pilot", "done", ticker=m.ticker, detail=m.note)
         else:
             m.phase = "idle"
@@ -1345,8 +1542,10 @@ async def _council(m: Mission, reason: str, first: bool) -> dict | None:
             title = (f"Совет решил держать позицию (HOLD, без добора): стоп {_lvl_s(ex.get('invalidation'))}, "
                      f"тейк {_lvl_s(ex.get('take'))}")
         else:
-            title = (f"Совет вынес приказ: {ex['do']} " + ("сейчас" if ex["entry"] is None else f"{ex['entry_kind']} @{ex['entry']:g}")
+            title = (f"Совет вынес приказ: {ex['do']} {_exec_how(ex)}"
                      + (f", тейк {ex['take']:g}" if ex.get("take") is not None else ", без тейка") + f", стоп {ex['invalidation']:g}")
+        if adopted is False:                         # v5.4.4 (D4): приказ не принят — так и сказать владельцу
+            title = f"Совет вынес приказ, но пилот его не принял: {_refused_why(m.pilot)}"[:200]
         _tolmach(m, "council", title,
                  f"{ex.get('why') or ''}. План: {ex.get('plan') or '—'}. Тайминг: {ex.get('time_note') or '—'}. Пилот: {m.note}",
                  refs={"do": ex["do"], "entry": ex["entry"], "take": ex["take"], "invalidation": ex["invalidation"],
@@ -1358,6 +1557,7 @@ async def _council(m: Mission, reason: str, first: bool) -> dict | None:
     except asyncio.CancelledError:
         if m.council_ts and m.run_id == rid:          # ревью 5.4.3: прерванный совет (PYTHIA_COUNCIL_MAX_SEC) тоже
             m.council_dur = max(0.0, time.time() - float(m.council_ts))   # держал пилот — его длительность видна PRO
+            m.council_end_ts = time.time()           # v5.4.4: окно совета по поводу — от конца (обрыва)
         if m.auto_resume:
             m.phase, m.error = "error", "совет прерван"
             bus.end_run(rid, error=m.error)
@@ -1371,6 +1571,7 @@ async def _council(m: Mission, reason: str, first: bool) -> dict | None:
         m.error = msg
         if m.council_ts:                             # v5.4.3: и неудачный совет держал пилот — его длительность видна PRO
             m.council_dur = max(0.0, time.time() - float(m.council_ts))
+        m.council_end_ts = time.time()               # v5.4.4: окно совета по поводу — от конца (сбоя)
         m.phase = "error" if not m.pilot_alive() else m.phase
         m.note = f"совет не завершился: {msg}"
         try:
@@ -1412,23 +1613,25 @@ async def _present_bg(m: Mission, rid: str | None, payload: dict) -> None:
 
 def _pilot_without_plan(m: Mission, err: str) -> None:
     """v5.4.2: первый совет не собрал приказ (приказ не прошёл проверку / таймаут / обрыв стрима) — миссия не умирает
-    в фазе error: пилот поднимается БЕЗ плана (ЖДУ_ПЛАН, фаза idle), дежурный PRO решит через REVIEW_RETRY_SEC
-    по живой картине (сам войдёт, будет ждать или позовёт совет)."""
+    в фазе error: пилот поднимается БЕЗ плана (ЖДУ_ПЛАН, фаза idle), дежурный PRO решит по живой картине (сам войдёт,
+    будет ждать или позовёт совет). v5.4.4 (воля владельца «только триггеры и раз в 30 мин»): не через 5 мин, а на
+    плановой перепроверке (PYTHIA_REVIEW_SEC от старта пилота); раньше его будят только рыночные триггеры."""
     pilot = MissionPilot(m.ticker, deposit=m.deposit, broker=_make_broker(), mission=m)
     _bind_pilot(m, pilot)
     m.pilot = pilot
     rr = f"совет не собрал приказ: {err} — реши по живой картине"
     pilot.state = "ЖДУ_ПЛАН"
-    pilot.review_ts = time.time() + REVIEW_RETRY_SEC
     pilot._review_reason, pilot._review_kind = rr, "pilot"
-    pilot.last_action = (f"совет не собрал приказ — пилот поднят без плана, дежурный PRO решит через "
-                         f"{int(REVIEW_RETRY_SEC // 60)} мин")
+    wait = max(0, int(pilot.review_ts - time.time()))
+    pilot.last_action = (f"совет не собрал приказ — пилот поднят без плана, дежурный PRO решит на плановой перепроверке "
+                         f"в {MissionPilot._hhmm(pilot.review_ts)} (через {wait // 60} мин)")
     _launch_pilot(m, pilot)
     m.phase = "idle"
     m.note = f"пилот запускается без плана ({pilot.broker.mode}): {pilot.last_action}"
     log.warning("миссия %s: %s (%s)", m.ticker, m.note, err)
     _tolmach(m, "council", "Совет не собрал приказ — пилот без плана",
-             f"{err}. Дежурный PRO решит по живой картине через {int(REVIEW_RETRY_SEC // 60)} мин.",
+             f"{err}. Дежурный PRO решит по живой картине на плановой перепроверке в "
+             f"{MissionPilot._hhmm(pilot.review_ts)}; раньше — только по рыночному поводу.",
              refs={"error": err[:200]})
 
 
@@ -1548,6 +1751,14 @@ class MissionPilot(ai_pilot.AIPilot):
         # max(шаг цены, WAKE_TOL_PCT %)) повторно не будит, пока не прошло PYTHIA_EVENT_COOL_SEC (нет пинг-понга у уровня)
         self._wake_fired: list[dict] = []
         self._flat: dict | None = None           # v5.4.3: вне рынка с {ts}, мин/макс цены за это время — факт для ситуации
+        # v5.4.4: прошлый ответ перепроверки не разобран {ts, raw, hint} — строка в ситуации следующей (плановой)
+        self._review_unparsed: dict | None = None
+        # v5.4.4: когда уровни (WAIT совета, будильник ЖДЁМ) будили PRO — не чаще LEVEL_MAX_PER_HOUR раз в час
+        self._level_wakes: list[float] = []
+        # v5.4.4: поводы, пришедшие, пока шёл совет (он их не видел) — переживают его приказ, копятся к плановой
+        self._mid_council: list[str] = []
+        # v5.4.4: исход последнего решения перепроверки {ts, label, outcome} — для панели (status «review_outcome»)
+        self._review_outcome: dict | None = None
         if mission:
             self.name = mission.name or self.name
             self.asset_class = mission.asset_class or self.asset_class
@@ -1714,9 +1925,31 @@ class MissionPilot(ai_pilot.AIPilot):
             if self._review_busy:                    # PRO думает прямо сейчас — повод поднимем, когда он ответит
                 return
             st["fired"][key] = now
-            self._ask_review_now(f"WAIT: цена {price:g} прошла уровень {lvl:g} из приказа совета — реши по живой картине",
-                                 kind="wait_level")
+            # v5.4.4: уровни будят PRO не чаще LEVEL_MAX_PER_HOUR раз в час (вместе с будильником ЖДЁМ), дальше — к плановой
+            self._level_wake(f"WAIT: цена {price:g} прошла уровень {lvl:g} из приказа совета — реши по живой картине")
             return
+
+    def _level_quota_left(self, now: float | None = None) -> int:
+        """v5.4.4: сколько ещё раз за скользящий час уровни (WAIT совета, будильник ЖДЁМ) могут разбудить PRO."""
+        now = time.time() if now is None else now
+        self._level_wakes = [t for t in self._level_wakes if now - t < 3600.0]
+        return max(0, LEVEL_MAX_PER_HOUR - len(self._level_wakes))
+
+    def _level_wake(self, why: str) -> bool:
+        """v5.4.4: проход уровня (WAIT совета или будильник ЖДЁМ). В пределах LEVEL_MAX_PER_HOUR за час — внеплановая
+        перепроверка kind «wait_level» (пейсинг _ask_review_now: EVENT_MIN_GAP_SEC после ответа, запас открытия рынка);
+        сверх — повод копится к плановой перепроверке (kind «pilot»): лестница уровней в тренде не будит PRO каждые
+        несколько минут (живой прогон на моке: раз в ~4 мин). Возврат: разбудили PRO?"""
+        now = time.time()
+        if self._level_quota_left(now) <= 0:
+            first = min(self._level_wakes) if self._level_wakes else now
+            self._ask_review_now(f"{why} (уровни будили PRO уже {LEVEL_MAX_PER_HOUR} раза за час, следующий раз — после "
+                                 f"{self._hhmm(first + 3600.0)}; повод — к плановой)", kind="pilot")
+            return False
+        pulled = bool(self._ask_review_now(why, kind="wait_level"))
+        if pulled:
+            self._level_wakes.append(now)
+        return pulled
 
     def _flat_track(self, price: float) -> None:
         """v5.4.3: сколько пилот вне рынка и где ходила цена за это время (мин/макс по тикам) — факт для строки «ЖДЁМ
@@ -1768,13 +2001,19 @@ class MissionPilot(ai_pilot.AIPilot):
 
     def _wake_fire(self, price: float, w: dict, note: str = "") -> None:
         """Будильник сработал: пометка fired, уровень — в память сработавших (D2), повод «wait_level» дежурному PRO
-        (пейсинг _ask_review_now: EVENT_MIN_GAP_SEC после ответа и запас открытия рынка)."""
+        (пейсинг _ask_review_now: EVENT_MIN_GAP_SEC после ответа и запас открытия рынка). v5.4.4: не чаще
+        LEVEL_MAX_PER_HOUR раз в час вместе с уровнями WAIT (_level_wake) — сверх того проход копится к плановой."""
         now = time.time()
         lvl = _f(w.get("level"), 0.0)
         w["fired"] = now
         self._wake_fired.append({"level": lvl, "ts": now})
-        self._ask_review_now(f"цена {price:g} прошла уровень {lvl:g}, который ты назвал в ЖДЁМ {self._hhmm(w.get('ts'))}"
-                             f"{note} — реши по живой картине", kind="wait_level")
+        self._level_wake(f"цена {price:g} прошла уровень {lvl:g}, который ты назвал в ЖДЁМ {self._hhmm(w.get('ts'))}"
+                         f"{note} — реши по живой картине")
+
+    def _wake_min_dist(self, price: float) -> float:
+        """v5.4.4: ближе этого к цене решения будильник не ставится — max(WAKE_MIN_PCT % цены, WAKE_MIN_TICKS шагов)."""
+        return max(abs(float(price)) * WAKE_MIN_PCT / 100.0,
+                   WAKE_MIN_TICKS * (_f(getattr(self, "tick_size", 0.0), 0.0) or 0.0))
 
     def _wake_drop(self, why: str) -> None:
         """Снять будильник явным событием (совет начался, новый приказ) — с записью в лог, не молча."""
@@ -1813,16 +2052,16 @@ class MissionPilot(ai_pilot.AIPilot):
         self._wake_fire(price, w)
 
     def _deferred_council_watch(self) -> None:
-        """v5.4.2: НОВЫЙ_АНАЛИЗ, отложенный окном совета, ждёт открытия окна (тик §3б зовёт его сам). Снимается, если
-        совет уже прошёл (родитель очистил _reanalyze_pending) или дежурный PRO с тех пор ответил и совет не просил
-        снова (_council_blocked стёрт его ответом) — решает ИИ, а не старая просьба."""
-        dfr = self._council_deferred
-        if not dfr:
+        """v5.4.4 (воля владельца «только триггеры и раз в 30 мин»): совет, отложенный пейсингом родителя
+        (_reanalyze_pending — тик §3б запустил бы его сам, как только окно откроется), сам не запускается: просьба
+        уходит поводом к плановой перепроверке, дежурный PRO решит (НОВЫЙ_АНАЛИЗ после окна). MissionPilot окно считает
+        сам (от конца совета) и родителю отдаёт force — это страховка, чтобы тик §3б совет не звал никогда.
+        (v5.4.2: НОВЫЙ_АНАЛИЗ в окне ждал открытия окна и запускался тиком — снято.)"""
+        why = self._reanalyze_pending
+        if not why:
             return
-        if self._reanalyze_pending != dfr or not self._council_blocked:
-            if self._reanalyze_pending == dfr:
-                self._reanalyze_pending = None
-            self._council_deferred = None
+        self._reanalyze_pending = None
+        self._ask_review_now(f"{why} (совет по поводу — к плановой перепроверке)", kind="council")
 
     def _shock_watch(self, price: float) -> None:
         """Резкий ход: цена за окно PYTHIA_SHOCK_WIN_SEC ушла от края окна на PYTHIA_SHOCK_PCT % →
@@ -2086,6 +2325,11 @@ class MissionPilot(ai_pilot.AIPilot):
             s += "; код переставил: " + ", ".join(rt["applied"])
         if rt.get("refused"):
             s += "; код не принял: " + "; ".join(rt["refused"])
+        if lr.get("wake_refused"):                       # v5.4.4: будильник у самой цены код не ставит — и говорит это
+            s += "; код не принял: " + str(lr["wake_refused"])
+        out = self._review_outcome or {}
+        if out.get("outcome") and abs(_f(out.get("ts"), 0.0) - ts) < 600:   # v5.4.4: что вышло из решения фактом
+            s += f"; итог: {out['outcome']}"
         return s
 
     def _wait_streak_line(self, price: float, now: float) -> str:
@@ -2142,6 +2386,9 @@ class MissionPilot(ai_pilot.AIPilot):
         mline = self._market_line()
         if mline:
             L.append("РЫНОК: " + mline)
+        feed_line = self._feed_line(now)               # v5.4.4: связи с брокером нет — факт первым делом
+        if feed_line:
+            L.append(feed_line)
         h = self._px_hist
         if h and h[0][1] > 0 and now - h[0][0] >= 60:
             lo = min(p for _, p in h)
@@ -2206,11 +2453,18 @@ class MissionPilot(ai_pilot.AIPilot):
         acc_line = self._account_line()
         if acc_line:
             L.append(acc_line + " — размер входа/добора считает биржа, ты решаешь только сторону")
+        for extra in (self._limits_line(), self._refusal_line()):   # v5.4.4: лимиты счёта и отказ биржи — фактом
+            if extra:
+                L.append(extra)
         if self.last_review:
             L.append(self._review_line(price, now))            # v5.4.3: с ценой решения и ходом с тех пор
             streak = self._wait_streak_line(price, now)
             if streak:
                 L.append(streak)
+        up = self._review_unparsed                       # v5.4.4: прошлый ответ не разобран — что именно и как ответить
+        if up:
+            L.append(f"ПРОШЛЫЙ ОТВЕТ «{str(up.get('raw') or 'пусто')[:80]}» НЕ РАЗОБРАН ({self._hhmm(up.get('ts'))}): "
+                     f"{up.get('hint') or UNPARSED_HINT}")
         m = self.mission
         if m is not None and m.council_ts:
             cut = _f(getattr(self, "_council_cut_ts", 0.0), 0.0)
@@ -2253,16 +2507,102 @@ class MissionPilot(ai_pilot.AIPilot):
         return (f"начат {self._hhmm(c0)} ({int(max(0.0, now - c0) // 60)} мин назад)"
                 + (f", шёл {int(dur // 60)} мин" if dur is not None else "") + ", нового приказа не дал")
 
-    def _review_silent(self, reason: str) -> None:
-        """v5.3 фаза 3: PRO промолчал на перепроверке (таймаут / сеть / не JSON) — не ждать плановой
-        PYTHIA_REVIEW_SEC: ранняя повторная попытка через REVIEW_RETRY_SEC (как при «шифровщик не дал exec»),
-        накопленный повод (_review_reason) не стирается, событие в ошибках ИИ для панели."""
+    # ── v5.4.4: связь с брокером, лимиты счёта, отказ биржи — факты для ситуации PRO (поля ведёт AIPilot) ──────────
+    def _broker_ok(self) -> bool:
+        """Брокер доступен? (AIPilot.broker_ok — 5.4.4; метода нет — считаем, что доступен). Нет связи — PRO не зовём."""
+        return _pilot_broker_ok(self)
+
+    @staticmethod
+    def _field(d: dict, *keys, default=None):
+        for k in keys:
+            v = d.get(k)
+            if v not in (None, ""):
+                return v
+        return default
+
+    def _feed_line(self, now: float | None = None) -> str:
+        """«СВЯЗЬ С БРОКЕРОМ: …» — только когда связи нет (self.feed ok=False, агент Y: kind, cause, reason, since): с
+        какого времени и что ответил брокер (токен / права — «нет доступа»)."""
+        feed = getattr(self, "feed", None)
+        if not isinstance(feed, dict) or feed.get("ok", True):
+            return ""
+        now = time.time() if now is None else now
+        since = _f(self._field(feed, "since", "down_since"))
+        what = str(self._field(feed, "cause", "reason", "text", "error", default="") or "")[:200]
+        code = self._field(feed, "code")
+        s = "СВЯЗЬ С БРОКЕРОМ: " + ("нет доступа (токен или права)" if feed.get("kind") in ("auth", "rights") else "нет")
+        if since:
+            s += f" с {self._hhmm(since)} ({int(max(0.0, now - since) // 60)} мин)"
+        if code not in (None, ""):
+            s += f", код {code}"
+        if what:
+            s += f" — {what}"
+        return s
+
+    def _limits_line(self) -> str:
+        """«ЛИМИТЫ СЧЁТА: покупка до N лотов, продажа до M (GetMaxLots HH:MM)» (self.account_limits, агент Y: buy_lots,
+        sell_lots, ts, note; сбой — None и last_buy_lots / last_sell_lots); покупка 0 — «покупка недоступна: маржа
+        исчерпана»; лимиты не получены — так и сказано, с последними известными."""
+        lim = getattr(self, "account_limits", None)
+        if not isinstance(lim, dict) or not lim:
+            return ""
+        buy = self._field(lim, "buy_lots", "buy")
+        sell = self._field(lim, "sell_lots", "sell")
+        ts = _f(self._field(lim, "ts", "at"))
+        at = f" (GetMaxLots {self._hhmm(ts)})" if ts else " (GetMaxLots)"
+        if buy is None and sell is None:
+            note = str(lim.get("note") or "").strip()
+            lb, ls = lim.get("last_buy_lots"), lim.get("last_sell_lots")
+            if not note and lb is None and ls is None:
+                return ""
+            last = (f"; последние известные: покупка до {int(_f(lb, 0.0) or 0)}, продажа до {int(_f(ls, 0.0) or 0)}"
+                    if lb is not None or ls is not None else "")
+            return "ЛИМИТЫ СЧЁТА: неизвестны" + (f" — {note[:200]}" if note else "") + last + at
+        parts = []
+        if buy is not None:
+            parts.append("покупка недоступна: маржа исчерпана" if int(_f(buy, 0.0) or 0) <= 0 else f"покупка до {int(_f(buy))} лотов")
+        if sell is not None:
+            parts.append("продажа: 0 лотов" if int(_f(sell, 0.0) or 0) <= 0 else f"продажа до {int(_f(sell))}")
+        return "ЛИМИТЫ СЧЁТА: " + ", ".join(parts) + at
+
+    def _refusal_line(self) -> str:
+        """«ОТКАЗ БИРЖИ: что, код, текст, N раз, HH:MM» (self.broker_refusal) — последний отказ брокера фактом."""
+        rf = getattr(self, "broker_refusal", None)
+        if not isinstance(rf, dict) or not rf:
+            return ""
+        what = str(self._field(rf, "what", "kind", "op", default="заявка") or "заявка")
+        code = self._field(rf, "code")
+        text = str(self._field(rf, "text", "error", "message", default="") or "")[:200]
+        n = int(_f(self._field(rf, "n", "count", "times"), 1) or 1)
+        ts = _f(self._field(rf, "ts", "last_ts", "at"))
+        parts = [what]
+        if code not in (None, ""):
+            parts.append(f"код {code}")
+        if text:
+            parts.append(f"«{text}»")
+        parts.append(f"{n} раз")
+        if ts:
+            parts.append(self._hhmm(ts))
+        return "ОТКАЗ БИРЖИ: " + ", ".join(parts)
+
+    def _review_silent(self, reason: str, raw: str | None = None, hint: str | None = None) -> None:
+        """PRO промолчал на перепроверке (таймаут / сеть / не JSON) или ответ не разобран — решения не было (код не пишет
+        за ИИ ни ЖДЁМ, ни вход). Накопленный повод (_review_reason) не стирается, событие — в ошибках ИИ для панели.
+        v5.4.4 (воля владельца «только триггеры и раз в 30 мин»): быстрого повтора через 5 мин (REVIEW_RETRY_SEC) больше
+        нет — повод ждёт СЛЕДУЮЩЕЙ ПЛАНОВОЙ перепроверки (или рыночного триггера раньше); ответ не разобран (raw) —
+        строка «ПРОШЛЫЙ ОТВЕТ «…» НЕ РАЗОБРАН» в её ситуации с подсказкой (hint), что ответить. Срок перепроверки уже в
+        прошлом (перепроверку позвали не тиком) — ставится плановый шаг, иначе петля повторов."""
         m = self.mission
-        self.review_ts = min(self.review_ts, time.time() + REVIEW_RETRY_SEC)
-        wait = max(0, int(self.review_ts - time.time()))
+        now = time.time()
+        if self.review_ts <= now:
+            self.review_ts = now + self._review_gap()
+        if raw is not None:
+            self._review_unparsed = {"ts": now, "raw": str(raw)[:120], "hint": hint or UNPARSED_HINT}
+        wait = max(0, int(self.review_ts - now))
         why = self._review_reason or "плановая перепроверка"
-        self.last_action = (f"дежурный PRO промолчал ({reason}) — повторю через {wait // 60} мин {wait % 60} с; "
-                            f"повод сохранён: {why[:160]}")
+        head = "ответ дежурного PRO не разобран" if raw is not None else "дежурный PRO промолчал"
+        self.last_action = (f"{head} ({reason}) — решения не было; повод ждёт плановой перепроверки в "
+                            f"{self._hhmm(self.review_ts)} (через {wait // 60} мин): {why[:160]}")
         log.warning("миссия %s: %s", self.base, self.last_action)
         try:
             ai_v5.note_error(f"перепроверка PRO: {reason}", "mission_review")
@@ -2270,14 +2610,21 @@ class MissionPilot(ai_pilot.AIPilot):
             pass
         if m is not None:
             _bg(bus.stage("mission", m.run_id, "review", "error", ticker=self.base, detail=self.last_action))
-            _tolmach(m, "review", "PRO промолчал на перепроверке",
-                     f"{reason}; повод не потерян ({why[:120]}) — повторю через {wait // 60} мин",
-                     refs={"reason": reason, "retry_in_s": wait})
+            _tolmach(m, "review", "PRO промолчал на перепроверке" if raw is None else "Ответ PRO на перепроверке не разобран",
+                     f"{reason}; решения не было, повод не потерян ({why[:120]}) — вернусь на плановой перепроверке в "
+                     f"{self._hhmm(self.review_ts)}", refs={"reason": reason, "next_review_in_s": wait})
             _persist(m)
 
     async def _review_bg(self, price: float) -> None:
         """Перепроверка фоном (AIPilot._review_bg) + v5.4.2: метка старта (ритм WAIT) и мысль о прибыли, которая ждала,
-        пока дежурный PRO думал (pos["profit_pending"]), — сразу после его ответа, если позиция та же и ещё в плюсе."""
+        пока дежурный PRO думал (pos["profit_pending"]), — сразу после его ответа, если позиция та же и ещё в плюсе.
+        v5.4.4: связи с брокером нет (broker_ok) — PRO не зовётся вовсе (решение не исполнить, данные брокера не свежие):
+        перепроверка пропущена, повод ждёт восстановления связи (_on_feed_change → одна перепроверка) или плановой."""
+        if not self._broker_ok():
+            self.last_action = ("связи с брокером нет — перепроверку PRO пропускаю до восстановления связи"
+                                + (f"; повод ждёт: {self._review_reason[:120]}" if self._review_reason else ""))
+            log.warning("миссия %s: %s", self.base, self.last_action)
+            return
         self._review_started_ts = time.time()
         try:
             await super()._review_bg(price)
@@ -2310,10 +2657,38 @@ class MissionPilot(ai_pilot.AIPilot):
             self._profit_think_now(cur, pos, f"{reason} (повод ждал ответа дежурного PRO: {waited[:120]})")
 
     # ── перепроверка дежурного PRO ────────────────────────────────────────────────
-    def _parse_choice(self, raw: str, in_pos: bool, side: str | None = None) -> str | None:
+    def _parse_choice(self, raw: str, in_pos: bool, side: str | None = None, *, obj: dict | None = None,
+                      price: float | None = None, armed: bool = False) -> str | None:
         """v5.4.2: слово перепроверки по словарю ai_v5.review_table (целые слова, латиница, Ё=Е): токен или None —
-        «не разобрано» (решения нет, переспрос), а не молчаливый ЖДЁМ базового разбора подстрок."""
-        return ai_v5.decision_of(raw, ai_v5.review_table(in_pos, side))
+        «не разобрано» (решения нет, переспрос), а не молчаливый ЖДЁМ базового разбора подстрок.
+        v5.4.4: вне рынка вход без стороны («ЗАСАДА», «ВОЙТИ», «вход взведён», AMBUSH) — сторона по словам ответа, иначе
+        по его уровням (ai_v5.side_by_levels: стоп ниже уровня входа — КУПИТЬ, выше — ПРОДАТЬ; уровня входа нет — от цены
+        снимка price), иначе None; засада / лимитка без уровня входа (entry) — None (засады без числа нет). armed —
+        взведён вход без позиции на момент промпта: ОТМЕНИТЬ (и «вне рынка») снимает его — ОТМЕНИТЬ_ВХОД."""
+        flat = not in_pos
+        tok = ai_v5.decision_of(raw, ai_v5.review_table(in_pos, side, armed=armed and flat, sideless=flat))
+        if not flat or tok is None:
+            return tok
+        if tok == ENTRY_ANY:
+            sd = side_by_levels(obj, price)
+            tok = "КУПИТЬ_СЕЙЧАС" if sd == "long" else "ПРОДАТЬ_СЕЙЧАС" if sd == "short" else None
+        if tok in ("КУПИТЬ_СЕЙЧАС", "ПРОДАТЬ_СЕЙЧАС") and ambush_of(raw) and not _f((obj or {}).get("entry")):
+            return None                              # «ЗАСАДА на покупку» без числа — не вход по текущей цене
+        return tok
+
+    def _unparsed_hint(self, raw: str, in_pos: bool, side: str | None, armed: bool) -> str:
+        """v5.4.4: подсказка к неразобранному ответу — что именно не так (эхо схемы, частичное закрытие, вход без
+        стороны и уровней) — в строку «ПРОШЛЫЙ ОТВЕТ … НЕ РАЗОБРАН» следующей ситуации."""
+        table = ai_v5.review_table(in_pos, side, armed=armed and not in_pos, sideless=not in_pos)
+        if echo_of(raw, table):
+            return UNPARSED_ECHO
+        if partial_of(raw):
+            return UNPARSED_PARTIAL
+        if not in_pos and ai_v5.decision_of(raw, table) == ENTRY_ANY:
+            return UNPARSED_SIDELESS
+        if not in_pos and ambush_of(raw):
+            return UNPARSED_SIDELESS
+        return UNPARSED_HINT
 
     def _review_situation(self, price: float) -> str:
         """Ситуация перепроверки: _situation_for_ai (ПРОКОЛ СКАНЕРА первым, пока PRO его не разобрал) + повод
@@ -2359,6 +2734,8 @@ class MissionPilot(ai_pilot.AIPilot):
         self._review_reason, self._review_kind, self._review_pulled = None, None, False
         self._review_deferred = None                 # отложенное решение (если было) PRO только что видел в поводе
         self._council_blocked = ""
+        self._council_deferred = None                # v5.4.4: просьба о совете в окне — PRO её видел в поводе
+        self._review_unparsed = None                 # v5.4.4: ответ разобран — пометка «не разобран» снята
 
     def _review_record(self, obj: dict, choice: str, ai_choice: str, why: str, note: str, price: float,
                        in_pos: bool, pos_side0: str | None) -> tuple[dict, dict]:
@@ -2392,6 +2769,15 @@ class MissionPilot(ai_pilot.AIPilot):
         # v5.4.3: будильник ЖДЁМ — уровень из entry ответа ЖДЁМ вне рынка; ревью 5.4.3 (D1/D2) — _wake_after_review
         self._wake_after_review(choice, rec, in_pos, price, why)
         self._streak_after_review(choice, in_pos, price)          # ревью 5.4.3: серия ЖДЁМ вне рынка — свой счётчик
+        if rec.get("wake_refused"):                               # v5.4.4: отказ в будильнике — модель увидит его
+            self.last_review["wake_refused"] = rec["wake_refused"]
+        # v5.4.4: метка для панели и Telegram; вид входа — как его задала модель (entry_kind), нет — по снимку, который
+        # она видела (в записи — её слово как есть)
+        lab = rec
+        if choice in _LABEL_ENTRY and rec["entry"] and rec["entry_kind"] not in ENTRY_KINDS and price:
+            up = (rec["entry"] > price) if choice == "КУПИТЬ_СЕЙЧАС" else (rec["entry"] < price)
+            lab = dict(rec, entry_kind="прорыв" if up else "откат")
+        rec["label"] = self.last_review["label"] = _decision_label(lab)
         if m is not None:
             m.reviews.append(rec)
             del m.reviews[:-REVIEWS_KEEP]
@@ -2400,159 +2786,225 @@ class MissionPilot(ai_pilot.AIPilot):
         return rec, retune
 
     async def _review(self, price: float) -> None:
+        """Перепроверка дежурного PRO: данные → промпт → ответ → запись → исполнение → объявление с исходом.
+        v5.4.4: (1) взведён вход без позиции на момент промпта (armed) — в списке ОТМЕНИТЬ (снять вход), «вне рынка» при
+        взведённом входе — тоже снять; (2) вход без стороны («ЗАСАДА», «ВОЙТИ») — сторона по уровням ответа
+        (_parse_choice); (3) не разобран / молчание / таймаут — повод ждёт плановой перепроверки, быстрого повтора нет
+        (_review_silent), в её ситуации — «ПРОШЛЫЙ ОТВЕТ … НЕ РАЗОБРАН» с подсказкой; вход против режима — к плановой;
+        (4) решение объявляется ПОСЛЕ исполнения с фактическим исходом (шина «review done», толмач, last_action): засада
+        взведена / вход сейчас / отложено: идёт совет / не исполнено: позиция уже … / снято; (5) стадия «review» всегда
+        закрывается (done / error), даже если исполнение споткнулось."""
         m = self.mission
         in_pos = self.position is not None
         pos_side0 = (self.position or {}).get("side")    # ревью 5.4.3: сторона позиции на момент промпта (память)
-        news_txt = await self._gather_news()
-        if not news_txt.strip():
-            news_txt = "(свежих новостей нет или сбор недоступен — НЕ выдумывай их, решай по цене и плану)"
+        stage_open = False
         try:
-            lt = await asyncio.wait_for(market_ctx.light(self.base, self.figi, self.asset_class), 30)
-            light_txt = lt.get("text") or ""
-        except Exception as e:                       # noqa: BLE001
-            light_txt = f"(живой рынок недоступен: {str(e)[:80]})"
-        astro_line = ""
-        try:
-            from . import astro as _astro
-            c = await _astro.acontext()              # в потоке: протухший кэш не держит event loop
-            astro_line = _astro.short_line(c) if c else ""
-        except Exception:                            # noqa: BLE001
-            pass
-        watch_txt = _watch_text(self._last_review_ts or self.started_ts)
-        scout_txt, partners_txt = await asyncio.gather(self._scout_fresh(SCOUT_REVIEW_TIMEOUT),
-                                                       self._partners_fresh(PARTNERS_REVIEW_TIMEOUT))
-        # разумные пределы (v5.1): блоки перепроверки через compress.fit — выше пределов FLASH
-        # ужимает без потери нитей, ниже — всё целиком; ножниц нет
-        blocks, squeezed = await _fit_blocks({
-            "light": light_txt, "council": _council_text(), "prev_exec": _exec_text(m) if m else "",
-            "news": news_txt, "watch": watch_txt, "scan": _scan_text(m) if m else "",
-            "wyckoff": (m.layers.get("wyckoff") if m else "") or "", "scout": scout_txt,
-            "partners": partners_txt, "memory": (m.memory if m else "") or ""})
-        # v5.4.2: снимок решения — цена, которую PRO видит в промпте (после сбора данных, а не при запуске задачи)
-        price, snap_ts = (self.prices[-1] if self.prices else price), time.time()
-        situation = self._review_situation(price)     # W3: блок ПРОКОЛ СКАНЕРА первым, пока PRO его не разобрал
-        # ревью 5.4.3: Вайкофф совета — с честной подписью (время, цена тогда) и расстояниями от текущей цены
-        wy_at, blocks["wyckoff"] = self._review_wyckoff(price, blocks["wyckoff"])
-        s, u = prompts_mission.review(
-            self.base, self.name, self._play(), situation=situation,
-            light=blocks["light"], council_text=blocks["council"], prev_exec=blocks["prev_exec"],
-            news=blocks["news"], watch=blocks["watch"], astro_line=astro_line, in_pos=in_pos,
-            time_msk=ai_v5.now_msk_str(),
-            review_min=int(float(getattr(config, "PYTHIA_REVIEW_SEC", 1800)) // 60),
-            scan=blocks["scan"], wyckoff=blocks["wyckoff"], scout=blocks["scout"], partners=blocks["partners"],
-            memory=blocks["memory"], side=(self.position or {}).get("side"),
-            council_min=max(1, int(float(getattr(config, "PYTHIA_COUNCIL_GAP_SEC", 1800)) // 60)), wyckoff_at=wy_at)
-        sb = {"situation": situation, **blocks}
-        if m is not None:
-            m.sizes["review"] = _sizes_rec(len(u), sb)
+            news_txt = await self._gather_news()
+            if not news_txt.strip():
+                news_txt = "(свежих новостей нет или сбор недоступен — НЕ выдумывай их, решай по цене и плану)"
             try:
-                await bus.stage("mission", m.run_id, "review", "start", ticker=self.base,
-                                detail=_sizes_detail("перепроверка", len(u), sb, squeezed))
+                lt = await asyncio.wait_for(market_ctx.light(self.base, self.figi, self.asset_class), 30)
+                light_txt = lt.get("text") or ""
             except Exception as e:                   # noqa: BLE001
-                log.info("шина: стадия review start: %s", str(e)[:80])
-        try:
-            obj = await asyncio.wait_for(ai_v5.pro_json(s, u, route="mission_review"), 1200)
-        except Exception as e:                       # noqa: BLE001  (таймаут 1200 с, сеть, 4xx/5xx после повторов)
-            self._review_silent(f"{'таймаут 1200 с' if isinstance(e, asyncio.TimeoutError) else str(e)[:100] or type(e).__name__}")
-            raise
-        if not isinstance(obj, dict):
-            self._review_silent("ответ не JSON-объект")
-            return
-        # v5.4.2: слово решения — по словарю перепроверки (BUY/LONG/ЛОНГ → КУПИТЬ, CLOSE/EXIT/ЗАФИКСИРОВАТЬ в позиции →
-        # ЗАКРЫТЬ, «НЕ …» и «… или …» → не разобрано) ДО сброса повода: не разобрано → решения не было, ранний повтор
-        # с сохранённым поводом и без записи «ЖДЁМ» за ИИ
+                light_txt = f"(живой рынок недоступен: {str(e)[:80]})"
+            astro_line = ""
+            try:
+                from . import astro as _astro
+                c = await _astro.acontext()          # в потоке: протухший кэш не держит event loop
+                astro_line = _astro.short_line(c) if c else ""
+            except Exception:                        # noqa: BLE001
+                pass
+            watch_txt = _watch_text(self._last_review_ts or self.started_ts)
+            scout_txt, partners_txt = await asyncio.gather(self._scout_fresh(SCOUT_REVIEW_TIMEOUT),
+                                                           self._partners_fresh(PARTNERS_REVIEW_TIMEOUT))
+            # разумные пределы (v5.1): блоки перепроверки через compress.fit — выше пределов FLASH
+            # ужимает без потери нитей, ниже — всё целиком; ножниц нет
+            blocks, squeezed = await _fit_blocks({
+                "light": light_txt, "council": _council_text(), "prev_exec": _exec_text(m) if m else "",
+                "news": news_txt, "watch": watch_txt, "scan": _scan_text(m) if m else "",
+                "wyckoff": (m.layers.get("wyckoff") if m else "") or "", "scout": scout_txt,
+                "partners": partners_txt, "memory": (m.memory if m else "") or ""})
+            # v5.4.2: снимок решения — цена, которую PRO видит в промпте (после сбора данных, а не при запуске задачи)
+            price, snap_ts = (self.prices[-1] if self.prices else price), time.time()
+            in_pos = self.position is not None
+            pos_side0 = (self.position or {}).get("side")
+            armed0 = (not in_pos) and bool(self.plan or self.pending)   # v5.4.4: есть что снять — ОТМЕНИТЬ в списке
+            situation = self._review_situation(price)     # W3: блок ПРОКОЛ СКАНЕРА первым, пока PRO его не разобрал
+            # ревью 5.4.3: Вайкофф совета — с честной подписью (время, цена тогда) и расстояниями от текущей цены
+            wy_at, blocks["wyckoff"] = self._review_wyckoff(price, blocks["wyckoff"])
+            s, u = prompts_mission.review(
+                self.base, self.name, self._play(), situation=situation,
+                light=blocks["light"], council_text=blocks["council"], prev_exec=blocks["prev_exec"],
+                news=blocks["news"], watch=blocks["watch"], astro_line=astro_line, in_pos=in_pos,
+                time_msk=ai_v5.now_msk_str(),
+                review_min=int(float(getattr(config, "PYTHIA_REVIEW_SEC", 1800)) // 60),
+                scan=blocks["scan"], wyckoff=blocks["wyckoff"], scout=blocks["scout"], partners=blocks["partners"],
+                memory=blocks["memory"], side=pos_side0,
+                council_min=max(1, int(float(getattr(config, "PYTHIA_COUNCIL_GAP_SEC", 1800)) // 60)), wyckoff_at=wy_at,
+                armed=armed0)
+            sb = {"situation": situation, **blocks}
+            if m is not None:
+                m.sizes["review"] = _sizes_rec(len(u), sb)
+                try:
+                    await bus.stage("mission", m.run_id, "review", "start", ticker=self.base,
+                                    detail=_sizes_detail("перепроверка", len(u), sb, squeezed))
+                    stage_open = True
+                except Exception as e:               # noqa: BLE001
+                    log.info("шина: стадия review start: %s", str(e)[:80])
+            try:
+                obj = await asyncio.wait_for(ai_v5.pro_json(s, u, route="mission_review"), 1200)
+            except Exception as e:                   # noqa: BLE001  (таймаут 1200 с, сеть, 4xx/5xx после повторов)
+                stage_open = False                   # _review_silent закрывает стадию «error»
+                self._review_silent(f"{'таймаут 1200 с' if isinstance(e, asyncio.TimeoutError) else str(e)[:100] or type(e).__name__}")
+                raise
+            if not isinstance(obj, dict):
+                stage_open = False
+                self._review_silent("ответ не JSON-объект", raw=str(obj)[:80], hint="верни один JSON-объект по схеме")
+                return
+            # v5.4.2: слово решения — по словарю перепроверки (BUY/LONG/ЛОНГ → КУПИТЬ, CLOSE/EXIT/ЗАФИКСИРОВАТЬ в позиции →
+            # ЗАКРЫТЬ, «НЕ …» и «… или …» → не разобрано) ДО сброса повода: не разобрано → решения не было, повод ждёт
+            # плановой перепроверки, без записи «ЖДЁМ» за ИИ. v5.4.4: словарь — по тому, что PRO видел (позиция и её
+            # сторона, взведённый вход на момент промпта), вход без стороны — по уровням ответа от цены снимка
+            raw_choice = ai_v5.decision_raw(obj)
+            choice = self._parse_choice(raw_choice, in_pos, pos_side0, obj=obj, price=price, armed=armed0)
+            if choice is None:
+                stage_open = False
+                self._review_silent(f"ответ не разобран: {raw_choice[:60] or 'пусто'}", raw=raw_choice or "",
+                                    hint=self._unparsed_hint(raw_choice, in_pos, pos_side0, armed0))
+                return
+            self._review_answered()
+            if m is not None:
+                m.sizes["review"] = _sizes_rec(len(u), sb, _json_len(obj))
+            why = str(obj.get("why") or "")[:300]
+            note = str(obj.get("note") or "")[:400]
+            # режим игры (воля владельца): вход против режима — не «ЖДЁМ» за ИИ, а своя запись ВНЕ_РЕЖИМА; ПЕРЕВЕРНУТЬ
+            # против режима — выходная половина разрешена: ЗАКРЫТЬ
+            play = self._play()
+            ai_choice = choice
+            pos_side = (self.position or {}).get("side")
+            if (choice == "КУПИТЬ_СЕЙЧАС" and play == "short") or (choice == "ПРОДАТЬ_СЕЙЧАС" and play == "long"):
+                why = f"[{choice} против режима {play} — не исполнено, повод к плановой] " + why
+                choice = "ВНЕ_РЕЖИМА"
+            if choice == "ПЕРЕВЕРНУТЬ" and pos_side and ((pos_side == "long" and play == "long")
+                                                           or (pos_side == "short" and play == "short")):
+                why = f"[ПЕРЕВЕРНУТЬ против режима {play} — только ЗАКРЫТЬ] " + why
+                choice = "ЗАКРЫТЬ"
+            rec, retune = self._review_record(obj, choice, ai_choice, why, note, price, in_pos, pos_side0)
+            cur = self.prices[-1] if self.prices else price
+            log.info("миссия %s: перепроверка → %s (%s)", self.base, rec.get("label") or _choice_label(rec), why)
+            # ── исполнение решения → фактический исход (v5.4.4, D6) ──
+            outcome = await self._review_execute(choice, ai_choice, obj, rec, retune, why, price, cur, snap_ts, play)
+            self._review_outcome = {"ts": time.time(), "label": rec.get("label"), "outcome": outcome}
+            if m is not None:
+                _bg(bus.stage("mission", m.run_id, "review", "done", ticker=self.base,
+                              detail=f"{rec.get('label') or _choice_label(rec)}: {why} → {outcome}",
+                              data=dict(rec, outcome=outcome)))   # метка модели и исход; канон — в data
+                stage_open = False
+                lvl_w = _f((self._wake or {}).get("level"), 0.0) or 0.0
+                # v5.4.3: у ЖДЁМ уровень — будильник, не «вход» (вне рынка без будильника entry не используется). Ревью
+                # 5.4.3: ДЕРЖАТЬ в позиции (решение принималось в позиции — in_pos, а не позиция сейчас) — толмачу
+                # применённые уровни и отказы кода (_retune), а не числа ИИ
+                inv_r, take_r = rec["invalidation"], rec["take"]
+                if choice == "ЖДЁМ" and in_pos:
+                    lv = list(retune.get("applied") or []) + [f"не принято: {x}" for x in (retune.get("refused") or [])]
+                    inv_r, take_r = retune.get("inv"), retune.get("take")
+                else:
+                    pairs = (("вход", rec["entry"]), ("стоп", rec["invalidation"]), ("тейк", rec["take"]))
+                    lv = [f"{k} {v}" for k, v in (() if choice in ("ЖДЁМ", REVIEW_CANCEL) else pairs)
+                          if v is not None]
+                if choice in ("КУПИТЬ_СЕЙЧАС", "ПРОДАТЬ_СЕЙЧАС", "ДОБРАТЬ", "ПЕРЕВЕРНУТЬ") and rec["entry"] is None:
+                    lv.insert(0, "вход сейчас")
+                if self._wake:
+                    lv.insert(0, f"будильник у {lvl_w:g}{' остаётся' if rec.get('wake_kept') else ''}: цена пройдёт "
+                                 f"уровень — дежурный PRO решит заново, это не вход")
+                if rec.get("wake_refused"):
+                    lv.append(rec["wake_refused"])
+                _tolmach(m, "review", f"Перепроверка: {_choice_label(rec)}",
+                         f"{why}" + (f". {note}" if note else "") + (f" ({', '.join(lv)})" if lv else "")
+                         + f". Итог: {outcome}",
+                         refs={"choice": choice, "price": price, "entry": rec["entry"] if choice != "ЖДЁМ" else None,
+                               "invalidation": inv_r, "take": take_r, "wake": lvl_w if self._wake else None,
+                               "outcome": outcome})
+                every = explain.memory_every() if explain is not None else 5
+                if m.reviews_since_memory >= every:      # узел «N перепроверок» — свести память
+                    _memorize(m, f"{every} перепроверок")
+            # ревью 5.4.3 (D1): уровень будильника пройден, пока PRO думал (снимок до уровня, цена сейчас за ним), — повод
+            # сразу после записи ответа (пейсинг wait_level: EVENT_MIN_GAP_SEC после ответа; 5.4.4 — не чаще
+            # LEVEL_MAX_PER_HOUR раз в час), а не молча
+            w = self._wake
+            cur2 = self.prices[-1] if self.prices else cur
+            if (w and not w.get("fired") and self._wake_beyond(w, cur2) and not self._wake_beyond(w, price)
+                    and not self._reanalyzing and self._wake_recent(_f(w.get("level"), 0.0)) is None):
+                self._wake_fire(cur2, w, note=" (пока ты думал над прошлым ответом)")
+        finally:
+            if stage_open and m is not None:
+                # v5.4.4: стадия не висит в start — исполнение или запись споткнулись после start
+                _bg(bus.stage("mission", m.run_id, "review", "error", ticker=self.base,
+                              detail=f"перепроверка споткнулась: {str(self.last_action or '')[:200]}"))
+
+    async def _review_execute(self, choice: str, ai_choice: str, obj: dict, rec: dict, retune: dict, why: str,
+                              price: float, cur: float, snap_ts: float, play: str) -> str:
+        """v5.4.4: исполнить решение перепроверки и вернуть фактический исход словами (для шины, толмача, панели):
+        «засада взведена @296.6 (откат)», «вход сейчас», «отложено: идёт совет», «не исполнено: позиция уже открыта»,
+        «снято: …», «против режима … — повод к плановой». Состояние — после ответа PRO (он думал минуты)."""
         pos_side = (self.position or {}).get("side")
-        raw_choice = ai_v5.decision_raw(obj)
-        choice = self._parse_choice(raw_choice, in_pos, pos_side)
-        if choice is None:
-            self._review_silent(f"ответ не разобран: {raw_choice[:60] or 'пусто'}")
-            return
-        self._review_answered()
-        if m is not None:
-            m.sizes["review"] = _sizes_rec(len(u), sb, _json_len(obj))
-        why = str(obj.get("why") or "")[:300]
-        note = str(obj.get("note") or "")[:400]
-        # режим игры (воля владельца): вход против режима — не «ЖДЁМ» за ИИ, а своя запись ВНЕ_РЕЖИМА и переспрос;
-        # ПЕРЕВЕРНУТЬ против режима — выходная половина разрешена: ЗАКРЫТЬ
-        play = self._play()
-        ai_choice = choice
-        if (choice == "КУПИТЬ_СЕЙЧАС" and play == "short") or (choice == "ПРОДАТЬ_СЕЙЧАС" and play == "long"):
-            why = f"[{choice} против режима {play} — не исполнено, переспрошу] " + why
-            choice = "ВНЕ_РЕЖИМА"
-        if choice == "ПЕРЕВЕРНУТЬ" and pos_side and ((pos_side == "long" and play == "long")
-                                                       or (pos_side == "short" and play == "short")):
-            why = f"[ПЕРЕВЕРНУТЬ против режима {play} — только ЗАКРЫТЬ] " + why
-            choice = "ЗАКРЫТЬ"
-        rec, retune = self._review_record(obj, choice, ai_choice, why, note, price, in_pos, pos_side0)
-        cur = self.prices[-1] if self.prices else price
-        lvl_w = _f((self._wake or {}).get("level"), 0.0) or 0.0
-        if m is not None:
-            _bg(bus.stage("mission", m.run_id, "review", "done", ticker=self.base,
-                          detail=f"{_choice_label(rec)}: {why}", data=rec))   # метка модели; канон — в data
-            # v5.4.3: у ЖДЁМ уровень — будильник, не «вход» (вне рынка без будильника entry не используется). Ревью
-            # 5.4.3: ДЕРЖАТЬ в позиции (решение принималось в позиции — in_pos, а не позиция сейчас) — толмачу
-            # применённые уровни и отказы кода (_retune), а не числа ИИ
-            inv_r, take_r = rec["invalidation"], rec["take"]
-            if choice == "ЖДЁМ" and in_pos:
-                lv = list(retune.get("applied") or []) + [f"не принято: {x}" for x in (retune.get("refused") or [])]
-                inv_r, take_r = retune.get("inv"), retune.get("take")
-            else:
-                pairs = (("вход", rec["entry"]), ("стоп", rec["invalidation"]), ("тейк", rec["take"]))
-                lv = [f"{k} {v}" for k, v in (() if choice == "ЖДЁМ" else pairs) if v is not None]
-            if choice in ("КУПИТЬ_СЕЙЧАС", "ПРОДАТЬ_СЕЙЧАС", "ДОБРАТЬ", "ПЕРЕВЕРНУТЬ") and rec["entry"] is None:
-                lv.insert(0, "вход сейчас")
-            if self._wake:
-                lv.insert(0, f"будильник у {lvl_w:g}{' остаётся' if rec.get('wake_kept') else ''}: цена пройдёт "
-                             f"уровень — дежурный PRO решит заново, это не вход")
-            _tolmach(m, "review", f"Перепроверка: {_choice_label(rec)}",
-                     f"{why}" + (f". {note}" if note else "") + (f" ({', '.join(lv)})" if lv else ""),
-                     refs={"choice": choice, "price": price, "entry": rec["entry"] if choice != "ЖДЁМ" else None,
-                           "invalidation": inv_r, "take": take_r,
-                           "wake": lvl_w if self._wake else None})
-            every = explain.memory_every() if explain is not None else 5
-            if m.reviews_since_memory >= every:      # узел «N перепроверок» — свести память
-                _memorize(m, f"{every} перепроверок")
-        log.info("миссия %s: перепроверка → %s (%s)", self.base, _choice_label(rec), why)
-        # ── исполнение решения ──
-        pos_side = (self.position or {}).get("side")     # v5.4.2: состояние — после ответа PRO (он думал минуты)
         entry_like = choice in ("КУПИТЬ_СЕЙЧАС", "ПРОДАТЬ_СЕЙЧАС", "ДОБРАТЬ", "ПЕРЕВЕРНУТЬ")
+        outcome = ""
         if choice == "ЗАКРЫТЬ" and self.position:
-            await self._close_all(cur, "решение перепроверки: закрыть")
+            ok = await self._close_all(cur, "решение перепроверки: закрыть")
+            outcome = ("позиция закрыта" if ok and self.position is None else
+                       f"закрытие не завершено: {str(self.last_action or '')[:160]}")
         elif choice == "ЖДЁМ" and self.position:
-            pass                                         # ДЕРЖАТЬ: уровни уже переставлены/отклонены выше (_retune)
+            # ДЕРЖАТЬ: уровни уже переставлены/отклонены выше (_retune)
+            outcome = "держим" + ("; " + ", ".join(retune["applied"]) if retune.get("applied") else "") \
+                + ("; не принято: " + "; ".join(retune["refused"]) if retune.get("refused") else "")
         elif entry_like and self._reanalyzing:
             # v5.4.2: совет начался, пока PRO думал, — решение не пропадает молча: повод дежурному PRO после совета
-            head = f"решение перепроверки {choice} отложено: идёт совет"
+            head = f"решение перепроверки {_choice_label({'choice': choice})} отложено: идёт совет"
             self._review_deferred = {"ts": time.time(), "text": head + (f" — {why[:160]}" if why else "")}
             self._review_reason, self._review_kind = self._review_deferred["text"], "pilot"
-            self.last_action = head + " — вернусь к нему после совета"
-            log.info("миссия %s: %s", self.base, self.last_action)
+            self.last_action = head + " — вернусь к нему на плановой перепроверке после совета"
+            outcome = "отложено: идёт совет"
         elif choice in ("КУПИТЬ_СЕЙЧАС", "ПРОДАТЬ_СЕЙЧАС") and not self.position:
             self._plan_from_review(choice, obj, why, price, cur, snap_ts=snap_ts)
+            outcome = self._plan_outcome("long" if choice == "КУПИТЬ_СЕЙЧАС" else "short")
         elif choice == "ДОБРАТЬ" and self.position:
             # докупить до максимума, что даёт биржа: план той же стороны «сейчас» — тик доберёт
             self._plan_from_review("КУПИТЬ_СЕЙЧАС" if pos_side == "long" else "ПРОДАТЬ_СЕЙЧАС",
                                    obj, why, price, cur, topup=True, snap_ts=snap_ts)
+            pl = self.plan or {}
+            outcome = ("добор взведён: " + self._plan_how(pl) if pl.get("side") == pos_side else
+                       f"добор не взведён: {str(self.last_action or '')[:160]}")
         elif choice == "ПЕРЕВЕРНУТЬ" and self.position:
             # закрыть и войти в другую сторону на максимум: план другой стороны → тик закроет (флип) и войдёт
             self._plan_from_review("ПРОДАТЬ_СЕЙЧАС" if pos_side == "long" else "КУПИТЬ_СЕЙЧАС",
                                    obj, why, price, cur, flip=True, snap_ts=snap_ts)
+            pl = self.plan or {}
+            outcome = (f"переворот: закрою {pos_side} и войду {pl.get('side')} ({self._plan_how(pl)})"
+                       if pl.get("side") and pl.get("side") != pos_side else
+                       f"переворот не взведён: {str(self.last_action or '')[:160]}")
+        elif choice == REVIEW_CANCEL:
+            outcome = self._cancel_armed(why)
         elif choice == "ВНЕ_РЕЖИМА":
-            # вход против режима игры владельца: не исполняем и не пишем «ЖДЁМ» за ИИ — переспрос с пометкой
-            self._review_reason = f"прошлый ответ {ai_choice} запрещён режимом {play}"
-            self._review_kind = "pilot"
-            self.review_ts = min(self.review_ts, time.time() + REVIEW_RETRY_SEC)
+            # вход против режима игры владельца: не исполняем и не пишем «ЖДЁМ» за ИИ. v5.4.4: не переспрос через 5 мин,
+            # а повод к плановой перепроверке (воля владельца «только триггеры и раз в 30 мин»)
+            rr = f"прошлый ответ {_choice_label({'choice': ai_choice})} запрещён режимом {play}"
+            self._review_reason = f"{self._review_reason}; {rr}" if self._review_reason else rr
+            self._review_kind = self._review_kind or "pilot"
             wait = max(0, int(self.review_ts - time.time()))
-            self.last_action = (f"перепроверка: {ai_choice} против режима {play} — не исполнено, "
-                                f"переспрошу через {wait // 60} мин {wait % 60} с")
-            log.info("миссия %s: %s", self.base, self.last_action)
+            self.last_action = (f"перепроверка: {_choice_label({'choice': ai_choice})} против режима {play} — не исполнено; "
+                                f"повод к плановой перепроверке в {self._hhmm(self.review_ts)} (через {wait // 60} мин)")
+            outcome = f"не исполнено: вход против режима {play} — повод к плановой перепроверке"
         elif choice == "НОВЫЙ_АНАЛИЗ":
             self._fire_reanalyze("перепроверка потребовала свежий разбор: " + (why or "картина сломалась"), kind="council")
+            outcome = ("полный совет запущен" if self._reanalyzing else
+                       f"совет не запущен: {str(self.last_action or '')[:200]}")
         elif choice != "ЖДЁМ":
-            # позиция открылась/закрылась, пока PRO думал: решение к нынешнему состоянию не относится — видно в панели
-            self.last_action = (f"решение перепроверки {choice} не исполнено: "
-                                f"{'позиция уже открыта' if self.position else 'позиции уже нет'} — решу на следующей")
-            log.info("миссия %s: %s", self.base, self.last_action)
+            # позиция открылась/закрылась, пока PRO думал: решение к нынешнему состоянию не относится — видно в панели,
+            # в шине и у толмача (v5.4.4)
+            outcome = (f"не исполнено: {'позиция уже открыта' if self.position else 'позиции уже нет'} — решу на "
+                       f"следующей перепроверке")
+            self.last_action = f"решение перепроверки {_choice_label({'choice': choice})} {outcome}"
         elif self._wake:
             # v5.4.3: ЖДЁМ вне рынка с уровнем — будильник (код только будит, решает ИИ); ревью 5.4.3: ЖДЁМ без entry
             # оставляет несработавший будильник — так и пишем
@@ -2560,15 +3012,55 @@ class MissionPilot(ai_pilot.AIPilot):
             kept = f" остаётся (из ЖДЁМ {self._hhmm(w.get('ts'))})" if rec.get("wake_kept") else ""
             self.last_action = (f"перепроверка: ЖДЁМ — будильник у {w['level']:g}{kept}: цена пройдёт уровень "
                                 f"({'вверх' if w['dir'] == 'up' else 'вниз'}) — дежурный PRO решит заново")
-            log.info("миссия %s: %s", self.base, self.last_action)
-        # ЖДЁМ без позиции — осознанное решение ИИ: держим как есть
-        # ревью 5.4.3 (D1): уровень будильника пройден, пока PRO думал (снимок до уровня, цена сейчас за ним), — повод
-        # сразу после записи ответа (обычный пейсинг wait_level: EVENT_MIN_GAP_SEC после ответа), а не молча
-        w = self._wake
-        cur2 = self.prices[-1] if self.prices else cur
-        if (w and not w.get("fired") and self._wake_beyond(w, cur2) and not self._wake_beyond(w, price)
-                and not self._reanalyzing and self._wake_recent(_f(w.get("level"), 0.0)) is None):
-            self._wake_fire(cur2, w, note=" (пока ты думал над прошлым ответом)")
+            outcome = f"вне рынка, будильник у {w['level']:g}" + (" остаётся" if kept else "")
+        else:
+            # ЖДЁМ без позиции — осознанное решение ИИ: держим как есть
+            armed = self._plan_how(self.plan) if self.plan else ""
+            outcome = (f"взведённый вход остаётся: {armed}" if armed else "вне рынка до следующего взгляда") \
+                + (f"; {rec['wake_refused']}" if rec.get("wake_refused") else "")
+            # v5.4.4: панель видит свежее решение, а не прошлый «не разобран» / «совет: вне рынка»
+            self.last_action = (f"перепроверка: ЖДЁМ — {outcome} (следующий плановый взгляд в {self._hhmm(self.review_ts)})"
+                                + (f": {why[:120]}" if why else ""))
+        log.info("миссия %s: перепроверка → итог: %s", self.base, outcome)
+        return outcome
+
+    def _plan_outcome(self, side: str) -> str:
+        """v5.4.4: что получилось из КУПИТЬ/ПРОДАТЬ перепроверки: план этой стороны взведён — как (засада / пробой /
+        сейчас) и по какому уровню; нет — почему (last_action)."""
+        pl = self.plan or {}
+        if pl.get("side") == side and str(pl.get("src") or "review") == "review":
+            e = _f(pl.get("entry"))
+            if not e:
+                return "вход сейчас" + (" (решит дверь по живой цене)" if pl.get("gate_note") else "")
+            return (f"вход на пробитии взведён @{e:g}" if pl.get("kind") == "прорыв" else
+                    f"засада взведена @{e:g} (откат)")
+        return f"план не взведён: {str(self.last_action or '')[:160]}"
+
+    def _cancel_armed(self, why: str) -> str:
+        """v5.4.4: ОТМЕНИТЬ перепроверки — снять взведённый вход (засада, вход у двери, заявка входа в полёте) с записью,
+        шиной и толмачом (их делает _review). Позиция уже открыта / снимать нечего — так и сказать."""
+        if self.position:
+            self.last_action = "перепроверка: ОТМЕНИТЬ — не исполнено: позиция уже открыта, снимать нечего"
+            return "не исполнено: позиция уже открыта"
+        if not self.plan and not self.pending:
+            self.last_action = "перепроверка: ОТМЕНИТЬ — взведённого входа уже нет"
+            return "снимать нечего: взведённого входа уже нет"
+        what = []
+        if self.plan:
+            what.append(self._plan_how(self.plan))
+            self.plan = None
+            self._break_n = 0
+        if self.pending:
+            what.append(f"заявка входа {self.pending.get('side')} {self.pending.get('lots')} лот — снимаю ближайшим тиком")
+            self._cancel_entry = True
+        else:
+            self.state = "ЖДУ_ПЛАН"
+        try:
+            self._save_state()
+        except Exception as e:                       # noqa: BLE001
+            log.info("миссия %s: state после ОТМЕНИТЬ: %s", self.base, str(e)[:80])
+        self.last_action = f"перепроверка: ОТМЕНИТЬ — снято: {'; '.join(what)}" + (f" ({why[:120]})" if why else "")
+        return "снято: " + "; ".join(what)
 
     def _wake_after_review(self, choice: str, rec: dict, in_pos: bool, price: float, why: str) -> None:
         """Будильник после ответа перепроверки (ревью 5.4.3, D1/D3). price — снимок, по которому думал PRO.
@@ -2580,7 +3072,9 @@ class MissionPilot(ai_pilot.AIPilot):
           заявки, не во время совета; уровень ≠ цене снимка; сторона — от снимка (dir up/down). Время будильником не
           ставится: следующий плановый взгляд — PYTHIA_WAIT_REVIEW_SEC / PYTHIA_REVIEW_SEC.
         · ЖДЁМ без entry (или с тем же уровнем в пределах _wake_tol) — несработавший будильник остаётся (rec wake_kept);
-          ЖДЁМ с другим entry — переставляет."""
+          ЖДЁМ с другим entry — переставляет.
+        · v5.4.4: уровень ближе _wake_min_dist (max(WAKE_MIN_PCT %, WAKE_MIN_TICKS шагов цены)) к цене снимка — будильник
+          не ставится (rec wake_refused — модель видит отказ в следующей ситуации), прежний несработавший остаётся."""
         now = time.time()
         w = self._wake
         if w and not w.get("fired") and self._wake_beyond(w, price):
@@ -2596,9 +3090,16 @@ class MissionPilot(ai_pilot.AIPilot):
         lvl = _f(rec.get("entry"), 0.0) or 0.0
         can = (choice == "ЖДЁМ" and not in_pos and not self.position and not self.plan and not self.pending
                and not self._reanalyzing)
-        if can and lvl > 0 and price and abs(lvl - float(price)) > 1e-9:
+        if can and lvl > 0 and price:
+            min_d = self._wake_min_dist(float(price))
             if keep is not None and abs(lvl - _f(keep.get("level"), 0.0)) <= self._wake_tol(lvl):
                 rec["wake"], rec["wake_kept"] = _f(keep.get("level"), 0.0), True   # тот же уровень — прежний будильник
+            elif abs(lvl - float(price)) < min_d:
+                # v5.4.4: уровень у самой цены — лестница будильников (перепроверка каждые несколько минут), не ставим
+                rec["wake_refused"] = (f"уровень {lvl:g} ближе {WAKE_MIN_PCT:g} % ({min_d:g}) к цене решения "
+                                       f"{float(price):g} — будильник не поставлен")
+                if keep is not None:
+                    rec["wake"], rec["wake_kept"] = _f(keep.get("level"), 0.0), True
             else:
                 self._wake = {"level": lvl, "ref": float(price), "dir": "up" if lvl > float(price) else "down",
                               "ts": now, "why": why[:120], "fired": None}
@@ -2979,11 +3480,11 @@ class MissionPilot(ai_pilot.AIPilot):
                      self.last_action, refs={"side": pos["side"], "lots": pos["lots"], "entry": pos.get("entry"),
                                              "invalidation": pos.get("invalidation"), "take": pos.get("take"),
                                              "hard_stop": pos.get("hard_stop")})
-            # фаза 4 · W2: исполнение — в шину (хроника панели, Telegram): числа в data.fill
-            _bg(bus.stage("mission", m.run_id, "pilot", "progress", ticker=self.base, detail=self.last_action,
-                          data={"fill": {"new": new, "side": pos["side"], "lots": pos["lots"], "entry": pos.get("entry"),
-                                         "filled": lots, "invalidation": pos.get("invalidation"), "take": pos.get("take"),
-                                         "hard_stop": pos.get("hard_stop")}}))
+            # фаза 4 · W2: исполнение — в шину (хроника панели, Telegram): числа в data.fill; v5.4.4 — с итогом «done»
+            _pilot_note(m, self.last_action,
+                        data={"fill": {"new": new, "side": pos["side"], "lots": pos["lots"], "entry": pos.get("entry"),
+                                       "filled": lots, "invalidation": pos.get("invalidation"), "take": pos.get("take"),
+                                       "hard_stop": pos.get("hard_stop")}})
 
     def _journal(self, before: dict | None, n_before: int, why: str, price: float) -> None:
         if not before or len(self.pnls) <= n_before:
@@ -3018,8 +3519,7 @@ class MissionPilot(ai_pilot.AIPilot):
         m = self.mission
         if m is not None:
             m.open_trade = None if not self.position else m.open_trade
-            _bg(bus.stage("mission", m.run_id, "pilot", "progress", ticker=self.base,
-                          detail=f"сделка закрыта ({why}): P/L {pnl:+.0f}", data=rec))
+            _pilot_note(m, f"сделка закрыта ({why}): P/L {pnl:+.0f}", data=rec)   # v5.4.4: с итогом «done»
             _persist(m)
             _tolmach(m, "close", f"{'Часть позиции закрыта' if self.position else 'Позиция закрыта'}: "
                                  f"{before.get('side')} {lots} лот, P/L {pnl:+.0f} ₽",
@@ -3056,9 +3556,13 @@ class MissionPilot(ai_pilot.AIPilot):
         · первый принятый план запускает пейсинг (REANALYZE_GAP_SEC);
         · свежий вердикт ДРУГОЙ стороны при позиции моложе PYTHIA_FLIP_QUIET_SEC не
           переворачивает её, но выход исполняется (v5.4.2): позиция закрывается ближайшим тиком без
-          переворота, вход в другую сторону решит перепроверка через 5 мин;
+          переворота, вход в другую сторону решит дежурный PRO (v5.4.4: по поводу «после закрытия» через
+          PYTHIA_AFTER_CLOSE_SEC — это рыночный триггер, — а не отдельной перепроверкой через 5 мин);
         · вид входа (сейчас / откат / прорыв) из приказа — в план пилота;
-        · HOLD (v5.4.2, ревью) — держать как есть без добора: только уровни позиции (AIPilot.adopt_forecast)."""
+        · HOLD (v5.4.2, ревью) — держать как есть без добора: только уровни позиции (AIPilot.adopt_forecast).
+        v5.4.4 (воля владельца «только триггеры и раз в 30 мин»): приказ не принят (HOLD без позиции, отклонён) — повод
+        к плановой перепроверке, а не PRO через 5 мин; решение перепроверки, отложенное советом, — повод к плановой;
+        поводы, пришедшие во время совета (он их не видел), переживают его приказ (без вызова PRO)."""
         m = self.mission
         ex = (forecast or {}).get("exec") if isinstance(forecast, dict) else None
         if isinstance(ex, dict) and self.position and str(ex.get("do") or "").upper() in ("BUY", "SELL"):
@@ -3082,39 +3586,65 @@ class MissionPilot(ai_pilot.AIPilot):
                 if self.pending:
                     self._cancel_entry = True
                 self._close_pending = why_c
-                self.review_ts = min(self.review_ts, time.time() + 300)
                 rr = (f"совет сказал {side}, а позиция {pos_side} была моложе {int(quiet // 60)} мин — закрыта без "
                       f"переворота; реши по живой картине, входить ли {side}")
                 self._review_reason = f"{self._review_reason}; {rr}" if self._review_reason else rr
+                self._review_kind = self._review_kind or "pilot"
+                # v5.4.4 «ритм PRO»: закрытие позиции — рыночный триггер (как «после закрытия»: приказ CLOSE закрывает
+                # с reanalyze=False) — PRO спросят через PYTHIA_AFTER_CLOSE_SEC, а не через 5 мин и не на плановой
+                after = float(getattr(config, "PYTHIA_AFTER_CLOSE_SEC", 900))
+                if after > 0:
+                    self.review_ts = min(self.review_ts, max(time.time() + after, self._last_review_ts + EVENT_MIN_GAP_SEC))
+                self._mid_council = []
                 self.last_action = (f"переворот отклонён: вердикт {side}, а позиция {pos_side} "
-                                    f"моложе {int(quiet // 60)} мин — {why_c}; перепроверка через 5 мин")
+                                    f"моложе {int(quiet // 60)} мин — {why_c}; вход в {side} решит дежурный PRO после "
+                                    f"закрытия")
+                # v5.4.4: ранний отказ идёт мимо AIPilot.adopt_forecast — причину (adopt_refused, агент Y) ставим сами
+                self.adopt_refused = self.last_action
                 log.warning("миссия %s: %s", self.base, self.last_action)
-                if m is not None:
-                    _bg(bus.stage("mission", m.run_id, "pilot", "progress", ticker=self.base,
-                                  detail=self.last_action))
+                _pilot_note(m, self.last_action)
                 return False
         deferred = getattr(self, "_review_deferred", None)
         # v5.4.2: событие (резкий ход, новость, прокол) подтянуло перепроверку, пока шёл совет, — совет его не видел:
         # после приказа повод не теряется, дежурный PRO вернётся к нему вскоре (проверка ритма WAIT)
         carry = (self._review_reason, self._review_kind) if (self._review_pulled and self._review_reason) else None
+        mid, self._mid_council = list(self._mid_council), []   # v5.4.4: поводы во время совета — он их не видел
+        rt0 = self.review_ts
         ok = super().adopt_forecast(forecast)
         self._council_kind = ""
+        if not ok and self.review_ts < rt0 and not (self.session_risk and self.session_risk.locked):
+            # v5.4.4: приказ не принят (HOLD без позиции / отклонён) — родитель звал PRO через 5 мин; по воле владельца
+            # это повод к плановой перепроверке, а не отдельный вызов PRO
+            self.review_ts = rt0
+            rr = str(self.last_action or "приказ совета не принят")[:200]
+            self._review_reason = f"{self._review_reason}; {rr}" if self._review_reason and rr not in self._review_reason \
+                else (self._review_reason or rr)
+            self._review_kind = self._review_kind or "pilot"
+            self.last_action = re.sub(r"(дежурный PRO решит|перепроверка) через 5 мин",
+                                      f"повод к плановой перепроверке в {self._hhmm(self.review_ts)}", str(self.last_action or ""))
+        # v5.4.4: причина отказа — как у AIPilot (агент Y), но по итоговому last_action (после правки срока выше)
+        self.adopt_refused = None if ok else (str(self.last_action or "").strip() or "приказ не принят пилотом")
         if ok and not self._last_reanalyze_ts:
             self._last_reanalyze_ts = time.time()    # пейсинг считается с первого плана, не со второго
         if ok:
             self._review_reason, self._review_kind, self._review_pulled = None, None, False
             self._council_blocked = ""               # совет только что всё рассмотрел
+            self._council_deferred = None
             self._wake_drop("новый приказ совета")   # ревью 5.4.3: будильник ЖДЁМ (и сработавший) совет не переживает
             self._break_n = 0
             if deferred:
                 # v5.4.2: решение перепроверки пришло, пока шёл совет (он его не видел): совет не дал входа — решение
-                # не пропадает, дежурный PRO вернётся к нему вскоре; дал план — совет новее, решение снято (в логе)
+                # не пропадает; дал план — совет новее, решение снято (в логе). v5.4.4: повод к плановой перепроверке,
+                # без отдельного вызова PRO через 3 мин
                 self._review_deferred = None
                 if not self.plan and not self.position and not self._close_pending:
                     self._review_reason, self._review_kind = deferred.get("text"), "pilot"
-                    self.review_ts = min(self.review_ts, time.time() + EVENT_MIN_GAP_SEC)
                 else:
                     log.info("миссия %s: %s — снято: совет дал свой приказ", self.base, deferred.get("text"))
+            for txt in mid:                          # v5.4.4: без вызова PRO — к плановой (события — ниже, carry)
+                if txt and txt not in (self._review_reason or "") and not (carry and txt in (carry[0] or "")):
+                    self._review_reason = f"{self._review_reason}; {txt}" if self._review_reason else txt
+                    self._review_kind = self._review_kind or "pilot"
             if carry and not self._close_pending:
                 txt, kind0 = carry
                 if not self._review_reason:
@@ -3154,10 +3684,11 @@ class MissionPilot(ai_pilot.AIPilot):
         позиции сначала смотрит FLASH-триаж (`_triage_bg`, PYTHIA_EVENT_TRIAGE) — дёшево и за секунды:
         СЕЙЧАС → PRO как раньше, ПЛАНОВО → повод к плановой, САМ → подтянуть трос / снять план без PRO.
         Возврат: задача триажа (можно дождаться) или None. Триаж уже идёт / рынок закрыт / нет позиции → сразу как
-        раньше. v5.4.2: и молодая позиция (PYTHIA_QUIET_SEC) идёт через триаж — СЕЙЧАС/ПЛАНОВО решает ИИ, не тишина кода."""
+        раньше. v5.4.2: и молодая позиция (PYTHIA_QUIET_SEC) идёт через триаж — СЕЙЧАС/ПЛАНОВО решает ИИ, не тишина кода.
+        v5.4.4: связи с брокером нет — триаж (это вызов ИИ у денег) не зовём: повод копится (_ask_review_now)."""
         why = str(why or "").strip()
         if (kind in ("shock", "news", "puncture") and self.position and bool(getattr(config, "PYTHIA_EVENT_TRIAGE", True))
-                and not self._market_closed()
+                and not self._market_closed() and self._broker_ok()
                 and not (self._triage_task and not self._triage_task.done()) and self.state != "СТОП"):
             self.last_action = f"{why} — {self._money_name()}-триаж решает, нужен ли дежурный PRO сейчас"
             log.info("миссия %s: %s", self.base, self.last_action)
@@ -3166,23 +3697,33 @@ class MissionPilot(ai_pilot.AIPilot):
         self._ask_review_now(why, kind)
         return None
 
-    def _ask_review_now(self, why: str, kind: str = "pilot", triage: dict | None = None) -> None:
-        """Повод для дежурного PRO. Поводы пилота (kind=pilot) копятся к ближайшей перепроверке; после
-        закрытия позиции — остыть PYTHIA_AFTER_CLOSE_SEC и решить (0 — ждать плановой). v5.4.2: повод пилота
-        вне рынка без плана (приказ протух, идея мертва до входа, вход отменён у двери, вход невозможен) —
-        пилот стоит без решения: перепроверка через EVENT_MIN_GAP_SEC после ответа PRO, а не плановая.
-        События (shock, news) поднимают внеплановую перепроверку: не чаще PYTHIA_EVENT_COOL_SEC после
-        прошлой событийной и не раньше EVENT_MIN_GAP_SEC после любого ответа PRO; в тишине после
-        входа (PYTHIA_QUIET_SEC) без вердикта триажа события не приближают перепроверку — трос защищает.
-        wait_level (v5.4.2) — цена прошла уровень приказа WAIT: только EVENT_MIN_GAP_SEC (один уровень — один повод);
-        v5.4.3 — и уровень будильника ЖДЁМ; ревью 5.4.3 — не раньше OPEN_REVIEW_GRACE_SEC после открытия рынка.
-        triage (v5.3 W2) — вердикт FLASH-триажа: ПЛАНОВО/САМ → повод копится, PRO не тянем."""
+    def _ask_review_now(self, why: str, kind: str = "pilot", triage: dict | None = None) -> bool:
+        """Повод для дежурного PRO. v5.4.4 «ритм PRO» (воля владельца 30.09.2026: «только триггеры и только раз в
+        30 мин»): перепроверку раньше плановой приближают ТОЛЬКО рыночные триггеры (TRIGGER_KINDS):
+          · события shock / news / puncture — не чаще PYTHIA_EVENT_COOL_SEC (у прокола — PYTHIA_PUNCTURE_COOL_SEC) после
+            прошлой событийной и не раньше EVENT_MIN_GAP_SEC после любого ответа PRO; в тишине после входа
+            (PYTHIA_QUIET_SEC) без вердикта триажа — не приближают; вердикт FLASH-триажа ПЛАНОВО/САМ — не приближает;
+          · wait_level (проход уровня WAIT совета или будильника ЖДЁМ; частоту держит _level_wake), dead (идея мертва до
+            входа: цена прошла стоп до входа), event (связь с брокером восстановлена) — не раньше EVENT_MIN_GAP_SEC
+            после ответа PRO (wait_level — и не раньше OPEN_REVIEW_GRACE_SEC после открытия рынка);
+          · open (рынок открылся) — сразу с запасом OPEN_REVIEW_GRACE_SEC;
+          · закрытие позиции (повод пилота «после закрытия» / «внешнее закрытие») — остыть PYTHIA_AFTER_CLOSE_SEC
+            (0 — к плановой).
+        Всё прочее (QUIET_KINDS: приказ протух, отказ биржи, лотов 0, вход невозможен, ОТМЕНИТЬ / дрейф у двери, просьба
+        совета в окне, ВНЕ_РЕЖИМА) — повод копится к СЛЕДУЮЩЕЙ ПЛАНОВОЙ перепроверке: до v5.4.4 вне рынка без плана он
+        звал PRO через EVENT_MIN_GAP_SEC (петли «перепроверка — отказ — перепроверка»). Биржа закрыта — к открытию; связи
+        с брокером нет — PRO не зовём вовсе, повод ждёт восстановления связи. Повод, пришедший во время совета, переживает
+        его приказ (_mid_council). Возврат: перепроверка приближена (PRO будет спрошен скоро)?"""
         m = self.mission
         now = time.time()
         why = str(why or "").strip()
         t_urg = str((triage or {}).get("urgency") or "")
-        cool = float(getattr(config, "PYTHIA_PUNCTURE_COOL_SEC", 600)) if kind == "puncture" \
-            else 0.0 if kind == "wait_level" else float(getattr(config, "PYTHIA_EVENT_COOL_SEC", 900))   # W3: у прокола свой пейсинг
+        # вид повода для ритма: «идея мертва до входа» (строка кода родителя, kind pilot) — рыночный триггер dead;
+        # в записи передачи и в _review_kind вид остаётся как пришёл (панель, совет)
+        trig = "dead" if kind == "pilot" and why.lower().startswith(DEAD_REASON) else kind
+        closed = kind == "pilot" and any(why.lower().startswith(k) for k in CLOSED_REASONS)
+        cool = float(getattr(config, "PYTHIA_PUNCTURE_COOL_SEC", 600)) if trig == "puncture" \
+            else 0.0 if trig in ("wait_level", "dead", "event") else float(getattr(config, "PYTHIA_EVENT_COOL_SEC", 900))
         floor = max(self._last_event_review_ts + cool, self._last_review_ts + EVENT_MIN_GAP_SEC)
         quiet = float(getattr(config, "PYTHIA_QUIET_SEC", 900))
         age = None
@@ -3192,26 +3733,28 @@ class MissionPilot(ai_pilot.AIPilot):
             except (TypeError, ValueError):
                 age = None
         pulled, note = False, ""
-        if kind == "open":                           # рынок открылся: без пейсинга и тишины — накопилось
+        if not self._broker_ok():                    # v5.4.4: без брокера PRO не зовётся вовсе
+            note = " — связи с брокером нет: PRO не зову, повод дойдёт после восстановления связи"
+        elif kind == "open":                         # рынок открылся: без пейсинга и тишины — накопилось
             due = now + ai_pilot.OPEN_REVIEW_GRACE_SEC
             self.review_ts = min(self.review_ts, due)
             pulled = self.review_ts <= due           # перепроверка уже раньше (другой повод) — этот идёт в неё же
         elif self._market_closed():                  # биржа закрыта: повод копится к открытию, PRO не дёргаем
             nxt = (self.market or {}).get("next_open_msk")
             note = f" — рынок закрыт{(' до ' + nxt) if nxt else ''}, повод дойдёт до перепроверки на открытии"
-        elif kind == "pilot":
-            closed = any(why.lower().startswith(k) for k in CLOSED_REASONS)
-            after = float(getattr(config, "PYTHIA_AFTER_CLOSE_SEC", 900)) if closed else 0.0
+        elif closed:
+            after = float(getattr(config, "PYTHIA_AFTER_CLOSE_SEC", 900))
             if after > 0:
                 due = max(now + after, floor)
                 self.review_ts = min(self.review_ts, due)
                 pulled = self.review_ts <= due
-            elif not closed and not self.position and not self.plan and not self.pending:
-                # v5.4.2: вне рынка без плана и без решения — дежурный PRO решает скоро, а не на плановой (до 30 мин)
-                due = max(now, self._last_review_ts) + EVENT_MIN_GAP_SEC
-                self.review_ts = min(self.review_ts, due)
-                pulled = self.review_ts <= due
-        elif age is not None and age < quiet and not triage:
+        elif trig in QUIET_KINDS or trig not in TRIGGER_KINDS:
+            pass                                     # v5.4.4: не рыночный повод — к плановой перепроверке
+        elif trig in ("dead", "event"):
+            due = max(now, self._last_review_ts + EVENT_MIN_GAP_SEC)
+            self.review_ts = min(self.review_ts, due)
+            pulled = self.review_ts <= due
+        elif age is not None and age < quiet and not triage and kind != "wait_level":
             note = f" — позиция моложе {int(quiet // 60)} мин, повод дойдёт до плановой перепроверки"
         elif triage and t_urg != "СЕЙЧАС":           # v5.3 W2: FLASH-триаж — PRO не нужен сейчас
             note = (f" — {self._money_name()}-триаж: {t_urg}" + (f" ({triage.get('done')})" if triage.get("done") else "")
@@ -3228,21 +3771,27 @@ class MissionPilot(ai_pilot.AIPilot):
             self._review_reason = f"{self._review_reason}; {why}"
         elif not self._review_reason:
             self._review_reason = why
-        if kind != "pilot" or not self._review_kind:
+        if kind not in QUIET_KINDS or not self._review_kind:
             self._review_kind = kind
-        self._review_pulled = self._review_pulled or (pulled and kind not in ("pilot", "wait_level"))   # пейсинг — только для событий
+        # пейсинг событий — только для событий (shock / news / puncture): от ответа PRO на такую перепроверку
+        self._review_pulled = self._review_pulled or (pulled and kind in ("shock", "news", "puncture"))
+        if self._reanalyzing or (m is not None and m.council_running()):
+            if why not in self._mid_council:         # v5.4.4: совет его не видит — переживёт приказ совета
+                self._mid_council.append(why)
+                del self._mid_council[:-10]
         wait = int(max(0, self.review_ts - now))
+        at = self._hhmm(self.review_ts)
         # v5.3 фаза 3: после закрытия причина («ЗАКРЫЛ ВСЁ (ПОБЕДА: тейк … / аварийный трос / FLASH решил
-        # слить): P/L …») остаётся первой, повод дежурному PRO дописывается — панель видит, ПОЧЕМУ закрылись
+        # слить): P/L …») остаётся первой, повод дежурному PRO дописывается — панель видит, ПОЧЕМУ закрылись.
+        # v5.4.4: время решения — абсолютное (HH:MM): строка не «замерзает» в панели как «через N мин»
         head = (self.last_action or "")
         head = (head + " · ") if (kind == "pilot" and head.startswith("ЗАКРЫЛ ВСЁ")) else ""
-        self.last_action = head + (f"{why} — дежурный PRO решит через {wait // 60} мин {wait % 60} с"
+        self.last_action = head + (f"{why} — дежурный PRO решит в {at} (через {wait // 60} мин {wait % 60} с)"
                                    if pulled else
-                                   f"{why}{note or ' — повод для дежурного PRO на плановой перепроверке'} "
-                                   f"(через {wait // 60} мин)")
+                                   f"{why}{note or ' — повод к плановой перепроверке'} (в {at}, через {wait // 60} мин)")
         log.info("миссия %s: %s", self.base, self.last_action)
         if m is None:
-            return
+            return pulled
         last = m.handoffs[-1] if m.handoffs else None
         if last and last.get("reason") == why and now - float(last.get("ts") or 0) < 3600:
             last["ts"], last["deferred"] = now, not pulled
@@ -3254,8 +3803,9 @@ class MissionPilot(ai_pilot.AIPilot):
         if triage:
             last["triage"] = t_urg + (f" ({triage.get('done')})" if triage.get("done") else "") \
                 + (f": {triage.get('why')}" if triage.get("why") else "")
-        _bg(bus.stage("mission", m.run_id, "pilot", "progress", ticker=self.base, detail=self.last_action))
+        _pilot_note(m, self.last_action)             # v5.4.4: «progress» и итог — стадия не висит
         _persist(m)
+        return pulled
 
     # ── триаж событий (v5.3 W2): FLASH за секунды — нужен ли PRO сейчас ───────────
     async def _event_triage(self, why: str, kind: str) -> dict:
@@ -3708,26 +4258,11 @@ class MissionPilot(ai_pilot.AIPilot):
                        "lock_price": g.get("lock_price"), "tp_next": g.get("tp_next")})
 
     def _take_handoff(self, why: str) -> None:
-        """ИИ у тейка решил подержать → задача Совету: полный совет без очереди и без окна
-        PYTHIA_COUNCIL_GAP_SEC (handoff kind `take`); совет уже идёт → дежурный PRO сразу после него.
-        Переворот по такому совету — без тишины."""
-        m = self.mission
+        """ИИ у тейка решил подержать → задача Совету (handoff kind `take`; переворот по такому совету — без тишины).
+        v5.4.4: через _fire_reanalyze(force=True) — не чаще PYTHIA_COUNCIL_GAP_SEC от конца прошлого совета; окно
+        закрыто или совет идёт — просьба поводом к плановой перепроверке."""
         reason = f"мягкий тейк: {self._money_name()} решил подержать и передать задачу Совету — " + (why or "без объяснений")
-        now = time.time()
-        if m is not None:
-            m.handoffs.append({"ts": now, "reason": reason, "deferred": False, "kind": "take"})
-            del m.handoffs[:-50]
-        if m is not None and m.council_running():
-            self._ask_review_now(reason, kind="take")
-            self.review_ts = min(self.review_ts, now)
-            return
-        self._council_reason = reason
-        self._council_kind = "take"
-        super()._fire_reanalyze(reason, force=True)
-        if m is not None:
-            _bg(bus.stage("mission", m.run_id, "pilot", "progress", ticker=self.base,
-                          detail="передаю задачу Совету: " + reason))
-            _persist(m)
+        self._fire_reanalyze(reason, force=True, kind="take")
 
     async def _apply_guard(self, r: dict, price: float, pos: dict) -> None:
         await super()._apply_guard(r, price, pos)
@@ -3754,25 +4289,11 @@ class MissionPilot(ai_pilot.AIPilot):
                        "hold_until": g.get("hold_until")})
 
     def _guard_handoff(self, why: str) -> None:
-        """ИИ у троса решил ждать → задача Совету: полный совет без очереди и без окна PYTHIA_COUNCIL_GAP_SEC;
-        совет уже идёт → дежурный PRO сразу после него. Переворот по такому совету — без тишины."""
-        m = self.mission
+        """ИИ у троса решил ждать → задача Совету (handoff kind `stop`; переворот по такому совету — без тишины).
+        v5.4.4: через _fire_reanalyze(force=True) — не чаще PYTHIA_COUNCIL_GAP_SEC от конца прошлого совета; окно
+        закрыто или совет идёт — просьба поводом к плановой перепроверке (трос сам спросит снова у триггера)."""
         reason = f"мягкий стоп: {self._money_name()} решил ждать и передать задачу Совету — " + (why or "без объяснений")
-        now = time.time()
-        if m is not None:
-            m.handoffs.append({"ts": now, "reason": reason, "deferred": False, "kind": "stop"})
-            del m.handoffs[:-50]
-        if m is not None and m.council_running():
-            self._ask_review_now(reason, kind="stop")
-            self.review_ts = min(self.review_ts, now)
-            return
-        self._council_reason = reason
-        self._council_kind = "stop"
-        super()._fire_reanalyze(reason, force=True)
-        if m is not None:
-            _bg(bus.stage("mission", m.run_id, "pilot", "progress", ticker=self.base,
-                          detail="передаю задачу Совету: " + reason))
-            _persist(m)
+        self._fire_reanalyze(reason, force=True, kind="stop")
 
     # ══ v5.4.1 «ТРЕЗВЫЙ ПИЛОТ»: проверка входа у двери ═════════════════════════════════════════════════════
     def _entry_check_on(self) -> bool:
@@ -4670,24 +5191,9 @@ class MissionPilot(ai_pilot.AIPilot):
         _persist(m)
 
     def _gate_handoff(self, reason: str) -> None:
-        """ОТМЕНИТЬ с council=true → полный совет без очереди и без окна PYTHIA_COUNCIL_GAP_SEC (handoff kind `entry`);
-        совет уже идёт → дежурный PRO сразу после него."""
-        m = self.mission
-        now = time.time()
-        if m is not None:
-            m.handoffs.append({"ts": now, "reason": reason, "deferred": False, "kind": "entry"})
-            del m.handoffs[:-50]
-        if m is not None and m.council_running():
-            self._ask_review_now(reason, kind="entry")
-            self.review_ts = min(self.review_ts, now)
-            return
-        self._council_reason = reason
-        self._council_kind = "entry"
-        super()._fire_reanalyze(reason, force=True)
-        if m is not None:
-            _bg(bus.stage("mission", m.run_id, "pilot", "progress", ticker=self.base,
-                          detail="передаю задачу Совету: " + reason))
-            _persist(m)
+        """ОТМЕНИТЬ с council=true → полный совет (handoff kind `entry`). v5.4.4: через _fire_reanalyze(force=True) — не
+        чаще PYTHIA_COUNCIL_GAP_SEC от конца прошлого совета; окно закрыто или совет идёт — повод к плановой перепроверке."""
+        self._fire_reanalyze(reason, force=True, kind="entry")
 
     # ══ v5.4.1: мысль о прибыли — в плюсе PRO думает сам, не дожидаясь тейка ═══════════════════════════════
     def _profit_trigger(self, price: float, pos: dict) -> str | None:
@@ -5048,25 +5554,11 @@ class MissionPilot(ai_pilot.AIPilot):
         _persist(m)
 
     def _profit_handoff(self, why: str) -> None:
-        """СОВЕТ из мысли о прибыли → полный совет без очереди и без окна PYTHIA_COUNCIL_GAP_SEC (handoff kind
-        `profit`, переворот по такому совету без тишины); совет уже идёт → дежурный PRO сразу после него."""
-        m = self.mission
+        """СОВЕТ из мысли о прибыли → полный совет (handoff kind `profit`, переворот по такому совету без тишины).
+        v5.4.4: через _fire_reanalyze(force=True) — не чаще PYTHIA_COUNCIL_GAP_SEC от конца прошлого совета; окно закрыто
+        или совет идёт — повод к плановой перепроверке."""
         reason = f"мысль о прибыли: {self._money_name()} зовёт Совет — " + (why or "без объяснений")
-        now = time.time()
-        if m is not None:
-            m.handoffs.append({"ts": now, "reason": reason, "deferred": False, "kind": "profit"})
-            del m.handoffs[:-50]
-        if m is not None and m.council_running():
-            self._ask_review_now(reason, kind="profit")
-            self.review_ts = min(self.review_ts, now)
-            return
-        self._council_reason = reason
-        self._council_kind = "profit"
-        super()._fire_reanalyze(reason, force=True)
-        if m is not None:
-            _bg(bus.stage("mission", m.run_id, "pilot", "progress", ticker=self.base,
-                          detail="передаю задачу Совету: " + reason))
-            _persist(m)
+        self._fire_reanalyze(reason, force=True, kind="profit")
 
     def _adopt_reentry(self, spec: dict) -> None:
         """Позиция закрыта по ВЫЙТИ_И_ПЕРЕЗАЙТИ → план той же стороны у уровня. v5.4.2: план несёт src «profit» и снимок
@@ -5094,99 +5586,228 @@ class MissionPilot(ai_pilot.AIPilot):
 
     def _council_timeout(self, lim: float) -> None:
         """v5.4.2: совет по поводу не уложился в PYTHIA_COUNCIL_MAX_SEC — разморозить пилот: _reanalyzing снят,
-        позиция и план как есть, ошибка ИИ для панели, перепроверка дежурного PRO через EVENT_MIN_GAP_SEC.
-        Ревью 5.4.2: окно совета (PYTHIA_COUNCIL_GAP_SEC) считается от обрыва — НОВЫЙ_АНАЛИЗ сразу после него не
-        запускает новый совет (иначе медленный PRO крутил бы цикл «совет — обрыв»), просьба ждёт окна."""
+        позиция и план как есть, ошибка ИИ для панели. Ревью 5.4.2: окно совета (PYTHIA_COUNCIL_GAP_SEC) считается от
+        обрыва — НОВЫЙ_АНАЛИЗ сразу после него не запускает новый совет (иначе медленный PRO крутил бы цикл «совет —
+        обрыв»). v5.4.4 (воля владельца «только триггеры и раз в 30 мин»): обрыв совета — не рыночный повод: дежурный PRO
+        решит на плановой перепроверке (её срок, пропущенный, пока совет шёл, наступает сразу), а не через 3 мин."""
         m = self.mission
+        now = time.time()
         if m is not None:
             if m.council_ts:                          # ревью 5.4.3: сколько шёл прерванный совет (до обрыва) — видно PRO
-                m.council_dur = max(0.0, time.time() - float(m.council_ts))
-            m.council_ts = self._council_cut_ts = time.time()
+                m.council_dur = max(0.0, now - float(m.council_ts))
+            m.council_ts = self._council_cut_ts = now
+            m.council_end_ts = now                    # v5.4.4: окно совета по поводу — от конца (обрыва)
         self._reanalyzing = False
+        self._mid_council = []                        # поводы во время совета уже в _review_reason — к плановой
         if self.state == "ПЕРЕАНАЛИЗ":
             self.state = "В_ПОЗИЦИИ" if self.position else ("ЗАСАДА" if self.plan else "ЖДУ_ПЛАН")
         why = f"совет не уложился в {int(lim // 60)} мин — прерван; реши по живой картине"
-        self.review_ts = min(self.review_ts, time.time() + EVENT_MIN_GAP_SEC)
         self._review_reason = f"{self._review_reason}; {why}" if self._review_reason and why not in self._review_reason \
             else (self._review_reason or why)
         self._review_kind = self._review_kind or "pilot"
-        self.last_action = f"{why} — пилот разморожен, дежурный PRO решит через {int(EVENT_MIN_GAP_SEC // 60)} мин"
+        at = self._hhmm(max(self.review_ts, now))
+        self.last_action = f"{why} — пилот разморожен, дежурный PRO решит на плановой перепроверке ({at})"
         log.warning("миссия %s: %s", self.base, self.last_action)
         try:
             ai_v5.note_error(f"совет миссии: дольше {int(lim)} с — прерван", "mission_council")
         except Exception:                            # noqa: BLE001  (в тестах ai_v5 — фейк без note_error)
             pass
         if m is not None:
-            _bg(bus.stage("mission", m.run_id, "pilot", "progress", ticker=self.base, detail=self.last_action))
+            _pilot_note(m, self.last_action, final="error")
             _tolmach(m, "council", "Совет не уложился в срок — пилот разморожен", self.last_action,
                      refs={"limit_s": int(lim)})
 
-    def _fire_reanalyze(self, why: str, force: bool = False, kind: str | None = None) -> None:
-        """kind (v5.4.2) — кто просит: «pilot» — повод пилота дежурному PRO; «council» — полный совет (НОВЫЙ_АНАЛИЗ
-        перепроверки). Без kind — родитель (AIPilot): его поводы — строки кода, узнаются по НАЧАЛУ (PILOT_REASONS),
-        а не по подстроке в чужом «why» (PRO мог написать «после закрытия» в своём объяснении). Совет в окне
-        PYTHIA_COUNCIL_GAP_SEC не теряется: отложен (_reanalyze_pending), перепроверка — к открытию окна."""
-        if self._reanalyzing:
+    def _council_failed(self, note: str) -> None:
+        """v5.4.4: совет по поводу кончился без приказа (упал, приказ не собрался, миссия занята) — пилот разморожен
+        сразу (раньше это делал родитель и звал PRO через 5 мин): повод к плановой перепроверке, без отдельного PRO."""
+        if not self._reanalyzing:
             return
+        self._reanalyzing = False
+        self._mid_council = []
+        if self.state == "ПЕРЕАНАЛИЗ":
+            self.state = "В_ПОЗИЦИИ" if self.position else ("ЗАСАДА" if self.plan else "ЖДУ_ПЛАН")
+        why = f"совет не дал приказа ({str(note or 'без причины')[:160]}) — реши по живой картине"
+        self._review_reason = f"{self._review_reason}; {why}" if self._review_reason and why not in self._review_reason \
+            else (self._review_reason or why)
+        self._review_kind = self._review_kind or "pilot"
+        self.last_action = (f"{why} — пилот разморожен, повод к плановой перепроверке в "
+                            f"{self._hhmm(max(self.review_ts, time.time()))}")
+        log.warning("миссия %s: %s", self.base, self.last_action)
+        _pilot_note(self.mission, self.last_action, final="error")
+
+    def _handoff_rec(self, why: str, kind: str, deferred: bool) -> None:
+        """Запись передачи совету (m.handoffs): та же причина за час — счётчик повторов, а не дубль."""
         m = self.mission
-        w = (why or "").lower()
-        if force:                                   # мягкий стоп: без очереди и без окна совета
-            self._council_reason = why
-            super()._fire_reanalyze(why, force=True)
-            return
-        if kind is None:
-            kind = "pilot" if any(w.startswith(k) for k in PILOT_REASONS) else "council"
-        # 1) поводы пилота — дежурному PRO, не совету
-        if kind == "pilot":
-            self._ask_review(why, kind="pilot")
-            return
-        # 2) полный совет по автоматическому поводу — не чаще PYTHIA_COUNCIL_GAP_SEC
-        gap = float(getattr(config, "PYTHIA_COUNCIL_GAP_SEC", 1800))
-        since = time.time() - float(getattr(m, "council_ts", 0) or 0) if m is not None else gap
-        if gap > 0 and since < gap and "по кнопке" not in w:
-            if self._council_deferred == why and self._reanalyze_pending == why:
-                return                              # тик §3б повторяет отложенную просьбу — окно ещё закрыто
-            left = max(1, int(gap - since) // 60)
-            self._council_blocked = (f"{ai_v5.fmt_ts(time.time())} просили полный совет ({why}), но он был "
-                                     f"{int(since // 60)} мин назад — не чаще раза в {int(gap // 60)} мин, "
-                                     f"окно откроется через {left} мин — просьба отложена до окна (следующий "
-                                     f"твой ответ без НОВЫЙ_АНАЛИЗ её снимет); до тех пор решай сам")
-            # v5.4.2: просьба не пропадает — совет, как только окно откроется (тик §3б), перепроверка к окну
-            self._reanalyze_pending = self._council_deferred = why
-            if m is not None:
-                self.review_ts = min(self.review_ts, float(m.council_ts or 0) + gap + 60.0)
-            self.last_action = (f"совет был {int(since // 60)} мин назад — новый не раньше чем через "
-                                f"{left} мин (просьба отложена до окна), решает дежурный PRO")
-            log.info("миссия %s: %s", self.base, self.last_action)
-            if m is not None:
-                m.handoffs.append({"ts": time.time(), "reason": why, "deferred": True, "kind": "council"})
-                del m.handoffs[:-50]
-                _bg(bus.stage("mission", m.run_id, "pilot", "progress", ticker=self.base, detail=self.last_action))
-                _persist(m)
-            return
-        self._council_reason = why
-        ts0 = self._last_reanalyze_ts
-        super()._fire_reanalyze(why)
         if m is None:
             return
-        deferred = (self._last_reanalyze_ts == ts0)
+        now = time.time()
         last = m.handoffs[-1] if m.handoffs else None
-        if last and last.get("reason") == why and time.time() - float(last.get("ts") or 0) < 3600:
-            last["ts"], last["deferred"] = time.time(), deferred      # та же причина за час — не плодим дубли
+        if last and last.get("reason") == why and now - float(last.get("ts") or 0) < 3600:
+            last["ts"], last["deferred"] = now, deferred
             last["repeats"] = int(last.get("repeats") or 1) + 1
         else:
-            m.handoffs.append({"ts": time.time(), "reason": why, "deferred": deferred, "kind": "council"})
+            m.handoffs.append({"ts": now, "reason": why, "deferred": deferred, "kind": kind})
         del m.handoffs[:-50]
-        _bg(bus.stage("mission", m.run_id, "pilot", "progress", ticker=self.base,
-                      detail="передаю задачу совету: " + why + (" (отложено пейсингом)" if deferred else "")))
+
+    def _fire_reanalyze(self, why: str, force: bool = False, kind: str | None = None) -> None:
+        """Повод пилота или просьба о полном совете. kind (v5.4.2): «pilot» — повод пилота дежурному PRO; «council» —
+        полный совет (НОВЫЙ_АНАЛИЗ перепроверки); v5.4.4 — «take» / «stop» / «entry» / «profit» — просьба узла у денег
+        (тейк ПОДЕРЖАТЬ, трос ЖДАТЬ, дверь ОТМЕНИТЬ+council, мысль о прибыли СОВЕТ; force=True). Без kind — родитель
+        (AIPilot): его поводы — строки кода, узнаются по НАЧАЛУ (PILOT_REASONS), а не по подстроке в чужом «why».
+        v5.4.4 «ритм PRO» (воля владельца 30.09.2026): полный совет по поводу — любой, и просьба узла тоже (force больше
+        не обходит окно), — не чаще PYTHIA_COUNCIL_GAP_SEC от КОНЦА прошлого совета (m.council_end_ts); окно закрыто,
+        совет уже идёт или связи с брокером нет — просьба уходит поводом к СЛЕДУЮЩЕЙ ПЛАНОВОЙ перепроверке (в ситуации
+        строка «СОВЕТ: …» с временем открытия окна), а не ждёт окна, чтобы запустить совет сама (тик §3б). Совет по
+        кнопке владельца (council_again) окна не знает. «Приказ протух» и «идея мертва до входа» — ещё и толмачу."""
+        m = self.mission
+        w = (why or "").lower()
+        now = time.time()
+        node = kind if kind in ("take", "stop", "entry", "profit") else None
+        if kind is None and not force:
+            kind = "pilot" if any(w.startswith(k) for k in PILOT_REASONS) else "council"
+        if kind == "pilot" and not force:
+            # 1) поводы пилота — дежурному PRO, не совету: рыночные (идея мертва до входа, закрытие позиции) будят его
+            #    по своему ритму, прочие (приказ протух, отказы биржи, вход невозможен) копятся к плановой
+            head = str(self.last_action or "")
+            self._ask_review(why, kind="pilot")
+            if w.startswith(DEAD_REASON) or w.startswith("приказ протух"):
+                title = "Идея мертва до входа — план снят" if w.startswith(DEAD_REASON) else "Приказ протух — план снят"
+                _tolmach(m, "other", title, f"{head}; {self.last_action}" if head and head != self.last_action
+                         else self.last_action, refs={"reason": why[:120]})
+            return
+        hk = node or "council"
+        head = str(self.last_action or "")
+
+        def later(note: str) -> None:
+            """Совет сейчас не зовём — просьба поводом к плановой; у узла у денег его собственный итог (что он сделал с
+            позицией) остаётся первым в last_action, пометка о совете — хвостом."""
+            self._ask_review_now(f"{why} ({note})", kind=hk)
+            if node and head and not head.startswith(why[:40]):
+                self.last_action = f"{head} · совет: {note}"
+
+        # 2) полный совет: совет уже идёт / запрошен — просьба к плановой после него (переживёт его приказ)
+        if self._reanalyzing or (m is not None and m.council_running()):
+            later("полный совет уже идёт — просьба к плановой перепроверке после него")
+            return
+        if not self._broker_ok():                    # без брокера PRO и совет по поводу не зовутся
+            later("связи с брокером нет — совет не зову, просьба к перепроверке после восстановления связи")
+            return
+        left = _council_gap_left(m, now)
+        if left > 0 and "по кнопке" not in w:
+            gap = float(getattr(config, "PYTHIA_COUNCIL_GAP_SEC", 1800))
+            opens = self._hhmm(now + left)
+            self._council_blocked = (f"{ai_v5.fmt_ts(now)} просили полный совет ({why[:200]}), но прошлый закончился "
+                                     f"{int(max(0.0, gap - left) // 60)} мин назад — не чаще раза в {int(gap // 60)} мин "
+                                     f"от конца совета, окно откроется в {opens}; просьба — повод этой перепроверки: после "
+                                     f"окна НОВЫЙ_АНАЛИЗ запустит совет, до тех пор решай сам")
+            self._council_deferred = why             # панель: просьба о совете ждёт (к плановой перепроверке)
+            later(f"совет не раньше {opens}: окно {int(gap // 60)} мин от конца прошлого — просьба к плановой перепроверке")
+            return
+        self._council_reason = why
+        self._council_kind = node or ""              # переворот по совету троса/тейка/прибыли — без тишины
+        super()._fire_reanalyze(why, force=True)     # окно уже проверено (от конца совета) — пейсинг родителя не нужен
+        self._council_blocked, self._council_deferred = "", None
+        if m is None:
+            return
+        self._handoff_rec(why, hk, deferred=not self._reanalyzing)
+        _pilot_note(m, ("передаю задачу Совету: " if node else "передаю задачу совету: ") + why)
         _persist(m)
+
+    # ── v5.4.4: хуки AIPilot (агент Y): связь с брокером, killswitch ────────────────────────────────────────────
+    def _on_feed_change(self, ok: bool, info: dict | None = None) -> None:
+        """Связь с брокером пропала / вернулась (AIPilot зовёт хук при смене, агент Y; info — feed {ok, kind ok|no_price|
+        auth|rights|cert|network|closed, cause, reason, since} + was, down_s, reason_was). Пропала — толмач и шина «pilot
+        error»; PRO не зовётся, пока связи нет (_review_bg, _ask_review, _ask_review_now, _fire_reanalyze, council_again).
+        Вернулась — толмач, шина (progress с текстом + done без detail) и ОДНА перепроверка по поводу «связь с брокером
+        восстановлена» (kind event: не раньше EVENT_MIN_GAP_SEC после ответа PRO) — с поводами, накопленными без связи."""
+        sup = getattr(super(), "_on_feed_change", None)
+        if callable(sup):
+            try:
+                sup(ok, info)
+            except Exception as e:                   # noqa: BLE001
+                log.info("миссия %s: хук связи родителя: %s", self.base, str(e)[:80])
+        m = self.mission
+        info = info if isinstance(info, dict) else {}
+        kind = str(info.get("kind") or "")
+        if not ok:
+            what = str(self._field(info, "cause", "reason", "text", "error", default="") or "")[:240]
+            head = "нет доступа к брокеру (токен или права)" if kind in ("auth", "rights") else "связь с брокером потеряна"
+            txt = (head + (f": {what}" if what else "")
+                   + " — дежурного PRO и совет не зову, пока связи нет; поводы копятся к перепроверке после восстановления")
+            log.warning("миссия %s: %s", self.base, txt)
+            _tolmach(m, "refusal", "Нет доступа к брокеру" if kind in ("auth", "rights") else "Связь с брокером потеряна",
+                     txt, refs={"kind": kind, "error": what})
+            _pilot_note(m, txt, final="error")
+            return
+        down = _f(info.get("down_s"))
+        if down is None:
+            since = _f(self._field(info, "since", "down_since"))
+            down = max(0.0, time.time() - since) if since else None
+        was = str(self._field(info, "reason_was", "cause", default="") or "")[:160]
+        dur = f" (не было {int(down // 60)} мин {int(down % 60)} с)" if down is not None else ""
+        why = f"связь с брокером восстановлена{dur} — реши по живой картине"
+        head = str(self.last_action or "")           # AIPilot уже написал «связь восстановлена… сверка со счётом»
+        _tolmach(m, "market", "Связь с брокером восстановлена",
+                 f"{why}" + (f"; причиной было: {was}" if was else "")
+                 + f"; накопленные поводы: {str(self._review_reason or 'нет')[:200]}", refs={"down_s": down})
+        self._ask_review_now(why, kind="event")
+        tail = str(self.last_action or "")
+        if head and "восстановлена" in head and head not in tail:
+            # запись AIPilot (сколько не было связи, причина, сверка со счётом) — первой, срок решения PRO — хвостом
+            self.last_action = f"{head} · " + (tail[len(why):].lstrip(" —") if tail.startswith(why) else tail)
+
+    def _on_killswitch(self, info: dict | None = None) -> None:
+        """Killswitch сработал (серия убытков / дневной лимит — AIPilot зовёт хук один раз на блокировку, агент Y; info —
+        {reason, ts, pnl, trades, position}): торговля стоит до нового торгового дня. Владелец узнаёт сразу (толмач, шина
+        «pilot error» → панель и Telegram), приказы совета пилот не примет — и совет по кнопке честно скажет это
+        (council_again: «внимание: killswitch …»; _council: «приказ не принят пилотом: …»)."""
+        sup = getattr(super(), "_on_killswitch", None)
+        if callable(sup):
+            try:
+                sup(info)
+            except Exception as e:                   # noqa: BLE001
+                log.info("миссия %s: хук killswitch родителя: %s", self.base, str(e)[:80])
+        m = self.mission
+        info = info if isinstance(info, dict) else {}
+        reason = self._field(info, "reason", "why", "text")
+        if not reason:
+            ks = _killswitch_why(self)
+            reason = ks.split(" — ", 1)[0] if ks else None
+        pnl, trades = _f(info.get("pnl")), info.get("trades")
+        pos = info.get("position") if isinstance(info.get("position"), dict) else None
+        tail = []
+        if pnl is not None:
+            tail.append(f"P/L сессии {pnl:+.0f} ₽")
+        if trades not in (None, ""):
+            tail.append(f"сделок {trades}")
+        txt = (f"killswitch: {reason or 'лимит риска сессии'}" + (f" ({', '.join(tail)})" if tail else "")
+               + " — торговля остановлена до нового торгового дня; приказы совета пилот не примет"
+               + (f"; позицию {pos.get('side')} {pos.get('lots')} лот пилот закрывает" if pos else ""))
+        log.warning("миссия %s: %s", self.base, txt)
+        if m is not None:
+            m.note = txt
+            _persist(m)
+        _tolmach(m, "refusal", "Killswitch: торговля остановлена", txt, refs={"reason": str(reason or "")[:160]})
+        _pilot_note(m, txt, final="error")
 
     def status(self) -> dict:
         st = super().status()
+        now = time.time()
         st["review_reason"] = self._review_reason
         st["review_kind"] = self._review_kind
         st["council_blocked"] = bool(self._council_blocked)
-        st["council_deferred"] = bool(self._council_deferred)   # v5.4.2: НОВЫЙ_АНАЛИЗ ждёт окна совета
+        st["council_deferred"] = bool(self._council_deferred)   # просьба о совете ждёт плановой перепроверки (5.4.4)
+        m = self.mission
+        # v5.4.4: решение перепроверки — метка модели с деталями и фактический исход; ответ не разобран; окно совета
+        lr = st.get("last_review")
+        if isinstance(lr, dict) and not lr.get("label"):
+            st["last_review"] = dict(lr, label=_decision_label(lr))
+        st["review_outcome"] = self._review_outcome
+        st["review_unparsed"] = self._review_unparsed
+        st["review_busy"] = bool(self._review_busy)
+        st["council_window_s"] = int(_council_gap_left(m, now)) if m is not None else 0
+        st["level_wakes_left"] = self._level_quota_left(now)
+        st["broker_ok"] = self._broker_ok()
         ws = self._wait_st                           # v5.4.2: приказ WAIT под наблюдением (цена отсчёта, пройденные уровни)
         st["wait_watch"] = {"ref": ws.get("ref"), "fired": sorted(ws.get("fired") or {})} if ws else None
         wk = self._wake                              # v5.4.3: будильник ЖДЁМ (уровень из ответа дежурного PRO)
@@ -5200,14 +5821,18 @@ class MissionPilot(ai_pilot.AIPilot):
         st["triages"] = self.triages[-10:]           # v5.3 W2: решения FLASH-триажа событий
         st["triage_busy"] = bool(self._triage_task and not self._triage_task.done())
         st["puncture"] = ({k: v for k, v in self.puncture.items() if k != "key"} if self.puncture else None)   # v5.3 W3
+        pu = st["puncture"]
+        if pu and pu.get("pending"):
+            # v5.4.4 (координатор): состояние прокола, ждущего PRO, — не замороженное «решит через N мин», а сейчас
+            pu["state"] = ("дежурный PRO думает над ним сейчас" if self._review_busy else
+                           f"{self._money_name()}-триаж решает, нужен ли PRO" if st["triage_busy"] else
+                           f"передан перепроверке PRO в {self._hhmm(self.review_ts)}")
         st["puncture_now"] = ({k: v for k, v in self._puncture_now.items() if k not in ("key", "text")}
                               if self._puncture_now else None)
         st["puncture_min"] = float(getattr(config, "PYTHIA_PUNCTURE_MIN", 0.6)) if bool(getattr(config, "PYTHIA_PUNCTURE", True)) else None
         st["price_ts"] = self._px_hist[-1][0] if self._px_hist else None   # v5.3 фаза 3: свежесть цены для панели проблем
-        m = self.mission
-        st["council_age_min"] = int((time.time() - m.council_ts) // 60) if m is not None and m.council_ts else None
+        st["council_age_min"] = int((now - m.council_ts) // 60) if m is not None and m.council_ts else None
         return st
-
 
 def _bind_pilot(m: Mission, pilot: MissionPilot) -> None:
     """Колбэк полного совета: повод берётся у пилота (НОВЫЙ_АНАЛИЗ от PRO, серьёзная новость …)."""
@@ -5217,10 +5842,14 @@ def _bind_pilot(m: Mission, pilot: MissionPilot) -> None:
 async def _pilot_council(m: Mission, pilot: MissionPilot) -> dict:
     """v5.4.2: автоматический совет (НОВЫЙ_АНАЛИЗ, передачи от троса/тейка/двери/мысли о прибыли) держит пилот
     (входы и перепроверки стоят, пока _reanalyzing) не дольше PYTHIA_COUNCIL_MAX_SEC: дольше — совет прерван,
-    пилот разморожен (позиция и план не трогаются), дежурный PRO решает через EVENT_MIN_GAP_SEC."""
+    пилот разморожен (позиция и план не трогаются). v5.4.4: и обрыв, и совет без приказа (упал, приказ не собрался,
+    миссия занята) — повод к плановой перепроверке, а не отдельный вызов PRO через 3–5 мин."""
     lim = float(getattr(config, "PYTHIA_COUNCIL_MAX_SEC", 3600))
     try:
-        return await asyncio.wait_for(council_again(m.ticker, pilot.council_reason(), wait=True), lim)
+        r = await asyncio.wait_for(council_again(m.ticker, pilot.council_reason(), wait=True), lim)
+        if pilot._reanalyzing:                       # adopt_forecast не случился — приказа нет (снимает флаг сам)
+            pilot._council_failed(str((r or {}).get("note") or m.error or m.note or "совет не завершился"))
+        return r
     except asyncio.TimeoutError:
         await _cancel_council(m)
         pilot._council_timeout(lim)
@@ -5393,13 +6022,23 @@ async def council_again(ticker: str, reason: str, wait: bool = False) -> dict:
         return {"ok": False, "note": f"уже идёт миссия {act.ticker} — один депозит = одна активная миссия"}
     if m.council_running():
         return {"ok": False, "run_id": m.run_id, "note": "совет по этой миссии уже идёт"}
+    if m.pilot_alive() and not _pilot_broker_ok(m.pilot):
+        # v5.4.4 (воля владельца: «пока брокер недоступен — PRO не зовётся вовсе»; проба агента Y при 401 — полный
+        # совет вслепую): без цены и счёта совет не зовём — ни по кнопке, ни по серьёзной новости
+        feed = getattr(m.pilot, "feed", None) or {}
+        why = str(feed.get("cause") or feed.get("reason") or "брокер не отвечает")[:200]
+        return {"ok": False, "note": f"нет связи с брокером ({why}) — совет не зову: без цены и счёта разбор вслепую; "
+                                     f"вернётся связь — дежурный PRO пилота сам посмотрит картину"}
     m.run_id = bus.start_run("mission", {"ticker": ticker, "play": m.play, "again": True, "reason": reason})
     m.council_task = asyncio.create_task(_council(m, reason, first=False))
     if wait:
         rid = m.run_id
         ex = await m.council_task
         return {"ok": bool(ex), "run_id": rid, "note": m.note}
-    return {"ok": True, "run_id": m.run_id, "note": f"пересмотр миссии {ticker}: {reason}"}
+    # v5.4.4 (D4): killswitch заперт — совет по кнопке идёт (разбор владельцу нужен), но честно: приказ пилот не примет
+    ks = _killswitch_why(m.pilot) if m.pilot_alive() else None
+    lock = f" — внимание: {ks}, приказ совета пилот не примет" if ks else ""
+    return {"ok": True, "run_id": m.run_id, "note": f"пересмотр миссии {ticker}: {reason}{lock}"}
 
 
 async def _cancel_council(m: Mission) -> None:
@@ -5542,9 +6181,17 @@ async def resume(ticker: str, *, settle_only: bool = False, panic_mode: bool = F
         if not (sf and sf.get("base") == ticker and sf.get("side") and sf["side"] != want):
             adopted = pilot.adopt_forecast({"exec": m.exec})
     if not adopted and not settle_only:
-        # v5.4.2: приказа нет (WAIT / протух / CLOSE исполнен) — не спать PYTHIA_REVIEW_SEC: первая перепроверка скоро
+        # v5.4.2: приказа нет (WAIT / протух / CLOSE исполнен) — не спать вслепую. v5.4.4 (воля владельца «только
+        # триггеры и раз в 30 мин»): это ПЛАНОВАЯ перепроверка — PYTHIA_REVIEW_SEC от последнего решения PRO миссии
+        # (перепроверка или приказ совета); просрочена (рестарт после долгого простоя) — сразу, с запасом стакану
         grace = max(float(ai_pilot.OPEN_REVIEW_GRACE_SEC), 120.0)
-        pilot.review_ts = min(float(getattr(pilot, "review_ts", 0.0) or time.time() + grace), time.time() + grace)
+        now = time.time()
+        last_rv = max([_f(r.get("ts"), 0.0) or 0.0 for r in (m.reviews or []) if isinstance(r, dict)] or [0.0])
+        if last_rv and not getattr(pilot, "_last_review_ts", 0.0):
+            pilot._last_review_ts = last_rv            # новости и заметки дозора — с прошлого решения, не со старта
+        last_dec = max(last_rv, _f(m.exec_ts, 0.0) or 0.0)
+        due = max(now + grace, (last_dec + float(ai_pilot.REVIEW_SEC)) if last_dec else now + grace)
+        pilot.review_ts = min(float(getattr(pilot, "review_ts", 0.0) or due), due)
         rr = "пилот поднят заново: приказа нет — реши по живой картине"
         prev = getattr(pilot, "_review_reason", None)
         pilot._review_reason = f"{prev}; {rr}" if prev and rr not in prev else (prev or rr)
@@ -5888,10 +6535,13 @@ def status(ticker: str) -> dict | None:
     return {"ticker": m.ticker, "name": m.name, "asset_class": m.asset_class, "play": m.play,
             "started_ts": m.started_ts, "run_id": m.run_id, "phase": _phase(m),
             "pilot": pst, "exec": m.exec, "frame": m.frame, "texts": m.texts, "news": m.news,
-            # ревью 5.4.3: + в позиции ли решение и цена решения — чат подаёт метку модели (ДЕРЖАТЬ) и ход с тех пор
+            # ревью 5.4.3: + в позиции ли решение и цена решения — чат подаёт метку модели (ДЕРЖАТЬ) и ход с тех пор;
+            # v5.4.4: label — метка модели с деталями («КУПИТЬ — засада (откат) @296.6», «ДЕРЖАТЬ», «ОТМЕНИТЬ»), канон кода
+            # остаётся в choice
             "reviews": [{"ts": r.get("ts"), "choice": r.get("choice"), "why": r.get("why"),
-                         "note": r.get("note"), "in_pos": r.get("in_pos"), "price": r.get("price")}
-                        for r in m.reviews[-REVIEWS_KEEP:]],
+                         "note": r.get("note"), "in_pos": r.get("in_pos"), "price": r.get("price"),
+                         "label": r.get("label") or _decision_label(r)}
+                        for r in m.reviews[-REVIEWS_KEEP:] if isinstance(r, dict)],
             "handoffs": [{"ts": h.get("ts"), "reason": h.get("reason"), "kind": h.get("kind") or "council",
                           "deferred": bool(h.get("deferred")), "triage": h.get("triage")} for h in m.handoffs[-20:]],
             "trades": tr, "price": price, "note": m.note, "error": m.error, "exec_ts": m.exec_ts,
@@ -5954,6 +6604,11 @@ async def on_serious_news(note: dict) -> None:
                 except Exception as e:               # noqa: BLE001
                     log.info("триаж новости: %s", str(e)[:80])
         elif not m.council_running():
+            left = _council_gap_left(m)
+            if left > 0:                             # v5.4.4: совет по поводу — не чаще окна от конца прошлого
+                log.info("миссия %s: серьёзная новость без пилота — совет не раньше чем через %d мин (окно от конца "
+                         "прошлого): %s", m.ticker, int(left // 60), txt)
+                return
             await council_again(m.ticker, "серьёзная новость: " + txt)
     except Exception as e:                           # noqa: BLE001
         log.warning("серьёзная новость не дошла до миссии: %s", str(e)[:100])
@@ -6566,7 +7221,7 @@ if __name__ == "__main__":
         # v5.3 толмач: приказ совета объяснён владельцу (стадия explain по шине, status()["explain"], store)
         assert await settle(lambda: xev(m, "council")), m.explain
         xc = [x for x in m.explain if x["kind"] == "council"][-1]
-        assert xc["ok"] and xc["text"].startswith("Толмач: ") and "Совет вынес приказ: BUY откат @99.5, тейк 103, стоп 98" in xc["title"]
+        assert xc["ok"] and xc["text"].startswith("Толмач: ") and "Совет вынес приказ: BUY засада (откат) @99.5, тейк 103, стоп 98" in xc["title"]
         assert xc["refs"]["invalidation"] == 98 and xc["model"] == "flash" and "exec_ts" in status("TEST")
         ux = fake_ai.last_user["explain"]
         for piece in ("═══ ЧТО ПРОИЗОШЛО ═══", "Совет вынес приказ", "═══ ПРИКАЗ СОВЕТА ═══", "BUY entry=99.5", "═══ СВЯЗАННЫЕ БУМАГИ ═══",
@@ -6675,7 +7330,7 @@ if __name__ == "__main__":
         # v5.3 фаза 3 (а): причина закрытия остаётся первой в last_action, повод дежурному PRO дописан
         la = p.last_action
         assert la.startswith("ЗАКРЫЛ ВСЁ (решение перепроверки: закрыть): P/L") and "после закрытия" in la, la
-        assert la.index("ЗАКРЫЛ ВСЁ") < la.index("после закрытия") and "дежурный PRO решит через" in la, la
+        assert la.index("ЗАКРЫЛ ВСЁ") < la.index("после закрытия") and "дежурный PRO решит в" in la, la
         assert status("TEST")["pilot"]["last_action"].startswith("ЗАКРЫЛ ВСЁ")
         # v5.3: закрытие → толмач «Позиция закрыта … P/L» и память сведена (узел прошёл): абзац, списки ужаты
         assert await settle(lambda: xev(m, "close") and m.memory_n >= 1), (m.explain, m.memory_n)
@@ -6813,11 +7468,13 @@ if __name__ == "__main__":
         fake_ai.review_answers[:] = [{"choice": "ПРОДАТЬ_СЕЙЧАС", "why": "вниз", "invalidation": 101}]
         p.review_ts = time.time() + 1800
         await p._review(px)
-        # v5.4.2: вход против режима — своя запись ВНЕ_РЕЖИМА (слово ИИ сохранено), не «ЖДЁМ» за ИИ; переспрос с пометкой
+        # v5.4.2: вход против режима — своя запись ВНЕ_РЕЖИМА (слово ИИ сохранено), не «ЖДЁМ» за ИИ; v5.4.4 — повод к
+        # плановой перепроверке (не переспрос через 5 мин), слово — как модель выбирала
         assert m.reviews[-1]["choice"] == "ВНЕ_РЕЖИМА" and m.reviews[-1]["ai_choice"] == "ПРОДАТЬ_СЕЙЧАС" \
             and "против режима" in m.reviews[-1]["why"] and p.plan is None, m.reviews[-1]
-        assert p._review_reason == "прошлый ответ ПРОДАТЬ_СЕЙЧАС запрещён режимом long", p._review_reason
-        assert p.review_ts <= time.time() + REVIEW_RETRY_SEC + 1, p.review_ts - time.time()
+        assert p._review_reason == "прошлый ответ ПРОДАТЬ запрещён режимом long", p._review_reason
+        assert p.review_ts >= time.time() + 1790, p.review_ts - time.time()
+        assert m.reviews[-1]["label"] == "ПРОДАТЬ — против режима игры", m.reviews[-1]
         # v5.4.2: слово не разобрано («НЕ ПОКУПАТЬ» / мусор) — решения нет: ни «ЖДЁМ» в m.reviews, ни плана; повод жив
         n_rv = len(m.reviews)
         for junk in ("НЕ ПОКУПАТЬ", "может быть"):
@@ -6825,7 +7482,8 @@ if __name__ == "__main__":
             p.review_ts = time.time() + 1800
             await p._review(px)
             assert len(m.reviews) == n_rv and p.plan is None and "ответ не разобран" in p.last_action, (junk, p.last_action)
-            assert "запрещён режимом" in (p._review_reason or "") and p.review_ts <= time.time() + REVIEW_RETRY_SEC + 1
+            assert "запрещён режимом" in (p._review_reason or "") and p.review_ts >= time.time() + 1790
+            assert f"ПРОШЛЫЙ ОТВЕТ «{junk}» НЕ РАЗОБРАН" in p._situation_text(px), p._review_unparsed
         # латиница и синонимы — решения: BUY → КУПИТЬ_СЕЙЧАС (план), ждём → ЖДЁМ
         fake_ai.review_answers[:] = [{"decision": "buy", "why": "латиницей", "invalidation": 95.0}]
         await p._review(px)
@@ -6848,15 +7506,15 @@ if __name__ == "__main__":
         p._fire_reanalyze("после закрытия — огромный анализ с нуля")
         assert p.review_ts >= time.time() + 1790 and "после закрытия" in p._review_reason
         config.PYTHIA_AFTER_CLOSE_SEC = 900
-        # ── v5.3 фаза 3 (д): PRO промолчал на перепроверке (ответ не JSON / таймаут) → ранняя повторная попытка
-        #    через REVIEW_RETRY_SEC, повод НЕ стирается, толмач и шина видят ──
+        # ── v5.3 фаза 3 (д): PRO промолчал на перепроверке (ответ не JSON / таймаут) — повод НЕ стирается, толмач и шина
+        #    видят; v5.4.4 (воля владельца «только триггеры и раз в 30 мин»): не ранний повтор через 5 мин, а плановая ──
         n_x = len(m.explain)
         fake_ai.review_answers[:] = ["это не JSON-объект"]
         await p._review(px)
         assert "после закрытия" in (p._review_reason or ""), "повод потерян"
-        assert time.time() + REVIEW_RETRY_SEC - 5 <= p.review_ts <= time.time() + REVIEW_RETRY_SEC + 1, p.review_ts - time.time()
-        assert p.last_action.startswith("дежурный PRO промолчал (ответ не JSON-объект)") and "повод сохранён:" in p.last_action \
-            and "после закрытия" in p.last_action, p.last_action
+        assert p.review_ts >= time.time() + 1790, p.review_ts - time.time()
+        assert p.last_action.startswith("ответ дежурного PRO не разобран (ответ не JSON-объект)") \
+            and "повод ждёт плановой перепроверки" in p.last_action and "после закрытия" in p.last_action, p.last_action
         p.review_ts = time.time() + 1800
 
         async def _pro_timeout(*a, **k):
@@ -6871,7 +7529,7 @@ if __name__ == "__main__":
         finally:
             fake_ai.pro_json = _pj
         assert "промолчал (таймаут 1200 с)" in p.last_action and "после закрытия" in p._review_reason, p.last_action
-        assert p.review_ts <= time.time() + REVIEW_RETRY_SEC + 1 and p.review_ts > time.time() + REVIEW_RETRY_SEC - 5
+        assert p.review_ts >= time.time() + 1790, "молчание — не повод звать PRO раньше плановой"
         assert await settle(lambda: len(m.explain) > n_x and xev(m, "review", "PRO промолчал")), m.explain[-1:]
         assert m.reviews[-1]["choice"] != "ПРОМОЛЧАЛ" and status("TEST")["pilot"]["review_reason"]
         p._review_reason = None
@@ -7072,9 +7730,10 @@ if __name__ == "__main__":
         p.puncture = None
         FakeTinkoff.pause_ticks = False
         # ── v5.3 W2: МЯГКИЙ ТЕЙК: FLASH ПОДЕРЖАТЬ → прибыль заперта триггером (не ниже входа + 50 % хода),
-        #    тейк отодвинут, задача Совету без очереди → совет BUY держит с новыми уровнями ──
+        #    тейк отодвинут, задача Совету → совет BUY держит с новыми уровнями. v5.4.4 (воля владельца): просьба узла
+        #    тоже ждёт окна PYTHIA_COUNCIL_GAP_SEC от конца прошлого совета — здесь окно открыто (прошлый давно) ──
         p._last_reanalyze_ts = time.time()
-        m.council_ts = time.time()
+        m.council_ts, m.council_end_ts = time.time() - 5000, time.time() - 4000
         p._review_pulled, p._review_reason = False, None
         fake_ai.take_answers[:] = [{"decision": "ПОДЕРЖАТЬ", "why": "импульс не выдохся", "lock_price": 101.0,
                                     "tp_next": 106.0, "hold_minutes": 10}]
@@ -7138,22 +7797,24 @@ if __name__ == "__main__":
         p._review_pulled = False
         p.review_ts = time.time() + 1800
 
-        # ── НОВЫЙ_АНАЛИЗ от PRO: совет был только что → окно закрыто, PRO решает сам; совет давно → полный совет ──
-        m.council_ts = time.time()
+        # ── НОВЫЙ_АНАЛИЗ от PRO: совет кончился только что → окно закрыто, PRO решает сам; совет давно → полный совет.
+        #    v5.4.4 (воля владельца): окно — от КОНЦА прошлого совета; просьба в окне — повод к плановой перепроверке
+        #    (не ждёт окна, чтобы тик сам запустил совет), в её ситуации «СОВЕТ: … окно откроется в HH:MM» ──
+        m.council_ts, m.council_end_ts = time.time() - 1200, time.time()
         p.review_ts = time.time() + 1800
         fake_ai.review_answers[:] = [{"choice": "НОВЫЙ_АНАЛИЗ", "why": "картина сломалась", "note": "зову совет"}]
         await p._review(px)
         assert not p._reanalyzing and p._council_blocked and m.handoffs[-1]["kind"] == "council" and m.handoffs[-1]["deferred"]
-        # v5.4.2: просьба не потеряна — отложена до окна, перепроверка к открытию окна
-        assert p._reanalyze_pending and p._reanalyze_pending.startswith("перепроверка потребовала свежий разбор: картина")
-        assert p.review_ts <= m.council_ts + float(config.PYTHIA_COUNCIL_GAP_SEC) + 61, p.review_ts - m.council_ts
-        assert "совет был 0 мин назад" in p.last_action and status("TEST")["pilot"]["council_blocked"], p.last_action
+        assert p._reanalyze_pending is None and "свежий разбор: картина сломалась" in (p._review_reason or "")
+        assert p.review_ts >= time.time() + 1790, p.review_ts - time.time()
+        assert "совет не раньше" in p.last_action and status("TEST")["pilot"]["council_blocked"], p.last_action
+        assert "совет не запущен" in (p._review_outcome or {}).get("outcome", ""), p._review_outcome
         fake_ai.review_answers[:] = [{"choice": "ЖДЁМ", "why": "жду окна", "note": "ждём"}]
         await p._review(px)
         ur = fake_ai.last_user["mission_review"]
         assert "СОВЕТ: " in ur and "просили полный совет" in ur and "решай сам" in ur
         assert not p._council_blocked
-        m.council_ts = time.time() - 4000
+        m.council_ts, m.council_end_ts = time.time() - 5000, time.time() - 4000
         p._last_reanalyze_ts = time.time() - 4000
         fake_ai.exec_answers[:] = [{"do": "BUY", "entry": None, "take": 104, "invalidation": 97}]
         fake_ai.review_answers[:] = [{"choice": "НОВЫЙ_АНАЛИЗ", "why": "сломалось всерьёз", "note": "зову совет"}]
@@ -7196,8 +7857,10 @@ if __name__ == "__main__":
         assert await settle(lambda: p.position is not None) and p.position["invalidation"] == 97.0
         hard1 = p.position["hard_stop"]
         assert hard1 and hard1 < 97.0 and abs(p.broker.stops[-1]["stop"] - hard1) < 1e-9
-        p._last_reanalyze_ts = time.time()                     # пейсинг советов «только что» — force обязан пройти
-        m.council_ts = time.time()
+        # v5.4.4 (воля владельца): просьба троса о совете тоже ждёт окна PYTHIA_COUNCIL_GAP_SEC от конца прошлого совета —
+        # пейсинг родителя «только что» не мешает (окно проверено миссией), прошлый совет кончился давно
+        p._last_reanalyze_ts = time.time()
+        m.council_ts, m.council_end_ts = time.time() - 5000, time.time() - 4000
         n_tr = store_v5.trades_summary("TEST")["count"]
         fake_ai.guard_answers[:] = [{"decision": "ЖДАТЬ", "why": "ложный прокол, стакан держит", "hold_minutes": 5,
                                      "hold_until_price": 96.5}]
@@ -7526,14 +8189,17 @@ if __name__ == "__main__":
         await _M["TEST"].council_task
         assert _M["TEST"].phase == "error" and "приказ не собрался" in _M["TEST"].error
         assert bus.run(r["run_id"])["status"] == "error"
-        # v5.4.2: токен есть — первый совет без приказа не убивает миссию: пилот без плана, PRO решит скоро
+        # v5.4.2: токен есть — первый совет без приказа не убивает миссию: пилот без плана; v5.4.4 (воля владельца «только
+        # триггеры и раз в 30 мин») — PRO решит на плановой перепроверке, а не через 5 мин
         FakeTinkoff.on = True
         fake_ai.exec_answers[:] = [{"do": "BUY"}, {"do": "BUY"}]
         r = await start("TEST", "auto")
         await _M["TEST"].council_task
         mf = _M["TEST"]
         assert mf.pilot_alive() and mf.phase == "idle" and mf.pilot.plan is None and "приказ не собрался" in (mf.error or "")
-        assert mf.pilot.review_ts <= time.time() + REVIEW_RETRY_SEC + 1 and "совет не собрал приказ" in (mf.pilot._review_reason or "")
+        assert mf.pilot.review_ts >= time.time() + float(config.PYTHIA_REVIEW_SEC) - 10 \
+            and "совет не собрал приказ" in (mf.pilot._review_reason or ""), mf.pilot.review_ts - time.time()
+        assert mf.council_end_ts and time.time() - mf.council_end_ts < 5, "окно совета — от конца (сбоя) совета"
         await stop("TEST")
         assert await settle(lambda: not mf.pilot_alive())
         FakeTinkoff.on = False
