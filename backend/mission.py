@@ -248,6 +248,7 @@ class Mission:
         self.exec: dict | None = None
         self.exec_ts: float | None = None
         self.council_ts: float = 0.0    # когда последний раз шёл полный совет (пейсинг автоматических советов)
+        self.council_dur: float | None = None   # v5.4.3: сколько длился последний совет (с) — цена НОВЫЙ_АНАЛИЗ в ситуации
         self.frame: dict | None = None
         self.texts: dict = {}
         self.news: list[dict] = []
@@ -295,6 +296,7 @@ def _persist(m: Mission) -> bool:
             "auto_resume": m.auto_resume,
             "panic_orders": m.panic_orders,
             "exec": m.exec, "exec_ts": m.exec_ts, "frame": m.frame, "texts": m.texts,
+            "council_dur": m.council_dur,
             "news": m.news, "reviews": m.reviews[-REVIEWS_KEEP:], "handoffs": m.handoffs[-50:],
             "note": m.note, "error": m.error, "ctx_price": m.ctx_price, "reason": m.reason,
             "layers": m.layers, "sizes": m.sizes, "scout_reqs": m.scout_reqs[:30],
@@ -323,6 +325,7 @@ def _from_store(ticker: str) -> Mission | None:
     m.auto_resume = bool(d.get("auto_resume", m.phase not in ("stopped", "panic")))
     m.panic_orders = d.get("panic_orders") if isinstance(d.get("panic_orders"), list) else []
     m.exec, m.exec_ts = d.get("exec"), _f(d.get("exec_ts"))
+    m.council_dur = _f(d.get("council_dur"))
     m.frame, m.texts = d.get("frame"), d.get("texts") or {}
     m.news, m.reviews = d.get("news") or [], d.get("reviews") or []
     m.handoffs, m.note = d.get("handoffs") or [], d.get("note") or ""
@@ -383,6 +386,42 @@ def _entry_kind(do: str, entry, price, hint=None) -> str:
     return "прорыв" if below else "откат"
 
 
+# ── уровни будильника из текста ориентира WAIT (v5.4.3) ────────────────────────
+_LVL_NUM = re.compile(r"(?<![\d.,:])(\d+(?:[.,]\d+)?)(?![\d:])")
+_LVL_DATE = re.compile(r"^(\d{1,2})\.(\d{2})$")
+_LVL_UNIT = re.compile(r"^\s*(%|проц|мин|ч\b|час|сек|лот|шт|раз|дн|день|дня|недел|мес|год|г\.)", re.IGNORECASE)
+
+
+def _levels_from_text(text: str, price, pct: float = 5.0, limit: int = 10) -> list[float]:
+    """Числа-уровни из свободного текста (ориентир совета wait_for) в пределах ±pct % от цены — только для
+    будильника кода (решает ИИ). Не уровни: время (11:20 — число у двоеточия), даты «ДД.ММ» и «ДД.ММ.ГГГГ»,
+    числа с единицами (%, мин, ч, лот …). Запятая — десятичный разделитель (98,7). Нет цены → []."""
+    px = _f(price)
+    if not text or not px or px <= 0:
+        return []
+    out: list[float] = []
+    s = str(text)
+    for mt in _LVL_NUM.finditer(s):
+        tok = mt.group(1)
+        after = s[mt.end():]
+        if after.startswith(".") and after[1:2].isdigit():
+            continue                                  # «30.09.2026» — дата с годом
+        dm = _LVL_DATE.match(tok)
+        if dm and 1 <= int(dm.group(1)) <= 31 and 1 <= int(dm.group(2)) <= 12:
+            continue                                  # «30.09» — дата (ДД.ММ), не цена
+        if _LVL_UNIT.match(after):
+            continue
+        v = _f(tok.replace(",", "."))
+        if v is None or v <= 0 or abs(v / px - 1.0) * 100.0 > pct:
+            continue
+        v = round(v, 6)
+        if v not in out:
+            out.append(v)
+        if len(out) >= limit:
+            break
+    return out
+
+
 # ── валидация приказа ─────────────────────────────────────────────────────────
 def _validate_exec(ex: Any, play: str, price, in_pos: bool = False,
                    pos_side: str | None = None) -> tuple[dict | None, str | None]:
@@ -436,14 +475,22 @@ def _validate_exec(ex: Any, play: str, price, in_pos: bool = False,
                           "противоположная сторона")
         lv = ex.get("levels") if isinstance(ex.get("levels"), (list, tuple)) else []
         wait_for = str(ex.get("wait_for") or "").strip()[:400]
-        return {"do": "WAIT", "entry": None, "entry_kind": "сейчас", "take": None, "invalidation": None,
-                "why": str(ex.get("why") or "").strip()[:300] or "(причина не указана)",
-                "plan": str(ex.get("plan") or "")[:1500],
-                "wait_for": wait_for or "условие входа не названо — реши по живой картине",
-                "confidence": int(max(0, min(100, conf))) if conf is not None else None,
-                "news_ids": [str(i)[:12] for i in ids if isinstance(i, (str, int))][:12],
-                "levels": [v for v in (_f(x) for x in lv) if v is not None][:10],
-                "time_note": str(ex.get("time_note") or "")[:300]}, None
+        levels = [v for v in (_f(x) for x in lv) if v is not None][:10]
+        out_w = {"do": "WAIT", "entry": None, "entry_kind": "сейчас", "take": None, "invalidation": None,
+                 "why": str(ex.get("why") or "").strip()[:300] or "(причина не указана)",
+                 "plan": str(ex.get("plan") or "")[:1500],
+                 "wait_for": wait_for or "условие входа не названо — реши по живой картине",
+                 "confidence": int(max(0, min(100, conf))) if conf is not None else None,
+                 "news_ids": [str(i)[:12] for i in ids if isinstance(i, (str, int))][:12],
+                 "levels": levels,
+                 "time_note": str(ex.get("time_note") or "")[:300]}
+        if not levels and wait_for:
+            # v5.4.3: уровней нет — числа из ориентира в ±5 % от цены становятся уровнями будильника (_wait_watch):
+            # код только будит дежурного PRO при проходе, решает ИИ; пометка levels_src — честно, откуда числа
+            got = _levels_from_text(wait_for, price)
+            if got:
+                out_w["levels"], out_w["levels_src"] = got, "wait_for"
+        return out_w, None
     if do == "CLOSE":
         if not in_pos:
             return None, f"do={raw_do}: позиции нет — закрывать нечего; нужно BUY, SELL или WAIT (HOLD и CLOSE — только при открытой позиции)"
@@ -591,7 +638,20 @@ def _lvl_s(v) -> str:
     return f"{x:g}" if x else "прежний"
 
 
-def _exec_text(m: Mission) -> str:
+def _live_price(m: Mission) -> float | None:
+    """Текущая цена для текстов: последний тик пилота, иначе цена досье совета; нет — None."""
+    p = m.pilot
+    px = _f(p.prices[-1]) if p is not None and getattr(p, "prices", None) else None
+    return px if px and px > 0 else (_f(m.ctx_price) or None)
+
+
+def _move_s(p0, p1) -> str:
+    """Ход цены «(+1.20 %)» от p0 к p1; нет цены — ''."""
+    a, b = _f(p0), _f(p1)
+    return f"({(b / a - 1) * 100:+.2f} %)" if a and b and a > 0 and b > 0 else ""
+
+
+def _exec_text(m: Mission, price: float | None = None) -> str:
     ex = m.exec or {}
     if not ex:
         return ""
@@ -600,28 +660,110 @@ def _exec_text(m: Mission) -> str:
                 f"invalidation={_lvl_s(ex.get('invalidation'))} take={_lvl_s(ex.get('take'))} "
                 f"уверенность {ex.get('confidence')} — {ex.get('why')}\n"
                 f"План: {ex.get('plan')}\nТайминг: {ex.get('time_note')}")
-    if str(ex.get("do") or "").upper() == "WAIT":     # v5.4.1: совет решил стоять вне рынка (5.4.2: это его прошлое мнение)
-        return (f"Приказ ({ai_v5.fmt_ts(m.exec_ts)}): WAIT — совет ждал: {ex.get('wait_for') or ex.get('why') or '—'} "
-                f"(уверенность {ex.get('confidence')}) — {ex.get('why')}\n"
-                f"План: {ex.get('plan')}\nТайминг: {ex.get('time_note')}")
+    if str(ex.get("do") or "").upper() == "WAIT":
+        # v5.4.1: совет решил стоять вне рынка (5.4.2: это его прошлое мнение). v5.4.3: у ожидания есть цена — возраст
+        # приказа, цена тогда и ход с тех пор; wait_for — ориентир, а не условие; план/тайминг — как совет видел ведение
+        # тогда (не убраны: там нити совета — уровни, что отменяет идею; подписаны прошлым мнением, чтобы не читались
+        # как действующее «ждём»); уровни будильника кода — числами, с пометкой, если взяты из текста ориентира
+        now = time.time()
+        n = int((now - _f(m.exec_ts, now)) // 60) if m.exec_ts else None
+        p0, p1 = _f(ex.get("price")), (_f(price) or _live_price(m))
+        age = f" ({n} мин назад" + (f", цена тогда {p0:g}" if p0 else "") + ")" if n is not None else ""
+        L = [f"Приказ совета {ai_v5.fmt_ts(m.exec_ts)}{age}: WAIT — вне рынка. "
+             f"Ориентир совета (не условие): {ex.get('wait_for') or ex.get('why') or '—'}."]
+        if p0 and p1:
+            L.append(f"С тех пор цена {p0:g} → {p1:g} {_move_s(p0, p1)}.")
+        lv = [x for x in (_f(v) for v in (ex.get("levels") or [])) if x]
+        if lv:
+            L.append(f"Будильник кода у уровней {', '.join(f'{x:g}' for x in lv)}"
+                     + (" (числа из ориентира совета)" if ex.get("levels_src") == "wait_for" else "")
+                     + " — проход цены будит дежурного PRO, это не вход.")
+        conf = ex.get("confidence")
+        L.append(f"Уверенность {conf if conf is not None else '—'} — {ex.get('why')}")
+        tail = [f"план — {ex.get('plan')}" if str(ex.get("plan") or "").strip() else "",
+                f"тайминг — {ex.get('time_note')}" if str(ex.get("time_note") or "").strip() else ""]
+        tail = [t for t in tail if t]
+        out = " ".join(L)
+        if tail:
+            out += (f"\nКак совет видел ведение{f' {n} мин назад' if n is not None else ''} (прошлое мнение): "
+                    + "; ".join(tail))
+        return out
     return (f"Приказ ({ai_v5.fmt_ts(m.exec_ts)}): {ex.get('do')} entry={ex.get('entry')} "
             f"({ex.get('entry_kind') or ('сейчас' if ex.get('entry') is None else 'откат')}) take={ex.get('take')} "
             f"invalidation={ex.get('invalidation')} уверенность {ex.get('confidence')} — {ex.get('why')}\n"
             f"План: {ex.get('plan')}\nТайминг: {ex.get('time_note')}")
 
 
+def _reviews_digest(reviews: list[dict], cur: float | None) -> str:
+    """v5.4.3: перепроверки для совета — с исходом, а не цепочкой мнений. Подряд идущие одинаковые решения (и то же
+    «в позиции/вне») свёрнуты: «ЖДЁМ ×4 (12:00–13:30), цена 100 → 101.2 (+1.20 %) к следующему решению — последнее:
+    …» (у последней группы — «сейчас»); одиночное — «ts ЖДЁМ @100 → сейчас 101.2 (+1.20 %) — почему». Все записи,
+    без среза; нет цены — без хода."""
+    groups: list[list[dict]] = []
+    for r in reviews or []:
+        if not isinstance(r, dict):
+            continue
+        g = groups[-1] if groups else None
+        if g and g[0].get("choice") == r.get("choice") and g[0].get("in_pos") == r.get("in_pos"):
+            g.append(r)
+        else:
+            groups.append([r])
+    parts = []
+    for i, g in enumerate(groups):
+        last = i == len(groups) - 1
+        r0, r1 = g[0], g[-1]
+        why = str(r1.get("why") or "")
+        if len(g) == 1:
+            p0 = _f(r0.get("price"))
+            s = f"{ai_v5.fmt_ts(r0.get('ts'))} {r0.get('choice')}" + (f" @{p0:g}" if p0 else "")
+            if p0 and cur:
+                s += f" → сейчас {_f(cur):g} {_move_s(p0, cur)}"
+            parts.append(f"{s} — {why}")
+            continue
+        p1 = _f(r0.get("price"))
+        p2 = _f(cur) if last else _f(groups[i + 1][0].get("price"))
+        t1, t2 = ai_v5.fmt_ts(r0.get("ts")), ai_v5.fmt_ts(r1.get("ts"))
+        if t1.split(" ")[0] == t2.split(" ")[0]:
+            t2 = t2.split(" ")[-1]                   # тот же день — только время
+        s = f"{r0.get('choice')} ×{len(g)} ({t1}–{t2})"
+        if p1 and p2:
+            s += f", цена {p1:g} → {p2:g} {_move_s(p1, p2)} {'сейчас' if last else 'к следующему решению'}"
+        parts.append(f"{s} — последнее: {why[:200]}")
+    return "; ".join(parts)
+
+
+def _pilot_state_text(p) -> str:
+    """v5.4.3: состояние пилота для совета — нейтрально, без эха last_action («ждал: …», «жду пробития …»)."""
+    pos, plan = getattr(p, "position", None), getattr(p, "plan", None)
+    if pos:
+        s = f"в позиции {pos.get('side')} {pos.get('lots')} лот @{_f(pos.get('entry'), 0.0):g}"
+        if plan and plan.get("side") == pos.get("side"):
+            s += "; добор взведён: " + MissionPilot._plan_how(plan)
+    elif getattr(p, "pending", None):
+        pe = p.pending
+        s = f"заявка входа в полёте: {pe.get('side')} {pe.get('lots')} лот"
+    elif plan:
+        s = (f"вход взведён: {MissionPilot._plan_how(plan)}, стоп {plan.get('invalidation')}, тейк {plan.get('take')}")
+    else:
+        s = "вне рынка"
+    st = str(getattr(p, "state", "") or "")
+    if st == "РЫНОК_ЗАКРЫТ":
+        s += "; биржа закрыта"
+    elif st == "СТОП":
+        s += "; пилот остановлен"
+    return s
+
+
 def _prev_text(m: Mission) -> str:
     L = [_exec_text(m)]
     if m.reviews:
-        L.append("Перепроверки: " + "; ".join(
-            f"{ai_v5.fmt_ts(r.get('ts'))} {r.get('choice')} — {str(r.get('why') or '')}"
-            for r in m.reviews))                     # все сохранённые, без среза
+        L.append("Перепроверки: " + _reviews_digest(m.reviews, _live_price(m)))    # все сохранённые, свёрнуты с исходом
     if m.handoffs:
         L.append("Передачи совету: " + "; ".join(
             f"{ai_v5.fmt_ts(h.get('ts'))} {str(h.get('reason') or '')}" for h in m.handoffs))
     p = m.pilot
     if p:
-        L.append(f"Пилот: {p.state}, {p.last_action}; результат сессии {sum(p.pnls):+.0f} ₽ за {len(p.pnls)} сделок")
+        L.append(f"Пилот: {_pilot_state_text(p)}; результат сессии {sum(p.pnls):+.0f} ₽ за {len(p.pnls)} сделок")
         pos_line = _position_text(m)
         if pos_line:
             L.append(pos_line)
@@ -1001,7 +1143,13 @@ async def _council(m: Mission, reason: str, first: bool) -> dict | None:
         # данных подавил отмену. Новый запуск может уже владеть тем же тикером.
         if not m.auto_resume or m.run_id != rid or _M.get(m.ticker) is not m:
             raise asyncio.CancelledError
+        # v5.4.3: цена при принятии приказа (живой тик пилота; пилота нет — цена досье совета) — «цена тогда → сейчас»
+        # у WAIT: цена ожидания числом
+        pl_live = m.pilot if m.pilot_alive() else None
+        live = _f(pl_live.prices[-1]) if pl_live is not None and getattr(pl_live, "prices", None) else None
+        ex["price"] = live if live and live > 0 else _f(price)
         m.exec, m.exec_ts = ex, time.time()
+        m.council_dur = max(0.0, m.exec_ts - float(m.council_ts or m.exec_ts))   # v5.4.3: сколько пилот стоял
         m.frame = None                               # рамка прошлого совета к новому приказу не липнет (придёт фоном)
         m.texts = {"analysis": a_txt, "critique": c_txt, "verdict": v_txt}
         m.news = news_items[:30]
@@ -1064,6 +1212,8 @@ async def _council(m: Mission, reason: str, first: bool) -> dict | None:
         msg = _humanize(e)
         log.warning("миссия %s: совет упал: %s", m.ticker, msg)
         m.error = msg
+        if m.council_ts:                             # v5.4.3: и неудачный совет держал пилот — его длительность видна PRO
+            m.council_dur = max(0.0, time.time() - float(m.council_ts))
         m.phase = "error" if not m.pilot_alive() else m.phase
         m.note = f"совет не завершился: {msg}"
         try:
@@ -1163,7 +1313,10 @@ class MissionPilot(ai_pilot.AIPilot):
     v5.3 W3: прокол сканера (`_puncture_watch`) — полоса устойчивого вакуума со стойкостью ≥ PYTHIA_PUNCTURE_MIN,
     сторона важна (вне рынка с планом: вход / предупреждение; в позиции: угроза / подтверждение) → повод kind
     «puncture»: блок ПРОКОЛ СКАНЕРА первым в ситуации PRO и триажа; в позиции — через триаж, иначе сразу PRO;
-    пейсинг PYTHIA_PUNCTURE_COOL_SEC, один прокол — одна перепроверка."""
+    пейсинг PYTHIA_PUNCTURE_COOL_SEC, один прокол — одна перепроверка.
+    v5.4.3 «решительный пилот»: у ожидания есть цена в числах — взведённый вход подан как решение (ВХОД ВЗВЕДЁН /
+    ПРОБОЙ ПРОЙДЕН), прошлая перепроверка — с ценой решения и ходом с тех пор, серия ЖДЁМ вне рынка — строкой-фактом;
+    уровень из ответа ЖДЁМ — будильник (`_wake_watch`: проход цены → перепроверка kind «wait_level», один раз)."""
 
     SOFT_STOP = True
 
@@ -1193,6 +1346,12 @@ class MissionPilot(ai_pilot.AIPilot):
         self._council_deferred: str | None = None   # v5.4.2: НОВЫЙ_АНАЛИЗ в окне совета — отложен до открытия окна
         self._wait_st: dict | None = None        # v5.4.2: приказ WAIT под наблюдением {exec_ts, ref, fired}
         self._review_started_ts = 0.0            # v5.4.2: когда перепроверка последний раз ушла к PRO (ритм WAIT)
+        # v5.4.3: будильник ЖДЁМ — уровень, названный дежурным PRO в ответе ЖДЁМ вне рынка (поле entry):
+        # {level, ref, dir up|down, ts, why, fired}; код только будит PRO при проходе цены, решает ИИ. Снимается любым
+        # ответом перепроверки, появлением плана, заявки или позиции. Через рестарт не переносится (как _wait_st):
+        # resume без приказа зовёт перепроверку в пределах 2 мин, а прошлый ЖДЁМ с ценой и ходом виден в ситуации
+        self._wake: dict | None = None
+        self._flat: dict | None = None           # v5.4.3: вне рынка с {ts}, мин/макс цены за это время — факт для ситуации
         if mission:
             self.name = mission.name or self.name
             self.asset_class = mission.asset_class or self.asset_class
@@ -1309,6 +1468,11 @@ class MissionPilot(ai_pilot.AIPilot):
         except Exception as e:                       # noqa: BLE001
             log.info("наблюдение приказа WAIT споткнулось: %s", str(e)[:80])
         try:
+            self._flat_track(price)
+            self._wake_watch(price)
+        except Exception as e:                       # noqa: BLE001
+            log.info("будильник ЖДЁМ споткнулся: %s", str(e)[:80])
+        try:
             self._deferred_council_watch()
         except Exception as e:                       # noqa: BLE001
             log.info("отложенный совет споткнулся: %s", str(e)[:80])
@@ -1354,6 +1518,48 @@ class MissionPilot(ai_pilot.AIPilot):
             self._ask_review_now(f"WAIT: цена {price:g} прошла уровень {lvl:g} из приказа совета — реши по живой картине",
                                  kind="wait_level")
             return
+
+    def _flat_track(self, price: float) -> None:
+        """v5.4.3: сколько пилот вне рынка и где ходила цена за это время (мин/макс по тикам) — факт для строки «ЖДЁМ
+        подряд» в ситуации. Позиция открылась — отсчёт снят; закрылась — новый отсчёт с первого тика без позиции."""
+        if self.position:
+            self._flat = None
+            return
+        if not price or price <= 0:
+            return
+        f = self._flat
+        if f is None:
+            self._flat = {"ts": time.time(), "lo": float(price), "hi": float(price)}
+        else:
+            f["lo"], f["hi"] = min(f["lo"], float(price)), max(f["hi"], float(price))
+
+    def _wake_watch(self, price: float) -> None:
+        """v5.4.3: будильник ЖДЁМ. Дежурный PRO ответил ЖДЁМ вне рынка и назвал уровень (entry) — код его не выбрасывает:
+        цена прошла уровень в сторону dir (от цены решения ref) → один раз внеплановая перепроверка kind «wait_level»
+        (пейсинг как у уровней WAIT: не раньше EVENT_MIN_GAP_SEC после ответа PRO). Рынок закрыт / мёртв, идёт совет, СТОП,
+        PRO думает прямо сейчас — не будим (его ответ снимет будильник и, может, поставит новый). План, заявка или
+        позиция появились — будильник снят. Код только будит — решает ИИ."""
+        w = self._wake
+        if not w:
+            return
+        if self.position or self.plan or self.pending:
+            self._wake = None
+            return
+        if w.get("fired") or not price or price <= 0:
+            return
+        if self.state == "СТОП" or self._reanalyzing or not self._market_alive() or self._market_closed():
+            return
+        lvl = _f(w.get("level"), 0.0)
+        if lvl <= 0:
+            self._wake = None
+            return
+        if not ((price >= lvl) if w.get("dir") == "up" else (price <= lvl)):
+            return
+        if self._review_busy:                        # PRO думает прямо сейчас — его ответ решит (и снимет будильник)
+            return
+        w["fired"] = time.time()
+        self._ask_review_now(f"цена {price:g} прошла уровень {lvl:g}, который ты назвал в ЖДЁМ {self._hhmm(w.get('ts'))} "
+                             f"— реши по живой картине", kind="wait_level")
 
     def _deferred_council_watch(self) -> None:
         """v5.4.2: НОВЫЙ_АНАЛИЗ, отложенный окном совета, ждёт открытия окна (тик §3б зовёт его сам). Снимается, если
@@ -1549,10 +1755,92 @@ class MissionPilot(ai_pilot.AIPilot):
         return self._break_n >= BREAK_CONFIRM_TICKS
 
     def _entry_wait_text(self, price: float, lvl: float) -> str:
+        # v5.4.3: взведённый вход — решение уже принято, не «жду»: уровень, расстояние, когда бьём
         if (self.plan or {}).get("kind") == "прорыв":
-            return (f"жду пробития {lvl:g} для {self.plan['side']} (цена {price:g}; вход после "
+            dist = f", до уровня {(lvl / price - 1) * 100:+.2f} %" if price and price > 0 and lvl > 0 else ""
+            return (f"вход взведён (пробой): {self.plan['side']} при проходе {lvl:g} (цена {price:g}{dist}; вход после "
                     f"{BREAK_CONFIRM_TICKS} тиков за уровнем)")
         return super()._entry_wait_text(price, lvl)
+
+    @staticmethod
+    def _crossed(pl: dict, price: float) -> bool:
+        """Пробой пройден: цена за уровнем сейчас или пометка plan["crossed"] у этого уровня (только чтение — пишет
+        её AIPilot._breakout_unbroken)."""
+        lvl = _f(pl.get("entry"), 0.0)
+        if lvl <= 0:
+            return False
+        if price and ((price >= lvl) if pl.get("side") == "long" else (price <= lvl)):
+            return True
+        c = pl.get("crossed")
+        if c is True:
+            return True
+        if c is None or c is False:
+            return False
+        return abs(_f(c, 0.0) - lvl) <= max(1e-9, abs(lvl) * 1e-9)
+
+    def _armed_line(self, pl: dict, price: float, now: float) -> str:
+        """v5.4.3: строка взведённого входа для ситуации — решение принято, это не ожидание: вид входа, до уровня в %,
+        стоп, тейк, сколько взведён и когда протухнет (PLAN_TTL_SEC от решения); нет времени плана — без этой части.
+        Пробой пройден — «ПРОБОЙ ПРОЙДЕН» с ходом цены за уровнем (дверь и PRO не читают это как «пробоя нет»)."""
+        side = pl.get("side")
+        st = f"стоп {pl.get('invalidation')}, тейк {pl.get('take')}"
+        ts = _f(pl.get("ts"))
+        age = ""
+        if ts:
+            left = max(0, int((ai_pilot.PLAN_TTL_SEC - (now - ts)) // 60))
+            age = f"; взведён {max(0, int((now - ts) // 60))} мин, протухнет через {left} мин"
+        lvl, px = _f(pl.get("entry"), 0.0), _f(price, 0.0)
+        dist = f" — до уровня {(lvl / px - 1) * 100:+.2f} %" if lvl > 0 and px > 0 else ""
+        if pl.get("kind") == "прорыв":
+            if px > 0 and self._crossed(pl, px):
+                beyond = (px / lvl - 1) * 100 * (1.0 if side == "long" else -1.0)
+                back = " — цена вернулась к уровню" if beyond < 0 else ""
+                return (f"ПРОБОЙ ПРОЙДЕН: {side}, уровень {lvl:g}, цена {px:g} ({beyond:+.2f} % за уровнем{back}); "
+                        f"вход по пробою — после {BREAK_CONFIRM_TICKS} тиков за уровнем, {st}{age}")
+            return f"ВХОД ВЗВЕДЁН (пробой): {side} при проходе {lvl:g}{dist}, {st}{age}"
+        return f"ВХОД ВЗВЕДЁН (лимит на откате): {side} @{lvl:g}{dist}, {st}{age}"
+
+    def _review_line(self, price: float, now: float) -> str:
+        """v5.4.3: прошлая перепроверка с исходом — цена решения и ход с тех пор (мнение без проверки фактом легче
+        всего повторить). Цена — из записи решения (last_review / m.reviews[-1] того же времени); нет — без неё."""
+        lr = self.last_review or {}
+        ts = _f(lr.get("ts"), now)
+        p0 = _f(lr.get("price"))
+        m = self.mission
+        if not p0 and m is not None and m.reviews and abs(_f(m.reviews[-1].get("ts"), 0.0) - ts) < 5.0:
+            p0 = _f(m.reviews[-1].get("price"))
+        s = (f"Прошлая перепроверка ({int((now - ts) / 60)} мин назад" + (f", цена {p0:g}" if p0 else "")
+             + f"): {lr.get('choice')} — {lr.get('why')}")
+        if p0 and price:
+            s += f"; с тех пор {price:g} {_move_s(p0, price)}"
+        return s
+
+    def _wait_streak_line(self, price: float, now: float) -> str:
+        """v5.4.3: строка-факт, если последние ответы перепроверки подряд — ЖДЁМ вне рынка (≥ 2): сколько, за сколько
+        минут, с какого времени вне рынка и где ходила цена (размах), ход от первого ЖДЁМ. Данные, а не приказ."""
+        m = self.mission
+        if m is None or self.position:
+            return ""
+        rs: list[dict] = []
+        for r in reversed(m.reviews or []):
+            if isinstance(r, dict) and r.get("choice") == "ЖДЁМ" and r.get("in_pos") is False:
+                rs.append(r)
+            else:
+                break
+        if len(rs) < 2:
+            return ""
+        first = rs[-1]
+        s = f"ЖДЁМ подряд: {len(rs)} за {int((now - _f(first.get('ts'), now)) // 60)} мин"
+        fl = self._flat
+        if fl:
+            lo, hi = min(fl["lo"], price or fl["lo"]), max(fl["hi"], price or fl["hi"])
+            s += f"; вне рынка с {self._hhmm(fl['ts'])}"
+            if lo > 0 and hi > 0:
+                s += f", цена за это время {lo:g}–{hi:g} (размах {(hi / lo - 1) * 100:.2f} %)"
+        p0 = _f(first.get("price"))
+        if p0 and price:
+            s += f", от первого ЖДЁМ {(price / p0 - 1) * 100:+.2f} %"
+        return s
 
     # ── ситуация для дежурного PRO ────────────────────────────────────────────────
     def _situation_text(self, price: float) -> str:
@@ -1600,15 +1888,10 @@ class MissionPilot(ai_pilot.AIPilot):
                      f"@{self.pending['price']}")
         elif self.plan:
             pl = self.plan
-            age = int((now - _f(pl.get("ts"), now)) / 60)
             if pl.get("entry") is None:
                 L.append(f"ВХОЖУ: {pl['side']} сейчас, стоп {pl['invalidation']}, тейк {pl.get('take')}")
-            elif pl.get("kind") == "прорыв":
-                L.append(f"ЖДУ ПРОБИТИЯ: {pl['side']} при проходе {pl['entry']}, стоп {pl['invalidation']}, "
-                         f"тейк {pl.get('take')} (приказ {age} мин назад, срок {int(ai_pilot.PLAN_TTL_SEC // 60)} мин)")
             else:
-                L.append(f"ЗАСАДА (откат): {pl['side']} @{pl['entry']}, стоп {pl['invalidation']}, "
-                         f"тейк {pl.get('take')} (приказ {age} мин назад, срок {int(ai_pilot.PLAN_TTL_SEC // 60)} мин)")
+                L.append(self._armed_line(pl, price, now))      # v5.4.3: взведённый вход — не «жду»
             gate_line = self._gate_line(pl)
             if gate_line:
                 L.append(gate_line)
@@ -1618,25 +1901,38 @@ class MissionPilot(ai_pilot.AIPilot):
             if m0 is not None and str((m0.exec or {}).get("do") or "").upper() == "WAIT":
                 # v5.4.2: WAIT совета — его прошлое мнение, а не запрет и не «вход — исключение»
                 # ревью 5.4.2: выбор — из того же списка, что в system перепроверки (режим игры, НОВЫЙ_АНАЛИЗ)
-                L.append(f"ПРИКАЗ СОВЕТА ({int((now - _f(m0.exec_ts, now)) // 60)} мин назад): вне рынка; совет ждал: "
-                         f"{m0.exec.get('wait_for') or m0.exec.get('why') or '—'}. Это прошлое мнение, а не запрет: "
-                         f"реши заново — {prompts_mission.review_options(self._play(), False)}")
+                # v5.4.3: ориентир совета второй раз не повторяем (он в блоке приказа) — возраст и ход цены с тех пор
+                p0 = _f(m0.exec.get("price"))
+                mv = f"; с тех пор цена {(price / p0 - 1) * 100:+.2f} %" if p0 and price else ""
+                L.append(f"ПРИКАЗ СОВЕТА ({int((now - _f(m0.exec_ts, now)) // 60)} мин назад): вне рынка — прошлое "
+                         f"мнение, не запрет{mv}. Реши заново — {prompts_mission.review_options(self._play(), False)}")
+        wk = self._wake
+        if wk and not self.position and not self.plan:
+            L.append(f"БУДИЛЬНИК: уровень {_f(wk.get('level'), 0.0):g} из твоего ЖДЁМ {self._hhmm(wk.get('ts'))} "
+                     f"(цена тогда {_f(wk.get('ref'), 0.0):g}) — "
+                     + ("сработал, это и есть повод перепроверки" if wk.get("fired") else
+                        "при проходе цены код разбудит дежурного PRO; это не вход"))
         L.append(f"Депозит {self.deposit:.0f} ₽, результат сессии {sum(self.pnls):+.0f} ₽ за {len(self.pnls)} сделок")
         acc_line = self._account_line()
         if acc_line:
             L.append(acc_line + " — размер входа/добора считает биржа, ты решаешь только сторону")
         if self.last_review:
-            age = int((now - self.last_review["ts"]) / 60)
-            L.append(f"Прошлая перепроверка ({age} мин назад): {self.last_review['choice']} — "
-                     f"{self.last_review['why']}")
+            L.append(self._review_line(price, now))            # v5.4.3: с ценой решения и ходом с тех пор
+            streak = self._wait_streak_line(price, now)
+            if streak:
+                L.append(streak)
         m = self.mission
         if m is not None and m.council_ts:
             cut = _f(getattr(self, "_council_cut_ts", 0.0), 0.0)
+            # v5.4.3: цена НОВЫЙ_АНАЛИЗ — честно: сколько длился прошлый совет и что пилот делает, пока совет идёт
+            frz = "пока совет идёт, пилот не входит и не перепроверяет, взведённый вход без позиции снимается"
             if cut and abs(cut - float(m.council_ts)) < 1.0:     # окно совета считается от обрыва — это не новый приказ
                 L.append(f"Последний полный совет прерван {int((now - cut) // 60)} мин назад (не уложился в срок) — "
-                         f"действующий приказ прежний")
+                         f"действующий приказ прежний; {frz}")
             else:
-                L.append(f"Последний полный совет: {int((now - m.council_ts) // 60)} мин назад")
+                dur = _f(getattr(m, "council_dur", None))
+                L.append(f"Последний полный совет: {int((now - m.council_ts) // 60)} мин назад"
+                         + (f", длился {int(dur // 60)} мин" if dur is not None else "") + f" ({frz})")
         sr = self.session_risk.state() if self.session_risk else {}
         if sr:
             L.append(f"Killswitch: {'ЗАБЛОКИРОВАН' if sr.get('locked') else 'ок'}"
@@ -1795,15 +2091,25 @@ class MissionPilot(ai_pilot.AIPilot):
                                                        or (pos_side == "short" and play == "short")):
             why = f"[ПЕРЕВЕРНУТЬ против режима {play} — только ЗАКРЫТЬ] " + why
             choice = "ЗАКРЫТЬ"
-        self.last_review = {"choice": choice, "why": why, "ts": time.time()}
+        self.last_review = {"choice": choice, "why": why, "ts": time.time(), "price": price}
         if self.puncture and self.puncture.get("pending"):    # W3: PRO разобрал прокол — блок больше не первым
             self.puncture["pending"] = False
             self.puncture["state"] = f"PRO решил: {choice} — {why[:120]}"
         rec = {"ts": time.time(), "choice": choice, "why": why, "note": note,
                "entry": _f(obj.get("entry")), "entry_kind": str(obj.get("entry_kind") or "")[:12] or None,
-               "invalidation": _f(obj.get("invalidation")), "take": _f(obj.get("take")), "price": price}
+               "invalidation": _f(obj.get("invalidation")), "take": _f(obj.get("take")), "price": price,
+               "in_pos": in_pos}                       # v5.4.3: решение в позиции или вне — для строки «ЖДЁМ подряд»
         if ai_choice != choice:
             rec["ai_choice"] = ai_choice                 # что ответил ИИ (запись — что сделал код и почему)
+        # v5.4.3: будильник ЖДЁМ — любой ответ снимает прошлый; ЖДЁМ вне рынка (нет позиции, плана, заявки) с уровнем
+        # entry — код его не выбрасывает, а будит PRO при проходе цены (от цены решения — той, что в промпте)
+        self._wake = None
+        lvl_w = _f(rec.get("entry"), 0.0) or 0.0
+        if (choice == "ЖДЁМ" and not self.position and not self.plan and not self.pending
+                and lvl_w > 0 and price and abs(lvl_w - float(price)) > 1e-9):
+            self._wake = {"level": lvl_w, "ref": float(price), "dir": "up" if lvl_w > float(price) else "down",
+                          "ts": time.time(), "why": why[:120], "fired": None}
+            rec["wake"] = lvl_w
         if m is not None:
             m.reviews.append(rec)
             del m.reviews[:-REVIEWS_KEEP]
@@ -1811,13 +2117,21 @@ class MissionPilot(ai_pilot.AIPilot):
             _persist(m)
             _bg(bus.stage("mission", m.run_id, "review", "done", ticker=self.base,
                           detail=f"{choice}: {why}", data=rec))
-            lv = [f"{k} {v}" for k, v in (("вход", rec["entry"]), ("стоп", rec["invalidation"]), ("тейк", rec["take"])) if v is not None]
+            # v5.4.3: у ЖДЁМ уровень — будильник, не «вход» (вне рынка без будильника entry не используется; в позиции
+            # ЖДЁМ двигает только стоп и тейк)
+            pairs = (("вход", rec["entry"]), ("стоп", rec["invalidation"]), ("тейк", rec["take"]))
+            if choice == "ЖДЁМ":
+                pairs = pairs[1:] if self.position else ()
+            lv = [f"{k} {v}" for k, v in pairs if v is not None]
             if choice in ("КУПИТЬ_СЕЙЧАС", "ПРОДАТЬ_СЕЙЧАС", "ДОБРАТЬ", "ПЕРЕВЕРНУТЬ") and rec["entry"] is None:
                 lv.insert(0, "вход сейчас")
+            if self._wake:
+                lv.insert(0, f"будильник у {lvl_w:g}: цена пройдёт уровень — дежурный PRO решит заново, это не вход")
             _tolmach(m, "review", f"Перепроверка: {choice}",
                      f"{why}" + (f". {note}" if note else "") + (f" ({', '.join(lv)})" if lv else ""),
-                     refs={"choice": choice, "price": price, "entry": rec["entry"], "invalidation": rec["invalidation"],
-                           "take": rec["take"]})
+                     refs={"choice": choice, "price": price, "entry": rec["entry"] if choice != "ЖДЁМ" else None,
+                           "invalidation": rec["invalidation"], "take": rec["take"],
+                           "wake": lvl_w if self._wake else None})
             every = explain.memory_every() if explain is not None else 5
             if m.reviews_since_memory >= every:      # узел «N перепроверок» — свести память
                 _memorize(m, f"{every} перепроверок")
@@ -1862,6 +2176,11 @@ class MissionPilot(ai_pilot.AIPilot):
             # позиция открылась/закрылась, пока PRO думал: решение к нынешнему состоянию не относится — видно в панели
             self.last_action = (f"решение перепроверки {choice} не исполнено: "
                                 f"{'позиция уже открыта' if self.position else 'позиции уже нет'} — решу на следующей")
+            log.info("миссия %s: %s", self.base, self.last_action)
+        elif self._wake:
+            # v5.4.3: ЖДЁМ вне рынка с уровнем — будильник (код только будит, решает ИИ)
+            self.last_action = (f"перепроверка: ЖДЁМ — будильник у {self._wake['level']:g}: цена пройдёт уровень "
+                                f"({'вверх' if self._wake['dir'] == 'up' else 'вниз'}) — дежурный PRO решит заново")
             log.info("миссия %s: %s", self.base, self.last_action)
         # ЖДЁМ без позиции — осознанное решение ИИ: держим как есть
 
@@ -3866,6 +4185,9 @@ class MissionPilot(ai_pilot.AIPilot):
         st["council_deferred"] = bool(self._council_deferred)   # v5.4.2: НОВЫЙ_АНАЛИЗ ждёт окна совета
         ws = self._wait_st                           # v5.4.2: приказ WAIT под наблюдением (цена отсчёта, пройденные уровни)
         st["wait_watch"] = {"ref": ws.get("ref"), "fired": sorted(ws.get("fired") or {})} if ws else None
+        wk = self._wake                              # v5.4.3: будильник ЖДЁМ (уровень из ответа дежурного PRO)
+        st["wake"] = ({"level": wk.get("level"), "dir": wk.get("dir"), "why": wk.get("why"), "ref": wk.get("ref"),
+                       "ts": wk.get("ts"), "fired": wk.get("fired")} if wk else None)
         # v5.4.1: модель узлов у денег, проверка входа у двери и мысль о прибыли — включены ли
         fn = getattr(ai_v5, "money_model", None)
         st["money_model"] = str(fn() if callable(fn) else "pro").lower()
@@ -5080,6 +5402,11 @@ if __name__ == "__main__":
         assert "позиция открыта" in _validate_exec({"do": "WAIT"}, "auto", 100, in_pos=True)[1], "WAIT при позиции недопустим"
         assert "HOLD" in _validate_exec({"do": "WAIT"}, "auto", 100, in_pos=True)[1], "отказ WAIT в позиции ведёт к HOLD"
         assert "позиции нет" in _validate_exec({"do": "CLOSE"}, "auto", 100)[1]
+        # v5.4.3: WAIT без levels — числа из ориентира в ±5 % (время, даты, проценты — не уровни) → будильник кода
+        exw = _validate_exec({"do": "WAIT", "wait_for": "выше 101,5 после 11:20 до 30.09; ход 2 %; 250"}, "auto", 100)[0]
+        assert exw["levels"] == [101.5] and exw["levels_src"] == "wait_for", exw
+        assert _levels_from_text("30.09.2026 в 10:00, пробой 30.5", 30.0) == [30.5]
+        assert "levels_src" not in _validate_exec({"do": "WAIT", "wait_for": "выше 101", "levels": [99]}, "auto", 100)[0]
         # ревью 5.4.2: HOLD — держать как есть без добора: только при позиции; null — прежний уровень; сторона — по позиции
         exh, err = _validate_exec({"do": "ДЕРЖАТЬ", "invalidation": 99, "take": None, "why": "ход жив"}, "long", 100,
                                   in_pos=True, pos_side="long")
@@ -5327,7 +5654,8 @@ if __name__ == "__main__":
             "перепроверка видит память миссии"
         assert p._review_reason is None and p.plan and p.plan["side"] == "long" and p.plan["entry"] == amb, p.plan
         assert p.plan["kind"] == "откат" and p.state == "ЗАСАДА" and p.position is None
-        assert m.reviews[-1]["entry_kind"] == "откат" and "ЗАСАДА (откат): long @" in p._situation_text(px)
+        assert m.reviews[-1]["entry_kind"] == "откат" and "ВХОД ВЗВЕДЁН (лимит на откате): long @" in p._situation_text(px)
+        assert "протухнет через" in p._situation_text(px) and "до уровня -" in p._situation_text(px), p._situation_text(px)
         FakeTinkoff.price = amb + 0.02                         # цена подошла к засаде → вход
         assert await settle(lambda: p.position is not None)
         assert status("TEST")["phase"] == "in_position" and p.position["entry"] <= amb + 0.1
@@ -5346,8 +5674,8 @@ if __name__ == "__main__":
         FakeTinkoff.price = brk - 0.05                         # под уровнем — ждём
         assert await settle(lambda: bool(p.prices) and p.prices[-1] == brk - 0.05)
         await settle(lambda: False, n=30)
-        assert p.position is None and "жду пробития" in p.last_action, p.last_action
-        assert "ЖДУ ПРОБИТИЯ: long при проходе" in p._situation_text(brk - 0.05)
+        assert p.position is None and "вход взведён (пробой)" in p.last_action, p.last_action
+        assert "ВХОД ВЗВЕДЁН (пробой): long при проходе" in p._situation_text(brk - 0.05)   # v5.4.3: не «жду»
         FakeTinkoff.price = brk + 0.02                         # прошли уровень → два тика → вход
         assert await settle(lambda: p.position is not None), p.last_action
         assert p.position["side"] == "long" and status("TEST")["phase"] == "in_position"
@@ -6075,11 +6403,11 @@ if __name__ == "__main__":
         assert m.error is None and m.exec["do"] == "WAIT" and m.exec["wait_for"] == "закрепление выше 101", (m.error, m.exec)
         p = m.pilot
         assert p and m.pilot_alive() and p.plan is None and status("TEST")["phase"] == "idle", (p.plan, status("TEST")["phase"])
-        assert "вне рынка — ждал: закрепление выше 101" in p.last_action and "WAIT — совет ждал: закрепление выше 101" in _exec_text(m), \
+        assert "вне рынка — ждал: закрепление выше 101" in p.last_action and "Ориентир совета (не условие): закрепление выше 101" in _exec_text(m), \
             p.last_action
         assert await settle(lambda: xev(m, "council", "Совет решил ждать (WAIT)")), m.explain
         sit_w = p._situation_text(100.0)                       # v5.4.2: WAIT совета — прошлое мнение, а не запрет
-        assert "ПРИКАЗ СОВЕТА (" in sit_w and "совет ждал: закрепление выше 101" in sit_w and "прошлое мнение, а не запрет" in sit_w, sit_w
+        assert "ПРИКАЗ СОВЕТА (" in sit_w and "прошлое мнение, не запрет" in sit_w and "закрепление выше 101" not in sit_w, sit_w
         assert status("TEST")["exec"]["do"] == "WAIT"
         FakeTinkoff.price = 101.5
         assert await settle(lambda: bool(p.prices) and p.prices[-1] == 101.5)

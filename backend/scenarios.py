@@ -2436,7 +2436,9 @@ async def s39_council_wait(sc: Scene) -> None:
     assert sc.p.plan is None and sc.p.state == "ЖДУ_ПЛАН" and "вне рынка — ждал: закрепление выше 101" in sc.p.last_action, sc.p.last_action
     assert "перевеса нет" not in sc.p.last_action, "5.4.2: текст пилота нейтрален"
     assert mission.status(TICKER)["phase"] == "idle" and mission.status(TICKER)["exec"]["do"] == "WAIT"
-    assert "WAIT — совет ждал: закрепление выше 101" in mission._exec_text(sc.m)
+    # v5.4.3: ориентир совета — не условие; цена тогда и ход с тех пор; уровень будильника кода — числом
+    assert "WAIT — вне рынка. Ориентир совета (не условие): закрепление выше 101" in mission._exec_text(sc.m)
+    assert "Будильник кода у уровней 101" in mission._exec_text(sc.m) and "(прошлое мнение): план — ждём" in mission._exec_text(sc.m)
     await sc.tick(100.0, n=2)                     # первый тик — стакан появился, второй — рынок жив
     # v5.4.2: WAIT — не сон на PYTHIA_REVIEW_SEC: дежурный PRO не реже раза в PYTHIA_WAIT_REVIEW_SEC
     assert sc.p.review_ts <= sc.m.exec_ts + float(config.PYTHIA_WAIT_REVIEW_SEC) + 1, sc.p.review_ts - time.time()
@@ -2454,7 +2456,7 @@ async def s39_council_wait(sc: Scene) -> None:
     await sc.tick(101.6)
     assert len(sc.m.handoffs) == n_h, "тот же уровень второй раз не будит"
     sit = sc.p._situation_text(101.5)
-    assert "ПРИКАЗ СОВЕТА (" in sit and "совет ждал: закрепление выше 101" in sit and "прошлое мнение, а не запрет" in sit, sit
+    assert "ПРИКАЗ СОВЕТА (" in sit and "прошлое мнение, не запрет" in sit and "закрепление выше 101" not in sit, sit
     await sc.settle_ai()
     assert any(e["title"].startswith("Совет решил ждать (WAIT)") for e in sc.xevents("council")), [e["title"] for e in sc.xevents()]
     # дежурный PRO: КУПИТЬ_СЕЙЧАС → план по живому рынку → вход без второго вопроса у двери → позиция
@@ -2463,7 +2465,7 @@ async def s39_council_wait(sc: Scene) -> None:
     await sc.tick(101.5)
     assert await sc.settle(lambda: fake_ai.count("mission_review") == 2 and not sc.p._review_busy)
     ur = fake_ai.last_user["mission_review"]
-    assert "совет ждал: закрепление выше 101" in ur and sc.p.plan and sc.p.plan["side"] == "long", sc.p.last_action
+    assert "Ориентир совета (не условие): закрепление выше 101" in ur and sc.p.plan and sc.p.plan["side"] == "long", sc.p.last_action
     assert sc.p.plan["src"] == "review" and sc.p.plan["snap_price"] == 101.5, sc.p.plan
     await sc.tick(101.5)                          # свежее решение PRO → заявка без вопроса у двери
     assert fake_ai.count("mission_entry") == 0 and sc.p.pending, sc.p.last_action
@@ -2577,6 +2579,54 @@ async def s41_council_hold(sc: Scene) -> None:
     sc.note = "ПОДЕРЖАТЬ → совет HOLD: стоп 101 / тейк 107, 3 лота как были — биржа давала 4, добора нет"
 
 
+async def s42_wait_alarm(sc: Scene) -> None:
+    """Будильник ЖДЁМ (5.4.3): вне рынка дежурный PRO ответил ЖДЁМ и назвал уровень 101 выше цены — код уровень не
+    выбрасывает, а ставит будильник; цена прошла 101 → внеплановая перепроверка с поводом «прошла уровень …, который
+    ты назвал в ЖДЁМ» (один раз) → PRO КУПИТЬ_СЕЙЧАС → вход по свежему решению; ответ снимает будильник."""
+    sc.p.plan = None
+    wait, err = mission._validate_exec({"do": "WAIT", "wait_for": "нужен объём покупателя", "why": "стенд: вне рынка",
+                                        "plan": "ждём"}, "auto", 100.0)
+    assert wait and not err and wait["levels"] == [], (wait, err)
+    assert sc.p.adopt_forecast({"exec": wait}) and sc.p.plan is None
+    sc.m.exec, sc.m.exec_ts = wait, time.time()
+    await sc.tick(100.0, n=2)                     # стакан появился, рынок жив
+    # 1) плановая перепроверка: ЖДЁМ с уровнем 101 → будильник (не план, не вход)
+    sc.p.review_ts = 0.0
+    fake_ai.queue("mission_review", {"choice": "ЖДЁМ", "why": "пробоя 101 нет — жду", "entry": 101.0, "entry_kind": "прорыв",
+                                     "note": "уровень 101"})
+    await sc.tick(100.0)
+    assert await sc.settle(lambda: fake_ai.count("mission_review") == 1 and not sc.p._review_busy)
+    wk = sc.p._wake
+    assert wk and wk["level"] == 101.0 and wk["dir"] == "up" and wk["ref"] == 100.0 and not wk["fired"], wk
+    assert sc.p.plan is None and sc.p.pending is None and sc.m.reviews[-1]["wake"] == 101.0, sc.p.plan
+    assert "будильник у 101" in sc.p.last_action and sc.p.status()["wake"]["level"] == 101.0, sc.p.last_action
+    assert "БУДИЛЬНИК: уровень 101 из твоего ЖДЁМ" in sc.p._situation_text(100.2)
+    await sc.tick(100.6)                          # под уровнем — тишина
+    assert not [h for h in sc.m.handoffs if h.get("kind") == "wait_level"], sc.m.handoffs
+    # 2) цена прошла 101 (PRO ответил давно — пейсинг EVENT_MIN_GAP_SEC позади) → внеплановая перепроверка
+    sc.p._last_review_ts -= mission.EVENT_MIN_GAP_SEC + 60
+    fake_ai.queue("mission_review", {"choice": "КУПИТЬ_СЕЙЧАС", "why": "пробой 101 с объёмом", "invalidation": 100.2,
+                                     "take": 104.0})
+    await sc.tick(101.3)
+    h = sc.m.handoffs[-1]
+    assert h["kind"] == "wait_level" and "прошла уровень 101, который ты назвал в ЖДЁМ" in h["reason"] and not h["deferred"], h
+    assert await sc.settle(lambda: fake_ai.count("mission_review") == 2 and not sc.p._review_busy)
+    ur = fake_ai.last_user["mission_review"]
+    assert "ПОВОД ПЕРЕПРОВЕРКИ (внеплановая): цена 101.3 прошла уровень 101, который ты назвал в ЖДЁМ" in ur, ur[:1500]
+    assert "Прошлая перепроверка (0 мин назад, цена 100): ЖДЁМ — пробоя 101 нет — жду; с тех пор 101.3 (+1.30 %)" in ur, ur[:1500]
+    assert sc.p._wake is None, "ответ перепроверки снимает будильник"
+    assert sc.p.plan and sc.p.plan["side"] == "long" and sc.p.plan["src"] == "review", sc.p.plan
+    n_h = len(sc.m.handoffs)
+    await sc.tick(101.3)                          # свежее решение PRO → заявка без второго вопроса у двери
+    await sc.tick(101.3)
+    assert sc.p.position and sc.p.position["side"] == "long" and fake_ai.count("mission_entry") == 0, sc.p.last_action
+    assert len([x for x in sc.m.handoffs[n_h:] if x.get("kind") == "wait_level"]) == 0, "будильник сработал один раз"
+    await sc.settle_ai()
+    rv = [e for e in sc.xevents("review") if e["title"] == "Перепроверка: ЖДЁМ"]
+    assert rv and "будильник у 101" in rv[-1]["detail"] and "вход 101" not in rv[-1]["detail"], rv
+    sc.note = "ЖДЁМ с уровнем 101 → будильник; цена 101.3 → PRO по поводу «прошла уровень» → КУПИТЬ → вход; будильник снят"
+
+
 SCENARIOS: list[tuple[str, Callable[[Scene], Awaitable[None]]]] = [
     ("гэп_за_трос", s01_gap_hard), ("гэп_за_триггер", s02_gap_trigger), ("мёртвый_рынок", s03_dead_market),
     ("рынок_закрыт", s04_market_closed), ("частичка_30042", s05_partial_then_30042),
@@ -2598,6 +2648,8 @@ SCENARIOS: list[tuple[str, Callable[[Scene], Awaitable[None]]]] = [
     ("рывок_в_плюсе", s38_shock_profit), ("совет_вне_рынка", s39_council_wait), ("стопы_в_программе", s40_program_stops),
     # ревью 5.4.2: совет «держать» — HOLD без добора
     ("совет_держать", s41_council_hold),
+    # v5.4.3 «решительный пилот»: уровень из ЖДЁМ — будильник, а не молча выброшенное число
+    ("ждём_будильник", s42_wait_alarm),
 ]
 
 
@@ -2672,4 +2724,5 @@ if __name__ == "__main__":
           "W4: запрос стопа завис → список стопов решает, стопа нет в списке → отмена подтверждена, база/state не читаются → "
           "паника всё равно, GetStopOrders недоступен → force, продажа владельца во время выхода, паника не липнет к тикеру; "
           "v5.4.1: PRO у двери ЖДАТЬ/ОТМЕНИТЬ/молчит, мысль о прибыли ВЫЙТИ/ПЕРЕЗАЙТИ/СОВЕТ, рывок в плюсе, приказ WAIT, "
-          "стопы только в программе; ревью 5.4.2: совет «держать» — HOLD без добора, молчание у троса/тейка — запись кода)")
+          "стопы только в программе; ревью 5.4.2: совет «держать» — HOLD без добора, молчание у троса/тейка — запись кода; "
+          "v5.4.3: ЖДЁМ с уровнем — будильник, проход цены → PRO решает заново)")

@@ -1747,8 +1747,9 @@ class AIPilot:
                 else (price >= lvl - arm))
 
     def _entry_wait_text(self, price: float, lvl: float) -> str:
-        return (f"засада {self.plan['side']} @{lvl:g} (цена {price:g}, "
-                "жду имба-момент)")
+        # v5.4.3: взведённый вход — решение принято, не «жду»
+        return (f"вход взведён: засада {self.plan['side']} @{lvl:g} (цена {price:g}, "
+                "вход в имба-момент)")
 
     # ── v5.4.1: хуки трезвого пилота (база — как раньше; наследник MissionPilot спрашивает PRO) ─────────
     async def _entry_gate(self, price: float, book: dict | None) -> bool:
@@ -2081,7 +2082,7 @@ class AIPilot:
             self.state = "ЗАСАДА" if (self.plan or {}).get("entry") is not None \
                 else "ЖДУ_ПЛАН"
             self.last_action = ("ликвидности нет даже по best — отступил, "
-                                "жду имба-момент заново")
+                                "вход взведён заново (имба-момент)")
 
     async def _absorb_fill(self, lots: int, po: dict,
                            place_stop: bool = True) -> None:
@@ -2893,8 +2894,8 @@ class AIPilot:
             L.append(f"ЗАЯВКА ВХОДА В ПОЛЁТЕ: {self.pending['side']} "
                      f"{self.pending['lots']} лот @{self.pending['price']}")
         elif self.plan:
-            L.append(f"ЗАСАДА: {self.plan['side']} @{self.plan.get('entry')} "
-                     f"(жду имба-момент), стоп {self.plan['invalidation']}")
+            L.append(f"ВХОД ВЗВЕДЁН (засада): {self.plan['side']} @{self.plan.get('entry')} "
+                     f"(вход в имба-момент), стоп {self.plan['invalidation']}")
         else:
             L.append("Позиции нет, засады нет — полностью вне рынка")
         L.append(f"Депозит {self.deposit:.0f} ₽, результат сессии "
