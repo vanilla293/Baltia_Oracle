@@ -1029,7 +1029,13 @@ async def light(ticker: str, figi: str | None, asset_class: str) -> dict:
             if book.get("limit_up") or book.get("limit_down"):
                 L.append(f"Планки: {book.get('limit_down')} … {book.get('limit_up')}")
         else:
-            L.append("Стакан: пуст/недоступен (ночь, аукцион, планка?)")
+            # v5.4.4: при отказе Т-Банка (токен, права, связь) — честная причина, а не догадка «ночь, аукцион, планка?»
+            why = ""
+            try:
+                why = tinkoff.failure_text("") if tinkoff is not None else ""
+            except Exception:                        # noqa: BLE001
+                why = ""
+            L.append(f"Стакан: недоступен — {why}" if why else "Стакан: пуст/недоступен (ночь, аукцион, планка?)")
         if isinstance(tr, dict) and tr.get("count"):
             ar = tr.get("aggressor_ratio")
             who = ("покупатели" if (ar or 0) > 0.55 else "продавцы" if (ar or 0) < 0.45 else "паритет")
